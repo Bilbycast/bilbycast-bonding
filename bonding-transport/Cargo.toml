@@ -1,6 +1,6 @@
 [package]
 name = "bonding-transport"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Async bonding transport: path managers, scheduler wiring, stats"
 license = "MPL-2.0"
@@ -30,6 +30,11 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rcgen = { version = "0.13", optional = true }
 rustls-pemfile = { version = "2", optional = true }
 srt-transport = { path = "../../bilbycast-libsrt-rs/srt-transport", optional = true }
+
+# `if_nametoindex` for NIC pinning via IP_BOUND_IF on Apple / BSD /
+# Fuchsia. Linux uses SO_BINDTODEVICE which socket2 exposes directly.
+[target.'cfg(any(target_vendor = "apple", target_os = "freebsd", target_os = "fuchsia"))'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 env_logger = "0.11"

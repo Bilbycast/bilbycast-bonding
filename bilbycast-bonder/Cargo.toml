@@ -1,6 +1,6 @@
 [package]
 name = "bilbycast-bonder"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Dedicated packet-bonding appliance — small binary built on bilbycast-bonding, no libav / no fdk-aac"
 license = "MPL-2.0"

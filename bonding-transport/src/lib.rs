@@ -23,6 +23,7 @@
 //!             transport: PathTransport::Udp {
 //!                 bind: None,
 //!                 remote: Some("203.0.113.5:7000".parse().unwrap()),
+//!                 interface: Some("wwan0".into()),
 //!             },
 //!         },
 //!         PathConfig {
@@ -32,6 +33,7 @@
 //!             transport: PathTransport::Udp {
 //!                 bind: None,
 //!                 remote: Some("203.0.113.5:7002".parse().unwrap()),
+//!                 interface: Some("eth0".into()),
 //!             },
 //!         },
 //!     ],

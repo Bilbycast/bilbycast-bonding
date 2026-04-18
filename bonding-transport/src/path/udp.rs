@@ -60,13 +60,18 @@ impl UdpPath {
     /// Build a path with an explicit bind address. Used when the
     /// caller needs to pin the local port (receiver mode) or when
     /// firewall policy requires a specific source port.
+    ///
+    /// `interface` optionally pins the socket to a specific NIC
+    /// (see `docs/nic-pinning.md`). `None` leaves egress selection
+    /// to the kernel routing table.
     pub async fn bind(
         id: PathId,
         name: impl Into<String>,
         local: SocketAddr,
         primary_peer: Option<SocketAddr>,
+        interface: Option<&str>,
     ) -> PathResult<Self> {
-        let socket = Self::build_socket(local).await?;
+        let socket = Self::build_socket(local, interface).await?;
         Ok(Self::from_socket(id, name.into(), socket, primary_peer))
     }
 
@@ -75,16 +80,20 @@ impl UdpPath {
         id: PathId,
         name: impl Into<String>,
         primary_peer: SocketAddr,
+        interface: Option<&str>,
     ) -> PathResult<Self> {
         let local: SocketAddr = if primary_peer.is_ipv4() {
             "0.0.0.0:0".parse().unwrap()
         } else {
             "[::]:0".parse().unwrap()
         };
-        Self::bind(id, name, local, Some(primary_peer)).await
+        Self::bind(id, name, local, Some(primary_peer), interface).await
     }
 
-    async fn build_socket(local: SocketAddr) -> PathResult<Arc<UdpSocket>> {
+    async fn build_socket(
+        local: SocketAddr,
+        interface: Option<&str>,
+    ) -> PathResult<Arc<UdpSocket>> {
         let domain = if local.is_ipv4() {
             Domain::IPV4
         } else {
@@ -100,6 +109,15 @@ impl UdpPath {
         sock.set_nonblocking(true).ok();
         let _ = sock.set_recv_buffer_size(DEFAULT_SOCK_BUF);
         let _ = sock.set_send_buffer_size(DEFAULT_SOCK_BUF);
+        // NIC pin first — some platforms require it before bind.
+        if let Some(iface) = interface {
+            bind_to_interface(&sock, iface, local.is_ipv6()).map_err(|e| {
+                PathError::BindInterface {
+                    interface: iface.to_string(),
+                    source: e,
+                }
+            })?;
+        }
         sock.bind(&local.into()).map_err(|e| PathError::Bind {
             addr: local.to_string(),
             source: e,
@@ -266,4 +284,57 @@ impl std::fmt::Debug for UdpPath {
             .field("primary_peer", &self.primary_peer())
             .finish()
     }
+}
+
+// ─── NIC pinning ─────────────────────────────────────────────────
+//
+// On Linux/Android: SO_BINDTODEVICE, needs CAP_NET_RAW.
+// On Apple / FreeBSD / Fuchsia: IP_BOUND_IF / IPV6_BOUND_IF by
+// interface index, unprivileged.
+// Elsewhere: return Unsupported so operators get a clear error
+// instead of silent fall-through to the default route.
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn bind_to_interface(sock: &Sock2, iface: &str, _is_ipv6: bool) -> std::io::Result<()> {
+    sock.bind_device(Some(iface.as_bytes()))
+}
+
+#[cfg(any(target_vendor = "apple", target_os = "freebsd", target_os = "fuchsia"))]
+fn bind_to_interface(sock: &Sock2, iface: &str, is_ipv6: bool) -> std::io::Result<()> {
+    let cname = std::ffi::CString::new(iface).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "interface name contains NUL byte",
+        )
+    })?;
+    // SAFETY: `cname` is a valid NUL-terminated C string.
+    let idx_raw = unsafe { libc::if_nametoindex(cname.as_ptr()) };
+    let idx = std::num::NonZeroU32::new(idx_raw).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("interface '{iface}' not found (if_nametoindex returned 0)"),
+        )
+    })?;
+    if is_ipv6 {
+        sock.bind_device_by_index_v6(Some(idx))
+    } else {
+        sock.bind_device_by_index_v4(Some(idx))
+    }
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple",
+    target_os = "freebsd",
+    target_os = "fuchsia",
+)))]
+fn bind_to_interface(_sock: &Sock2, iface: &str, _is_ipv6: bool) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        format!(
+            "NIC pinning (interface='{iface}') is not supported on this platform; \
+             use source-IP binding + policy routing instead"
+        ),
+    ))
 }

@@ -200,10 +200,19 @@ async fn build_one_path(
     sender_mode: bool,
 ) -> BondResult<Path> {
     match &p.transport {
-        PathTransport::Udp { bind, remote } => {
+        PathTransport::Udp {
+            bind,
+            remote,
+            interface,
+        } => {
+            let iface = interface.as_deref();
             let udp = match (bind, remote, sender_mode) {
-                (Some(b), _, _) => UdpPath::bind(p.id, p.name.clone(), *b, *remote).await?,
-                (None, Some(r), true) => UdpPath::bind_ephemeral(p.id, p.name.clone(), *r).await?,
+                (Some(b), _, _) => {
+                    UdpPath::bind(p.id, p.name.clone(), *b, *remote, iface).await?
+                }
+                (None, Some(r), true) => {
+                    UdpPath::bind_ephemeral(p.id, p.name.clone(), *r, iface).await?
+                }
                 (None, _, false) => {
                     return Err(BondSocketError::Path(PathError::Other(
                         "receiver-mode UDP path requires an explicit bind address".into(),

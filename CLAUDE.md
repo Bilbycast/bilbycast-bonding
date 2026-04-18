@@ -25,8 +25,9 @@ into two crates following the same pattern:
    bonding-only binary uses the built-in `WeightedRttScheduler` and still
    gets RTT-aware aggregation.
 2. **Transport-agnostic.** The 12-byte bond header wraps arbitrary bytes.
-   Paths can ride QUIC, SRT, RIST, or raw UDP independently; the header
-   stays the same.
+   Paths can ride any datagram-ish transport independently; the header
+   stays the same. Current adapters: QUIC, RIST, raw UDP. SRT is a Phase 3
+   target — see the implementation-status table below.
 3. **Lock-free hot path.** Stats are `AtomicU64`; reassembly is a flat
    ring indexed by `bond_seq % capacity`. Same constraints as the edge
    data plane.
@@ -132,6 +133,24 @@ cargo build          # debug, both crates
 cargo test           # all unit tests in bonding-protocol
 cargo build --release
 ```
+
+## NIC Pinning
+
+Each UDP path accepts an optional `interface` field (e.g. `"wwan0"`,
+`"eth0"`) that pins egress to a specific NIC regardless of the
+kernel routing table. Without it, multiple paths to the same
+destination collapse onto the default route and the bond is
+cosmetic.
+
+- Linux / Android → `SO_BINDTODEVICE`, needs `CAP_NET_RAW` (grant via
+  `setcap cap_net_raw+ep <bin>` or systemd `AmbientCapabilities`).
+- macOS / FreeBSD / Fuchsia → `IP_BOUND_IF` / `IPV6_BOUND_IF`,
+  unprivileged.
+- Other platforms → not implemented; fall back to source-IP binding
+  + policy routing.
+
+Full reference (capability grants, systemd snippet, policy-routing
+fallback, troubleshooting): [`docs/nic-pinning.md`](docs/nic-pinning.md).
 
 ## Key Design Decisions
 

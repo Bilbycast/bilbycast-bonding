@@ -162,6 +162,7 @@ async fn udp_plus_quic_deliver_in_order() {
                 transport: PathTransport::Udp {
                     bind: Some(udp_addr),
                     remote: None,
+                    interface: None,
                 },
             },
             PathConfig {
@@ -193,6 +194,7 @@ async fn udp_plus_quic_deliver_in_order() {
                 transport: PathTransport::Udp {
                     bind: None,
                     remote: Some(udp_addr),
+                    interface: None,
                 },
             },
             PathConfig {

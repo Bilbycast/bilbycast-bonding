@@ -50,6 +50,11 @@ pub enum PathError {
         addr: String,
         source: std::io::Error,
     },
+    #[error("path pin to interface '{interface}' failed: {source}")]
+    BindInterface {
+        interface: String,
+        source: std::io::Error,
+    },
     #[error("{0}")]
     Other(String),
 }

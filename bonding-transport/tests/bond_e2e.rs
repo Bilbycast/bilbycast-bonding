@@ -119,6 +119,7 @@ async fn two_path_bond_clean_delivers_in_order() {
                 transport: PathTransport::Udp {
                     bind: Some(rx_a),
                     remote: None,
+                    interface: None,
                 },
             },
             PathConfig {
@@ -128,6 +129,7 @@ async fn two_path_bond_clean_delivers_in_order() {
                 transport: PathTransport::Udp {
                     bind: Some(rx_b),
                     remote: None,
+                    interface: None,
                 },
             },
         ],
@@ -146,6 +148,7 @@ async fn two_path_bond_clean_delivers_in_order() {
                 transport: PathTransport::Udp {
                     bind: None,
                     remote: Some(rx_a),
+                    interface: None,
                 },
             },
             PathConfig {
@@ -155,6 +158,7 @@ async fn two_path_bond_clean_delivers_in_order() {
                 transport: PathTransport::Udp {
                     bind: None,
                     remote: Some(rx_b),
+                    interface: None,
                 },
             },
         ],
@@ -246,6 +250,7 @@ async fn nack_recovers_losses_across_paths() {
                 transport: PathTransport::Udp {
                     bind: Some(rx_a),
                     remote: None,
+                    interface: None,
                 },
             },
             PathConfig {
@@ -255,6 +260,7 @@ async fn nack_recovers_losses_across_paths() {
                 transport: PathTransport::Udp {
                     bind: Some(rx_b),
                     remote: None,
+                    interface: None,
                 },
             },
         ],
@@ -274,6 +280,7 @@ async fn nack_recovers_losses_across_paths() {
                 transport: PathTransport::Udp {
                     bind: None,
                     remote: Some(relay_a),
+                    interface: None,
                 },
             },
             PathConfig {
@@ -283,6 +290,7 @@ async fn nack_recovers_losses_across_paths() {
                 transport: PathTransport::Udp {
                     bind: None,
                     remote: Some(relay_b),
+                    interface: None,
                 },
             },
         ],

@@ -67,9 +67,16 @@ pub enum PathTransport {
     /// the receiver side. `remote` is the primary peer on the sender
     /// side and the expected peer on the receiver side (`None` =
     /// learn on first packet).
+    ///
+    /// `interface` pins egress traffic to a specific NIC (e.g.
+    /// `"eth0"`, `"wwan0"`). `None` leaves selection to the kernel
+    /// routing table. See `docs/nic-pinning.md` for platform
+    /// requirements (Linux needs `CAP_NET_RAW`; macOS / FreeBSD are
+    /// unprivileged).
     Udp {
         bind: Option<SocketAddr>,
         remote: Option<SocketAddr>,
+        interface: Option<String>,
     },
     /// RIST Simple Profile — unidirectional at the bond layer.
     /// `role` decides whether this leg transmits or receives bond

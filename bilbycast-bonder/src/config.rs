@@ -13,12 +13,18 @@
 //!   "scheduler": "weighted_rtt",
 //!   "paths": [
 //!     { "id": 0, "name": "lte-0",
-//!       "transport": { "type": "udp", "remote": "hub.example.com:7000" } },
+//!       "transport": { "type": "udp", "remote": "hub.example.com:7000",
+//!                      "interface": "wwan0" } },
 //!     { "id": 1, "name": "ether",
-//!       "transport": { "type": "udp", "remote": "hub.example.com:7001" } }
+//!       "transport": { "type": "udp", "remote": "hub.example.com:7001",
+//!                      "interface": "eth0" } }
 //!   ]
 //! }
 //! ```
+//!
+//! The optional `interface` pins egress to a specific NIC — see
+//! `docs/nic-pinning.md` for platform requirements. Omit it to let
+//! the kernel routing table decide.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -110,11 +116,18 @@ fn default_weight() -> u32 {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PathTransportSpec {
     /// Raw UDP — simplest path, works anywhere UDP does.
+    ///
+    /// `interface` optionally pins egress traffic to a specific NIC
+    /// (`"eth0"`, `"wwan0"`, …) so paths don't all collapse onto the
+    /// default route. See `docs/nic-pinning.md` — on Linux this needs
+    /// `CAP_NET_RAW`; on macOS / FreeBSD it is unprivileged.
     Udp {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         bind: Option<SocketAddr>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         remote: Option<SocketAddr>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        interface: Option<String>,
     },
     /// RIST Simple Profile leg. `role` MUST match the sender / receiver
     /// intent: senders use RIST-sender legs, receivers use
@@ -226,9 +239,14 @@ impl BonderConfig {
 
 fn translate_transport(t: &PathTransportSpec) -> anyhow::Result<TxPathTransport> {
     Ok(match t {
-        PathTransportSpec::Udp { bind, remote } => TxPathTransport::Udp {
+        PathTransportSpec::Udp {
+            bind,
+            remote,
+            interface,
+        } => TxPathTransport::Udp {
             bind: *bind,
             remote: *remote,
+            interface: interface.clone(),
         },
         #[cfg(feature = "path-rist")]
         PathTransportSpec::Rist {
