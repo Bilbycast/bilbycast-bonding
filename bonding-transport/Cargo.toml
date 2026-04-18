@@ -1,6 +1,6 @@
 [package]
 name = "bonding-transport"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Async bonding transport: path managers, scheduler wiring, stats"
 license = "MPL-2.0"

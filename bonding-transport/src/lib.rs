@@ -46,12 +46,14 @@
 //! ```
 
 pub mod config;
+pub(crate) mod health;
 pub mod path;
 pub mod receiver;
 pub mod sender;
 pub mod socket;
 
 pub use bonding_protocol::{
+    events::{PathDeadReason, PathEvent, PathEventKind},
     packet::{BondHeader, Priority},
     protocol::{
         path_health::PathHealth,

@@ -37,8 +37,10 @@
 
 pub mod control;
 pub mod error;
+pub mod events;
 pub mod packet;
 pub mod protocol;
 pub mod stats;
 
 pub use error::{BondError, Result};
+pub use events::{PathDeadReason, PathEvent, PathEventKind};

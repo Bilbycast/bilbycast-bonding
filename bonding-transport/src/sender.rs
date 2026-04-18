@@ -15,13 +15,14 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use bonding_protocol::control::{
     CtrlHeader, CtrlPacket, CtrlType, KeepaliveBody, is_control,
 };
+use bonding_protocol::events::{PathDeadReason, PathEvent, PathEventKind};
 use bonding_protocol::packet::{BondHeader, Priority, write_packet};
 use bonding_protocol::protocol::path_health::PathHealth;
 use bonding_protocol::protocol::retransmit::RetransmitBuffer;
@@ -30,6 +31,7 @@ use bonding_protocol::protocol::scheduler::{
 };
 use bonding_protocol::stats::{BondConnStats, PathStats};
 
+use crate::health::BondHealthMonitor;
 use crate::path::{Path, PathDatagram};
 
 /// App-facing outbound message.
@@ -43,14 +45,18 @@ pub(crate) struct SenderHandle {
     pub tx: mpsc::Sender<OutboundMessage>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_sender<S>(
     flow_id: u32,
     mut paths: Vec<Path>,
     scheduler: S,
     conn_stats: Arc<BondConnStats>,
     path_stats: Vec<Arc<PathStats>>,
+    path_names: Vec<String>,
     keepalive_interval: Duration,
+    keepalive_miss_threshold: u32,
     retransmit_capacity: usize,
+    events_tx: broadcast::Sender<PathEvent>,
     cancel: CancellationToken,
 ) -> (SenderHandle, JoinHandle<()>)
 where
@@ -86,8 +92,11 @@ where
             scheduler,
             conn_stats,
             path_stats,
+            path_names,
             keepalive_interval,
+            keepalive_miss_threshold,
             retransmit_capacity,
+            events_tx,
             rx,
             ctrl_rx,
             cancel,
@@ -108,8 +117,11 @@ async fn sender_loop<S>(
     mut scheduler: S,
     conn_stats: Arc<BondConnStats>,
     path_stats: Vec<Arc<PathStats>>,
+    path_names: Vec<String>,
     keepalive_interval: Duration,
+    keepalive_miss_threshold: u32,
     retransmit_capacity: usize,
+    events_tx: broadcast::Sender<PathEvent>,
     mut app_rx: mpsc::Receiver<OutboundMessage>,
     mut ctrl_rx: mpsc::Receiver<(PathId, PathDatagram)>,
     cancel: CancellationToken,
@@ -140,6 +152,30 @@ where
 
     let path_index_by_id = |id: PathId| -> Option<usize> { paths.iter().position(|p| p.id() == id) };
     let path_stats_for = |idx: usize| -> Option<&Arc<PathStats>> { path_stats.get(idx) };
+
+    // Liveness monitor — fires a KA timeout once no ack has been seen
+    // for `keepalive_miss_threshold * keepalive_interval`. A keepalive
+    // ack on any path counts as that path's activity.
+    let liveness_timeout =
+        keepalive_interval.saturating_mul(keepalive_miss_threshold.max(1));
+    let now_start = Instant::now();
+    let monitor_inputs: Vec<(PathId, String, Arc<PathStats>)> = paths
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let name = path_names.get(i).cloned().unwrap_or_default();
+            (p.id(), name, path_stats[i].clone())
+        })
+        .collect();
+    let mut monitor = BondHealthMonitor::new(monitor_inputs, liveness_timeout, now_start);
+
+    // Fires at the liveness-timeout cadence so timeouts are detected
+    // with a bounded latency even during a quiet period where no app
+    // traffic is flowing.
+    let mut liveness_tick = tokio::time::interval(liveness_timeout);
+    liveness_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Swallow the immediate first tick; it fires at t=0.
+    liveness_tick.tick().await;
 
     loop {
         tokio::select! {
@@ -248,6 +284,15 @@ where
                                         ..Default::default()
                                     };
                                     scheduler.on_path_update(path_id, &health);
+                                    // Liveness: a fresh ack revives this
+                                    // path if it was dead. Also tell the
+                                    // scheduler so weights restore.
+                                    for ev in monitor.record_activity(path_id, Instant::now()) {
+                                        if matches!(ev.kind, PathEventKind::PathAlive { .. }) {
+                                            scheduler.on_path_alive(path_id);
+                                        }
+                                        let _ = events_tx.send(ev);
+                                    }
                                 }
                             }
                         }
@@ -298,6 +343,19 @@ where
                         }
                     }
                     Ok(_) | Err(_) => { /* ignore goodbye + parse errors */ }
+                }
+            }
+
+            // Periodic liveness sweep — flip paths to dead after
+            // `keepalive_miss_threshold` intervals with no ack and
+            // emit both the per-path PathDead and any bond
+            // aggregate transition (Degraded / Down).
+            _ = liveness_tick.tick() => {
+                for ev in monitor.check_timeouts(Instant::now(), PathDeadReason::KeepaliveTimeout) {
+                    if let PathEventKind::PathDead { .. } = &ev.kind {
+                        scheduler.on_path_dead(ev.path_id);
+                    }
+                    let _ = events_tx.send(ev);
                 }
             }
 

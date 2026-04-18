@@ -20,10 +20,11 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use thiserror::Error;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, broadcast};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use bonding_protocol::events::PathEvent;
 use bonding_protocol::protocol::scheduler::{BondScheduler, PacketHints, PathId};
 use bonding_protocol::stats::{BondConnStats, PathStats};
 
@@ -31,6 +32,12 @@ use crate::config::{BondSocketConfig, PathTransport};
 use crate::path::{Path, PathError, UdpPath};
 use crate::receiver::{ReceiverHandle, spawn_receiver};
 use crate::sender::{OutboundMessage, SenderHandle, spawn_sender};
+
+/// Capacity of the path-event broadcast channel. Events are emitted
+/// only on lifecycle transitions (alive↔dead, aggregate bond state
+/// crossings), so a handful at peak is typical; 64 leaves ample
+/// headroom for slow subscribers without materially wasting memory.
+const PATH_EVENT_CHANNEL_CAPACITY: usize = 64;
 
 #[derive(Debug, Error)]
 pub enum BondSocketError {
@@ -56,6 +63,7 @@ pub struct BondSocket {
     conn_stats: Arc<BondConnStats>,
     path_stats: Vec<Arc<PathStats>>,
     path_ids: Vec<PathId>,
+    events_tx: broadcast::Sender<PathEvent>,
     cancel: CancellationToken,
     _tasks: Vec<JoinHandle<()>>,
 }
@@ -70,9 +78,10 @@ impl BondSocket {
         if cfg.paths.is_empty() {
             return Err(BondSocketError::NoPaths);
         }
-        let (paths, path_stats, path_ids) = build_paths(&cfg, true).await?;
+        let (paths, path_stats, path_ids, path_names) = build_paths(&cfg, true).await?;
         let conn_stats = BondConnStats::new();
         let cancel = CancellationToken::new();
+        let (events_tx, _) = broadcast::channel(PATH_EVENT_CHANNEL_CAPACITY);
 
         let (sender_handle, task) = spawn_sender(
             cfg.flow_id,
@@ -80,8 +89,11 @@ impl BondSocket {
             scheduler,
             conn_stats.clone(),
             path_stats.clone(),
+            path_names,
             cfg.keepalive_interval,
+            cfg.keepalive_miss_threshold,
             cfg.retransmit_capacity,
+            events_tx.clone(),
             cancel.clone(),
         );
 
@@ -91,6 +103,7 @@ impl BondSocket {
             conn_stats,
             path_stats,
             path_ids,
+            events_tx,
             cancel,
             _tasks: vec![task],
         })
@@ -101,9 +114,10 @@ impl BondSocket {
         if cfg.paths.is_empty() {
             return Err(BondSocketError::NoPaths);
         }
-        let (paths, path_stats, path_ids) = build_paths(&cfg, false).await?;
+        let (paths, path_stats, path_ids, path_names) = build_paths(&cfg, false).await?;
         let conn_stats = BondConnStats::new();
         let cancel = CancellationToken::new();
+        let (events_tx, _) = broadcast::channel(PATH_EVENT_CHANNEL_CAPACITY);
 
         let (recv_handle, task) = spawn_receiver(
             cfg.flow_id,
@@ -111,6 +125,10 @@ impl BondSocket {
             cfg.hold_time,
             conn_stats.clone(),
             path_stats.clone(),
+            path_names,
+            cfg.keepalive_interval,
+            cfg.keepalive_miss_threshold,
+            events_tx.clone(),
             cancel.clone(),
             cfg.nack_delay,
             cfg.max_nack_retries,
@@ -122,6 +140,7 @@ impl BondSocket {
             conn_stats,
             path_stats,
             path_ids,
+            events_tx,
             cancel,
             _tasks: vec![task],
         })
@@ -166,6 +185,17 @@ impl BondSocket {
         &self.path_ids
     }
 
+    /// Subscribe to the bonding lifecycle event stream.
+    ///
+    /// Events are emitted once per transition — path alive ↔ dead,
+    /// bond aggregate up ↔ degraded ↔ down. No periodic ticks, so
+    /// a subscriber that misses an event by lagging (the broadcast
+    /// channel drops old items under pressure) should reconcile by
+    /// inspecting [`PathStats::dead`] afterwards.
+    pub fn subscribe_events(&self) -> broadcast::Receiver<PathEvent> {
+        self.events_tx.subscribe()
+    }
+
     /// Signal shutdown. Background tasks observe the cancel token
     /// and exit cleanly.
     pub fn close(&self) {
@@ -182,17 +212,19 @@ impl Drop for BondSocket {
 async fn build_paths(
     cfg: &BondSocketConfig,
     sender_mode: bool,
-) -> BondResult<(Vec<Path>, Vec<Arc<PathStats>>, Vec<PathId>)> {
+) -> BondResult<(Vec<Path>, Vec<Arc<PathStats>>, Vec<PathId>, Vec<String>)> {
     let mut paths = Vec::with_capacity(cfg.paths.len());
     let mut stats = Vec::with_capacity(cfg.paths.len());
     let mut ids = Vec::with_capacity(cfg.paths.len());
+    let mut names = Vec::with_capacity(cfg.paths.len());
     for p in &cfg.paths {
         let path = build_one_path(p, sender_mode).await?;
         stats.push(PathStats::new());
         ids.push(p.id);
+        names.push(p.name.clone());
         paths.push(path);
     }
-    Ok((paths, stats, ids))
+    Ok((paths, stats, ids, names))
 }
 
 async fn build_one_path(

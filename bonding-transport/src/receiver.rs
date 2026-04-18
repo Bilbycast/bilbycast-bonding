@@ -13,30 +13,37 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use bonding_protocol::control::{
     CtrlHeader, CtrlPacket, CtrlType, KeepaliveAckBody, NackBody, is_control,
 };
+use bonding_protocol::events::{PathDeadReason, PathEvent};
 use bonding_protocol::packet::BondHeader;
 use bonding_protocol::protocol::reassembly::{DrainItem, ReassemblyBuffer};
 use bonding_protocol::protocol::scheduler::PathId;
 use bonding_protocol::stats::{BondConnStats, PathStats};
 
+use crate::health::BondHealthMonitor;
 use crate::path::{Path, PathDatagram};
 
 pub(crate) struct ReceiverHandle {
     pub rx: mpsc::Receiver<Bytes>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_receiver(
     flow_id: u32,
     mut paths: Vec<Path>,
     hold_time: Duration,
     conn_stats: Arc<BondConnStats>,
     path_stats: Vec<Arc<PathStats>>,
+    path_names: Vec<String>,
+    keepalive_interval: Duration,
+    keepalive_miss_threshold: u32,
+    events_tx: broadcast::Sender<PathEvent>,
     cancel: CancellationToken,
     nack_delay: Duration,
     max_nack_retries: u32,
@@ -69,6 +76,10 @@ pub(crate) fn spawn_receiver(
             hold_time,
             conn_stats,
             path_stats,
+            path_names,
+            keepalive_interval,
+            keepalive_miss_threshold,
+            events_tx,
             app_tx,
             mux_rx,
             cancel,
@@ -100,6 +111,10 @@ async fn receiver_loop(
     hold_time: Duration,
     conn_stats: Arc<BondConnStats>,
     path_stats: Vec<Arc<PathStats>>,
+    path_names: Vec<String>,
+    keepalive_interval: Duration,
+    keepalive_miss_threshold: u32,
+    events_tx: broadcast::Sender<PathEvent>,
     app_tx: mpsc::Sender<Bytes>,
     mut mux_rx: mpsc::Receiver<(PathId, PathDatagram)>,
     cancel: CancellationToken,
@@ -124,6 +139,25 @@ async fn receiver_loop(
     let path_index_by_id = |id: PathId| -> Option<usize> { paths.iter().position(|p| p.id() == id) };
     let path_stats_for = |idx: usize| -> Option<&Arc<PathStats>> { path_stats.get(idx) };
 
+    // Receiver-side liveness: any inbound datagram (data or control)
+    // counts as activity on a path. A path with no activity for
+    // `keepalive_miss_threshold * keepalive_interval` flips to dead.
+    let liveness_timeout =
+        keepalive_interval.saturating_mul(keepalive_miss_threshold.max(1));
+    let now_start = Instant::now();
+    let monitor_inputs: Vec<(PathId, String, Arc<PathStats>)> = paths
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let name = path_names.get(i).cloned().unwrap_or_default();
+            (p.id(), name, path_stats[i].clone())
+        })
+        .collect();
+    let mut monitor = BondHealthMonitor::new(monitor_inputs, liveness_timeout, now_start);
+    let mut liveness_tick = tokio::time::interval(liveness_timeout);
+    liveness_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    liveness_tick.tick().await;
+
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
@@ -137,6 +171,12 @@ async fn receiver_loop(
                     return Ok(());
                 };
                 let path_idx = path_index_by_id(path_id);
+                // Any inbound datagram — even a keepalive — counts as
+                // a liveness signal. Emit revival events if this path
+                // was previously dead.
+                for ev in monitor.record_activity(path_id, Instant::now()) {
+                    let _ = events_tx.send(ev);
+                }
                 if is_control(&dg.data) {
                     // Remember peer before handling control so the
                     // echo goes back to the right address even if the
@@ -261,6 +301,12 @@ async fn receiver_loop(
                             nacks_sent: 0,
                         });
                     }
+                }
+            }
+
+            _ = liveness_tick.tick() => {
+                for ev in monitor.check_timeouts(Instant::now(), PathDeadReason::ReceiveTimeout) {
+                    let _ = events_tx.send(ev);
                 }
             }
 
