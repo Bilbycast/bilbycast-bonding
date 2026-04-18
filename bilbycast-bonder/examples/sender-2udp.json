@@ -1,0 +1,13 @@
+{
+  "flow_id": 42,
+  "role": "sender",
+  "input": { "type": "udp", "bind": "0.0.0.0:5555" },
+  "scheduler": "weighted_rtt",
+  "paths": [
+    { "id": 0, "name": "lte-0",
+      "transport": { "type": "udp", "remote": "127.0.0.1:7000" } },
+    { "id": 1, "name": "ethernet",
+      "transport": { "type": "udp", "remote": "127.0.0.1:7002" } }
+  ],
+  "tuning": { "hold_ms": 400, "keepalive_ms": 200 }
+}

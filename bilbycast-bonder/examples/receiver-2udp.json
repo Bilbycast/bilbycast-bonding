@@ -1,0 +1,12 @@
+{
+  "flow_id": 42,
+  "role": "receiver",
+  "output": { "type": "udp", "dest": "127.0.0.1:5000" },
+  "paths": [
+    { "id": 0, "name": "lte-0",
+      "transport": { "type": "udp", "bind": "0.0.0.0:7000" } },
+    { "id": 1, "name": "ethernet",
+      "transport": { "type": "udp", "bind": "0.0.0.0:7002" } }
+  ],
+  "tuning": { "hold_ms": 400, "keepalive_ms": 200 }
+}

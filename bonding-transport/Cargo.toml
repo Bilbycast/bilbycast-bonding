@@ -1,0 +1,37 @@
+[package]
+name = "bonding-transport"
+version = "0.1.0"
+edition = "2024"
+description = "Async bonding transport: path managers, scheduler wiring, stats"
+license = "MPL-2.0"
+
+[features]
+default = ["path-udp", "path-rist", "path-quic"]
+path-udp = []
+path-rist = ["dep:rist-transport"]
+path-quic = ["dep:quinn", "dep:rustls", "dep:rcgen", "dep:rustls-pemfile"]
+# SRT is opt-in so lightweight bonder builds don't need libsrt
+path-srt = ["dep:srt-transport"]
+
+[dependencies]
+bonding-protocol = { path = "../bonding-protocol" }
+tokio = { version = "1.51", features = ["net", "rt-multi-thread", "time", "sync", "macros"] }
+bytes = "1.11"
+log = "0.4"
+thiserror = "2.0"
+anyhow = "1.0"
+tokio-util = "0.7"
+socket2 = "0.6"
+
+# Optional path transports
+rist-transport = { path = "../../bilbycast-rist/rist-transport", optional = true }
+quinn = { version = "0.11", default-features = false, features = ["rustls-ring", "runtime-tokio"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
+rcgen = { version = "0.13", optional = true }
+rustls-pemfile = { version = "2", optional = true }
+srt-transport = { path = "../../bilbycast-libsrt-rs/srt-transport", optional = true }
+
+[dev-dependencies]
+env_logger = "0.11"
+rand = "0.9"
+tokio = { version = "1.51", features = ["net", "rt-multi-thread", "time", "sync", "macros", "test-util"] }

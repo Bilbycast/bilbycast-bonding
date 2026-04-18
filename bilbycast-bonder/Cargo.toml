@@ -1,0 +1,29 @@
+[package]
+name = "bilbycast-bonder"
+version = "0.1.0"
+edition = "2024"
+description = "Dedicated packet-bonding appliance — small binary built on bilbycast-bonding, no libav / no fdk-aac"
+license = "MPL-2.0"
+
+[[bin]]
+name = "bilbycast-bonder"
+path = "src/main.rs"
+
+[features]
+default = ["path-udp", "path-rist", "path-quic"]
+# Pass-through features to bonding-transport so a lean build can
+# drop the QUIC / RIST dependencies entirely.
+path-udp = ["bonding-transport/path-udp"]
+path-rist = ["bonding-transport/path-rist"]
+path-quic = ["bonding-transport/path-quic"]
+
+[dependencies]
+bonding-transport = { path = "../bonding-transport", default-features = false }
+tokio = { version = "1.51", features = ["rt-multi-thread", "net", "time", "sync", "macros", "signal", "io-util"] }
+bytes = "1.11"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+env_logger = "0.11"
+log = "0.4"

@@ -1,0 +1,15 @@
+{
+  "flow_id": 43,
+  "role": "receiver",
+  "output": { "type": "udp", "dest": "127.0.0.1:5000" },
+  "paths": [
+    { "id": 0, "name": "udp",
+      "transport": { "type": "udp", "bind": "0.0.0.0:7000" } },
+    { "id": 1, "name": "quic",
+      "transport": { "type": "quic",
+                      "quic_role": "server",
+                      "addr": "0.0.0.0:7001",
+                      "server_name": "localhost",
+                      "tls": { "mode": "self_signed" } } }
+  ]
+}

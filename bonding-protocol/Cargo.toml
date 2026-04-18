@@ -1,0 +1,11 @@
+[package]
+name = "bonding-protocol"
+version = "0.1.0"
+edition = "2024"
+description = "Pure Rust packet-bonding protocol (media-aware multi-path aggregation for broadcast)"
+license = "MPL-2.0"
+
+[dependencies]
+bytes = "1.11"
+log = "0.4"
+thiserror = "2.0"

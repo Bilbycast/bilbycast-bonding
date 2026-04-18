@@ -1,0 +1,7 @@
+[workspace]
+members = [
+    "bonding-protocol",
+    "bonding-transport",
+    "bilbycast-bonder",
+]
+resolver = "2"
