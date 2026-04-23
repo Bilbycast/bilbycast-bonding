@@ -78,7 +78,7 @@ async fn spawn_lossy_relay(
                 }
                 if forward_loss > 0.0 {
                     let roll: f32 = {
-                        use rand::Rng;
+                        use rand::RngExt;
                         rand::rng().random()
                     };
                     if roll < forward_loss {

@@ -369,7 +369,7 @@ fn build_server_config(tls: &QuicTls) -> PathResult<ServerConfig> {
             let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])
                 .map_err(|e| PathError::Other(format!("self-sign cert: {e}")))?;
             let cert_der = CertificateDer::from(cert.cert.der().to_vec());
-            let key_der = PrivateKeyDer::try_from(cert.key_pair.serialize_der())
+            let key_der = PrivateKeyDer::try_from(cert.signing_key.serialize_der())
                 .map_err(|e| PathError::Other(format!("self-sign key: {e}")))?;
             (vec![cert_der], key_der)
         }

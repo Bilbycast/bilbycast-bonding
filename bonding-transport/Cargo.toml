@@ -27,7 +27,7 @@ socket2 = "0.6"
 rist-transport = { path = "../../bilbycast-rist/rist-transport", optional = true }
 quinn = { version = "0.11", default-features = false, features = ["rustls-ring", "runtime-tokio"], optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
-rcgen = { version = "0.13", optional = true }
+rcgen = { version = "0.14", optional = true }
 rustls-pemfile = { version = "2", optional = true }
 srt-transport = { path = "../../bilbycast-libsrt-rs/srt-transport", optional = true }
 
@@ -38,5 +38,5 @@ libc = "0.2"
 
 [dev-dependencies]
 env_logger = "0.11"
-rand = "0.9"
+rand = "0.10"
 tokio = { version = "1.51", features = ["net", "rt-multi-thread", "time", "sync", "macros", "test-util"] }
