@@ -4,6 +4,7 @@ version = "0.3.0"
 edition = "2024"
 description = "Async bonding transport: path managers, scheduler wiring, stats"
 license = "MPL-2.0"
+publish = false
 
 [features]
 default = ["path-udp", "path-rist", "path-quic"]
