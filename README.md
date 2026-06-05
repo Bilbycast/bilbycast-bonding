@@ -25,8 +25,17 @@ etc.) on the axes that broadcast actually cares about.
 
 ## Status
 
-Phase 1 complete: wire format, reassembly buffer, scheduler trait,
-built-in schedulers, stats. `cargo test` green.
+Wire format, reassembly buffer, scheduler trait, built-in schedulers,
+and stats are complete. The async transport layer is also done: UDP,
+RIST, and QUIC path adapters, the sender/receiver tasks, the public
+`BondSocket` API, and the standalone `bilbycast-bonder` binary all ship
+today. `cargo test` green.
+
+Remaining: the SRT path adapter (the `path-srt` feature and
+`srt-transport` dependency are declared, but the `Srt` config variant
+and adapter aren't wired yet) and edge integration
+(`bonded_input` / `bonded_output` plus the edge-side
+`MediaAwareScheduler`).
 
 See [`CLAUDE.md`](CLAUDE.md) for the full module map, design
-principles, and phased build-out plan.
+principles, and implementation-status table.

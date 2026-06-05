@@ -199,8 +199,14 @@ Not wired into bilbycast-bonding today. If you need this, run one
   On Linux, `ss -e` also prints the bound device when
   `SO_BINDTODEVICE` is set.
 - **Interface names must match the kernel's view** (`ip link`,
-  `ifconfig`). On Linux the limit is 15 characters (`IFNAMSIZ - 1`);
-  bilbycast-bonding validates this at config load.
+  `ifconfig`). On Linux the kernel limit is 15 characters
+  (`IFNAMSIZ - 1`). bilbycast-bonding does **not** pre-validate the
+  name at config load — it is passed straight to the OS at socket
+  creation time (`SO_BINDTODEVICE` on Linux/Android,
+  `if_nametoindex` + `IP_BOUND_IF`/`IPV6_BOUND_IF` on Apple/BSD), so
+  an invalid or over-long name surfaces as a bind error from the
+  kernel then (see the troubleshooting table), not as a config-load
+  failure.
 - **IPv6 is handled transparently** — the same `interface` field
   pins both IPv4 and IPv6 UDP sockets.
 - **Mobile interfaces can change index on reconnect**; the bonding

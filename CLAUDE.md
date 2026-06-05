@@ -14,7 +14,7 @@ into two crates following the same pattern:
 | Crate | Role |
 |-------|------|
 | **bonding-protocol** | Pure I/O-free core: wire header, reassembly buffer, scheduler trait + built-in implementations, stats types. |
-| **bonding-transport** | Async wiring on tokio: path adapters, sender/receiver tasks, `BondSocket` API. (Phase 2.) |
+| **bonding-transport** | Async wiring on tokio: path adapters (UDP / RIST / QUIC), sender/receiver tasks, `BondSocket` API. |
 
 ## Design Principles
 
@@ -66,26 +66,36 @@ Each bonded packet is a 12-byte header followed by opaque payload:
 ## Module Map
 
 ### bonding-protocol
-- `packet/` — wire header, priority enum, flags.
+- `packet.rs` — wire header, priority enum, flags.
+- `control.rs` — control-channel messages (NACK / keepalive) shared by
+  sender and receiver.
 - `protocol/reassembly.rs` — `ReassemblyBuffer` (32-bit seq, per-path
   accounting, gap timeout).
+- `protocol/retransmit.rs` — retransmit buffer + NACK-driven resend
+  bookkeeping.
 - `protocol/scheduler.rs` — `BondScheduler` trait, `RoundRobinScheduler`,
   `WeightedRttScheduler`.
 - `protocol/path_health.rs` — `PathHealth` snapshot driven into the
   scheduler once per health tick.
 - `stats.rs` — `BondConnStats` (aggregate) + `PathStats` (per-path),
   both `Arc<AtomicU64>` patterned, with snapshot types for exporters.
+- `events.rs` — `PathEvent` types broadcast to subscribers.
 - `error.rs` — `BondError`.
 
-### bonding-transport *(Phase 2)*
+### bonding-transport
 - `config.rs` — `BondSocketConfig`, `PathConfig`, `PathTransport` enum
-  (QUIC / UDP / SRT / RIST variants).
-- `path.rs` — uniform `BondPath` trait wrapping each transport.
+  (`Udp` / `Rist` / `Quic` variants today; `Srt` not yet wired).
+- `path/` — uniform `BondPath` trait (`mod.rs`) plus the concrete
+  adapters: `udp.rs`, `rist.rs`, `quic.rs`.
 - `sender.rs` — outbound task: consults scheduler, frames header,
   writes to selected path(s).
 - `receiver.rs` — inbound task: multiplexes N paths into a
   `ReassemblyBuffer`, drains in bond-seq order.
-- `socket.rs` — public `BondSocket::sender()` / `::receiver()` API.
+- `health.rs` — per-path health tracking / `PathHealth` snapshots fed
+  to the scheduler.
+- `socket.rs` — public `BondSocket::sender()` / `::receiver()` API,
+  plus `send` / `recv` / `stats` / `path_stats` / `path_ids` /
+  `subscribe_events` / `close`.
 
 ## Implementation Status
 
@@ -97,14 +107,14 @@ Each bonded packet is a 12-byte header followed by opaque payload:
 | `RoundRobinScheduler` (default for bonding-only boxes) | Done |
 | `WeightedRttScheduler` (RTT-aware, Critical-duplicates) | Done |
 | Stats + snapshots | Done |
-| QUIC path adapter | Phase 2 |
-| Raw UDP path adapter | Phase 2 |
-| SRT path adapter (via bilbycast-libsrt-rs) | Phase 3 |
-| RIST path adapter (via bilbycast-rist) | Phase 3 |
-| `BondSocket::sender` / `::receiver` | Phase 2 |
-| Edge integration (input_bonded, output_bonded) | Phase 4 |
-| `MediaAwareScheduler` (edge-side, parses NAL) | Phase 4 |
-| Bonding-only binary (`bilbycast-bonder`) | Phase 5 |
+| QUIC path adapter | Done (`path/quic.rs`, `path-quic` default feature) |
+| Raw UDP path adapter | Done (`path/udp.rs`, `path-udp` default feature) |
+| RIST path adapter (via bilbycast-rist) | Done (`path/rist.rs`, `path-rist` default feature) |
+| SRT path adapter (via bilbycast-libsrt-rs) | Outstanding — `path-srt` feature + `srt-transport` dep declared, but no `Srt` config variant or `path/srt.rs` yet |
+| `BondSocket::sender` / `::receiver` (+ `send` / `recv` / `stats` / `path_stats` / `path_ids` / `subscribe_events` / `close`) | Done (`socket.rs`) |
+| Bonding-only binary (`bilbycast-bonder`) | Done (workspace member, `bilbycast-bonder/src/main.rs`) |
+| Edge integration (input_bonded, output_bonded) | Outstanding |
+| `MediaAwareScheduler` (edge-side, parses NAL) | Outstanding (edge-side) |
 
 ## Inter-Project Dependencies
 
