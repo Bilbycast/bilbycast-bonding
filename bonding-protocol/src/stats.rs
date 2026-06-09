@@ -12,6 +12,25 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+// NIC-pin mechanism codes carried on `PathStats::pin_mechanism`. The
+// concrete `PinMechanism` enum lives in `bonding-transport` (it owns
+// the syscalls); the protocol crate only stores the resolved code so
+// snapshots can report which primitive actually bound the path.
+pub const PIN_NONE: u64 = 0;
+pub const PIN_SO_BINDTODEVICE: u64 = 1;
+pub const PIN_IP_UNICAST_IF: u64 = 2;
+pub const PIN_IP_BOUND_IF: u64 = 3;
+
+/// Stable lowercase label for a `pin_mechanism` code.
+pub fn pin_mechanism_label(code: u64) -> &'static str {
+    match code {
+        PIN_SO_BINDTODEVICE => "so_bindtodevice",
+        PIN_IP_UNICAST_IF => "ip_unicast_if",
+        PIN_IP_BOUND_IF => "ip_bound_if",
+        _ => "none",
+    }
+}
+
 /// Aggregate-across-paths counters.
 #[derive(Debug, Default)]
 pub struct BondConnStats {
@@ -97,6 +116,10 @@ pub struct PathStats {
     pub queue_depth: AtomicU64,
     /// 1 when the path is currently declared dead, 0 when alive.
     pub dead: AtomicU64,
+    /// Resolved NIC-pin mechanism code (see `PIN_*`). Set once at
+    /// path construction; `PIN_NONE` when no `interface` pin was
+    /// requested.
+    pub pin_mechanism: AtomicU64,
 }
 
 impl PathStats {
@@ -122,6 +145,7 @@ impl PathStats {
             throughput_bps: self.throughput_bps.load(Ordering::Relaxed),
             queue_depth: self.queue_depth.load(Ordering::Relaxed),
             dead: self.dead.load(Ordering::Relaxed) != 0,
+            pin_mechanism: self.pin_mechanism.load(Ordering::Relaxed),
         }
     }
 }
@@ -144,6 +168,8 @@ pub struct PathStatsSnapshot {
     pub throughput_bps: u64,
     pub queue_depth: u64,
     pub dead: bool,
+    /// Resolved NIC-pin mechanism code (see `PIN_*`).
+    pub pin_mechanism: u64,
 }
 
 impl PathStatsSnapshot {
@@ -152,5 +178,9 @@ impl PathStatsSnapshot {
     }
     pub fn loss_fraction(&self) -> f64 {
         self.loss_ppm as f64 / 1_000_000.0
+    }
+    /// Lowercase label for the resolved NIC-pin mechanism.
+    pub fn pin_mechanism_label(&self) -> &'static str {
+        pin_mechanism_label(self.pin_mechanism)
     }
 }

@@ -219,7 +219,22 @@ async fn build_paths(
     let mut names = Vec::with_capacity(cfg.paths.len());
     for p in &cfg.paths {
         let path = build_one_path(p, sender_mode).await?;
-        stats.push(PathStats::new());
+        let ps = PathStats::new();
+        // Record which NIC-pin mechanism (if any) actually bound this
+        // path so the resolved value reaches telemetry.
+        let code = match path.pin_mechanism() {
+            Some(crate::path::PinMechanism::SoBindToDevice) => {
+                bonding_protocol::stats::PIN_SO_BINDTODEVICE
+            }
+            Some(crate::path::PinMechanism::UnicastIf) => {
+                bonding_protocol::stats::PIN_IP_UNICAST_IF
+            }
+            Some(crate::path::PinMechanism::BoundIf) => bonding_protocol::stats::PIN_IP_BOUND_IF,
+            None => bonding_protocol::stats::PIN_NONE,
+        };
+        ps.pin_mechanism
+            .store(code, std::sync::atomic::Ordering::Relaxed);
+        stats.push(ps);
         ids.push(p.id);
         names.push(p.name.clone());
         paths.push(path);

@@ -39,10 +39,43 @@ const DEFAULT_SOCK_BUF: usize = 2 * 1024 * 1024;
 /// Maximum UDP datagram we'll accept.
 const MAX_DATAGRAM: usize = 2048;
 
+/// Which kernel primitive actually pinned this path's egress to the
+/// requested NIC. Surfaced so telemetry can show whether a path got
+/// the hard device bind or the unprivileged egress hint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinMechanism {
+    /// `SO_BINDTODEVICE` (Linux/Android) — hard TX+RX bind to the
+    /// device. Needs `CAP_NET_RAW`.
+    SoBindToDevice,
+    /// `IP_UNICAST_IF` / `IPV6_UNICAST_IF` — unprivileged per-socket
+    /// egress interface hint. Used as the automatic fallback when
+    /// `SO_BINDTODEVICE` is denied (no `CAP_NET_RAW`). TX-only: it
+    /// steers the route lookup but does not hard-bind receive.
+    UnicastIf,
+    /// `IP_BOUND_IF` / `IPV6_BOUND_IF` (Apple / *BSD / Fuchsia) —
+    /// unprivileged device bind.
+    BoundIf,
+}
+
+impl PinMechanism {
+    /// Stable lowercase label for stats / Prometheus.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PinMechanism::SoBindToDevice => "so_bindtodevice",
+            PinMechanism::UnicastIf => "ip_unicast_if",
+            PinMechanism::BoundIf => "ip_bound_if",
+        }
+    }
+}
+
 pub struct UdpPath {
     id: PathId,
     name: String,
     socket: Arc<UdpSocket>,
+    /// `Some` when an `interface` pin was requested; records which
+    /// kernel mechanism actually succeeded (hard bind vs the
+    /// unprivileged hint fallback).
+    pin_mechanism: Option<PinMechanism>,
     primary_peer: Arc<Mutex<Option<SocketAddr>>>,
     /// Cached copy of the primary peer as a pair of atomics for the
     /// send hot path — avoids taking the Mutex on every
@@ -71,8 +104,14 @@ impl UdpPath {
         primary_peer: Option<SocketAddr>,
         interface: Option<&str>,
     ) -> PathResult<Self> {
-        let socket = Self::build_socket(local, interface).await?;
-        Ok(Self::from_socket(id, name.into(), socket, primary_peer))
+        let (socket, pin_mechanism) = Self::build_socket(local, interface).await?;
+        Ok(Self::from_socket(
+            id,
+            name.into(),
+            socket,
+            primary_peer,
+            pin_mechanism,
+        ))
     }
 
     /// Bind on an ephemeral local port (sender-mode convenience).
@@ -93,7 +132,7 @@ impl UdpPath {
     async fn build_socket(
         local: SocketAddr,
         interface: Option<&str>,
-    ) -> PathResult<Arc<UdpSocket>> {
+    ) -> PathResult<(Arc<UdpSocket>, Option<PinMechanism>)> {
         let domain = if local.is_ipv4() {
             Domain::IPV4
         } else {
@@ -110,14 +149,23 @@ impl UdpPath {
         let _ = sock.set_recv_buffer_size(DEFAULT_SOCK_BUF);
         let _ = sock.set_send_buffer_size(DEFAULT_SOCK_BUF);
         // NIC pin first — some platforms require it before bind.
-        if let Some(iface) = interface {
-            bind_to_interface(&sock, iface, local.is_ipv6()).map_err(|e| {
-                PathError::BindInterface {
-                    interface: iface.to_string(),
-                    source: e,
-                }
-            })?;
-        }
+        let pin_mechanism = if let Some(iface) = interface {
+            let mech =
+                bind_to_interface(&sock, iface, local.is_ipv6()).map_err(|e| {
+                    PathError::BindInterface {
+                        interface: iface.to_string(),
+                        source: e,
+                    }
+                })?;
+            log::info!(
+                "bond udp path pinned to interface '{}' via {}",
+                iface,
+                mech.as_str()
+            );
+            Some(mech)
+        } else {
+            None
+        };
         sock.bind(&local.into()).map_err(|e| PathError::Bind {
             addr: local.to_string(),
             source: e,
@@ -126,7 +174,13 @@ impl UdpPath {
             addr: local.to_string(),
             source: e,
         })?;
-        Ok(Arc::new(udp))
+        Ok((Arc::new(udp), pin_mechanism))
+    }
+
+    /// Which NIC-pin mechanism this path is using, if an `interface`
+    /// was requested. `None` = no pin (kernel routing decides egress).
+    pub fn pin_mechanism(&self) -> Option<PinMechanism> {
+        self.pin_mechanism
     }
 
     fn from_socket(
@@ -134,6 +188,7 @@ impl UdpPath {
         name: String,
         socket: Arc<UdpSocket>,
         primary_peer: Option<SocketAddr>,
+        pin_mechanism: Option<PinMechanism>,
     ) -> Self {
         let (tx, rx) = mpsc::channel::<PathDatagram>(1024);
         let cancel = CancellationToken::new();
@@ -143,6 +198,7 @@ impl UdpPath {
             id,
             name,
             socket,
+            pin_mechanism,
             primary_peer: Arc::new(Mutex::new(primary_peer)),
             primary_ip_hi: AtomicU64::new(0),
             primary_ip_lo: AtomicU64::new(0),
@@ -288,19 +344,79 @@ impl std::fmt::Debug for UdpPath {
 
 // ─── NIC pinning ─────────────────────────────────────────────────
 //
-// On Linux/Android: SO_BINDTODEVICE, needs CAP_NET_RAW.
+// On Linux/Android: prefer SO_BINDTODEVICE (hard TX+RX bind, needs
+//   CAP_NET_RAW); on EPERM/EACCES fall back to the unprivileged
+//   IP_UNICAST_IF / IPV6_UNICAST_IF egress hint so a non-privileged
+//   field box can still steer each path onto its own NIC.
 // On Apple / FreeBSD / Fuchsia: IP_BOUND_IF / IPV6_BOUND_IF by
-// interface index, unprivileged.
+//   interface index, unprivileged.
 // Elsewhere: return Unsupported so operators get a clear error
-// instead of silent fall-through to the default route.
+//   instead of silent fall-through to the default route.
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn bind_to_interface(sock: &Sock2, iface: &str, _is_ipv6: bool) -> std::io::Result<()> {
-    sock.bind_device(Some(iface.as_bytes()))
+fn bind_to_interface(sock: &Sock2, iface: &str, is_ipv6: bool) -> std::io::Result<PinMechanism> {
+    match sock.bind_device(Some(iface.as_bytes())) {
+        Ok(()) => Ok(PinMechanism::SoBindToDevice),
+        Err(e)
+            if matches!(e.raw_os_error(), Some(libc::EPERM) | Some(libc::EACCES)) =>
+        {
+            // No CAP_NET_RAW — degrade to the unprivileged egress hint.
+            set_unicast_if(sock, iface, is_ipv6)?;
+            log::info!(
+                "bond udp: SO_BINDTODEVICE('{iface}') denied (no CAP_NET_RAW); \
+                 using unprivileged IP_UNICAST_IF"
+            );
+            Ok(PinMechanism::UnicastIf)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Set `IP_UNICAST_IF` (IPv4) / `IPV6_UNICAST_IF` (IPv6) — an
+/// unprivileged per-socket egress-interface hint. Note the IPv4
+/// option takes the interface index in **network byte order** (a
+/// long-standing kernel quirk); the IPv6 option takes **host order**.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn set_unicast_if(sock: &Sock2, iface: &str, is_ipv6: bool) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let cname = std::ffi::CString::new(iface).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "interface name contains NUL byte",
+        )
+    })?;
+    // SAFETY: `cname` is a valid NUL-terminated C string.
+    let idx = unsafe { libc::if_nametoindex(cname.as_ptr()) };
+    if idx == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("interface '{iface}' not found (if_nametoindex returned 0)"),
+        ));
+    }
+    let (level, optname, optval) = if is_ipv6 {
+        (libc::IPPROTO_IPV6, libc::IPV6_UNICAST_IF, idx as libc::c_int)
+    } else {
+        // network byte order for IPv4 IP_UNICAST_IF.
+        (libc::IPPROTO_IP, libc::IP_UNICAST_IF, idx.to_be() as libc::c_int)
+    };
+    // SAFETY: `optval` is a valid `c_int` and `optlen` matches its size.
+    let rc = unsafe {
+        libc::setsockopt(
+            sock.as_raw_fd(),
+            level,
+            optname,
+            &optval as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 #[cfg(any(target_vendor = "apple", target_os = "freebsd", target_os = "fuchsia"))]
-fn bind_to_interface(sock: &Sock2, iface: &str, is_ipv6: bool) -> std::io::Result<()> {
+fn bind_to_interface(sock: &Sock2, iface: &str, is_ipv6: bool) -> std::io::Result<PinMechanism> {
     let cname = std::ffi::CString::new(iface).map_err(|_| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -316,10 +432,11 @@ fn bind_to_interface(sock: &Sock2, iface: &str, is_ipv6: bool) -> std::io::Resul
         )
     })?;
     if is_ipv6 {
-        sock.bind_device_by_index_v6(Some(idx))
+        sock.bind_device_by_index_v6(Some(idx))?;
     } else {
-        sock.bind_device_by_index_v4(Some(idx))
+        sock.bind_device_by_index_v4(Some(idx))?;
     }
+    Ok(PinMechanism::BoundIf)
 }
 
 #[cfg(not(any(
@@ -329,7 +446,7 @@ fn bind_to_interface(sock: &Sock2, iface: &str, is_ipv6: bool) -> std::io::Resul
     target_os = "freebsd",
     target_os = "fuchsia",
 )))]
-fn bind_to_interface(_sock: &Sock2, iface: &str, _is_ipv6: bool) -> std::io::Result<()> {
+fn bind_to_interface(_sock: &Sock2, iface: &str, _is_ipv6: bool) -> std::io::Result<PinMechanism> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         format!(
@@ -337,4 +454,48 @@ fn bind_to_interface(_sock: &Sock2, iface: &str, _is_ipv6: bool) -> std::io::Res
              use source-IP binding + policy routing instead"
         ),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pinning to the loopback interface must succeed and report a
+    /// concrete mechanism. Without `CAP_NET_RAW` (the usual test
+    /// environment) `SO_BINDTODEVICE` is denied and we expect the
+    /// automatic `IP_UNICAST_IF` fallback; with the cap we get the
+    /// hard bind. Either is a pass — the point is no silent failure.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[tokio::test]
+    async fn pin_to_loopback_reports_a_mechanism() {
+        let local: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let path = UdpPath::bind(0, "lo-test", local, None, Some("lo"))
+            .await
+            .expect("bind+pin to lo should succeed");
+        let mech = path.pin_mechanism().expect("a pin mechanism was requested");
+        assert!(
+            matches!(mech, PinMechanism::SoBindToDevice | PinMechanism::UnicastIf),
+            "expected SO_BINDTODEVICE or IP_UNICAST_IF, got {mech:?}"
+        );
+    }
+
+    /// No interface requested → no pin mechanism recorded.
+    #[tokio::test]
+    async fn no_interface_no_mechanism() {
+        let local: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let path = UdpPath::bind(0, "no-pin", local, None, None)
+            .await
+            .expect("plain bind should succeed");
+        assert!(path.pin_mechanism().is_none());
+    }
+
+    /// A bogus interface name must error, not silently fall through to
+    /// the default route (that would collapse all paths onto one link).
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[tokio::test]
+    async fn pin_to_missing_interface_errors() {
+        let local: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let res = UdpPath::bind(0, "bad", local, None, Some("definitely-not-a-nic0")).await;
+        assert!(res.is_err(), "pinning to a nonexistent NIC must fail loudly");
+    }
 }

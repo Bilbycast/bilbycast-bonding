@@ -34,7 +34,9 @@ srt-transport = { path = "../../bilbycast-libsrt-rs/srt-transport", optional = t
 
 # `if_nametoindex` for NIC pinning via IP_BOUND_IF on Apple / BSD /
 # Fuchsia. Linux uses SO_BINDTODEVICE which socket2 exposes directly.
-[target.'cfg(any(target_vendor = "apple", target_os = "freebsd", target_os = "fuchsia"))'.dependencies]
+# libc is used for NIC pinning: SO_BINDTODEVICE fallback to IP_UNICAST_IF
+# (Linux/Android) and IP_BOUND_IF by index (Apple/BSD/Fuchsia).
+[target.'cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple", target_os = "freebsd", target_os = "fuchsia"))'.dependencies]
 libc = "0.2"
 
 [dev-dependencies]

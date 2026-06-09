@@ -31,7 +31,7 @@ use tokio::sync::mpsc;
 
 use bonding_protocol::protocol::scheduler::PathId;
 
-pub use udp::UdpPath;
+pub use udp::{PinMechanism, UdpPath};
 
 #[cfg(feature = "path-rist")]
 pub use rist::RistPath;
@@ -153,6 +153,19 @@ impl Path {
             Path::Rist(p) => p.primary_peer(),
             #[cfg(feature = "path-quic")]
             Path::Quic(p) => p.primary_peer(),
+        }
+    }
+
+    /// The NIC-pin mechanism in effect for this path, if an
+    /// `interface` was requested. Only UDP paths can be NIC-pinned;
+    /// RIST / QUIC paths return `None`.
+    pub fn pin_mechanism(&self) -> Option<PinMechanism> {
+        match self {
+            Path::Udp(p) => p.pin_mechanism(),
+            #[cfg(feature = "path-rist")]
+            Path::Rist(_) => None,
+            #[cfg(feature = "path-quic")]
+            Path::Quic(_) => None,
         }
     }
 }
