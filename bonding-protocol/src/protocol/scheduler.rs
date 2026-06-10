@@ -14,7 +14,7 @@
 //! - No async, no locks — the transport layer owns the scheduler
 //!   exclusively and calls it from the sender task.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::packet::Priority;
 
@@ -84,6 +84,14 @@ pub trait BondScheduler: Send {
     /// against current RTT and loss. Default impl is a no-op so
     /// static schedulers (round-robin) don't need to override.
     fn on_path_update(&mut self, _path_id: PathId, _health: &PathHealth) {}
+
+    /// Called periodically by the transport with the current monotonic
+    /// instant. Rate-paced schedulers (e.g. the capacity-aware one) use
+    /// it to refill per-path token buckets so liveness/telemetry stay
+    /// fresh even during a quiet period with no outbound packets.
+    /// Default impl is a no-op. Schedulers MUST NOT rely on a fixed
+    /// cadence — refill against the supplied instant.
+    fn on_tick(&mut self, _now: Instant) {}
 
     /// Called when a path is declared dead (consecutive keepalive
     /// misses, transport error). Default impl is a no-op; weighted

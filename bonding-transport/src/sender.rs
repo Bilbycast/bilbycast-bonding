@@ -40,6 +40,23 @@ pub(crate) struct OutboundMessage {
     pub hints: PacketHints,
 }
 
+/// Last keepalive-ack sample retained per path so the sender can derive
+/// a **windowed** loss fraction and delivered bitrate by differencing
+/// successive acks — the lifetime-cumulative ratio the old code used is
+/// far too sluggish to drive a congestion controller (a path that runs
+/// clean for an hour then degrades shows a diluted average for minutes).
+#[derive(Clone, Copy)]
+struct AckSample {
+    /// Echoed sender-side packet count at the ping this ack answers.
+    sent: u64,
+    /// Receiver-side packet count for this path.
+    received: u64,
+    /// Receiver-side byte count for this path.
+    bytes_received: u64,
+    /// Sender-side arrival instant of this ack.
+    at: Instant,
+}
+
 /// Handle retained by `BondSocket::sender`.
 pub(crate) struct SenderHandle {
     pub tx: mpsc::Sender<OutboundMessage>,
@@ -149,6 +166,8 @@ where
             .collect();
     // Track per-path sent packets so keepalive body can advertise it.
     let mut path_sent_counter: Vec<u64> = vec![0; paths.len()];
+    // Previous ack sample per path for windowed loss + delivered-rate.
+    let mut last_ack: Vec<Option<AckSample>> = vec![None; paths.len()];
 
     let path_index_by_id = |id: PathId| -> Option<usize> { paths.iter().position(|p| p.id() == id) };
     let path_stats_for = |idx: usize| -> Option<&Arc<PathStats>> { path_stats.get(idx) };
@@ -255,39 +274,72 @@ where
                                 .and_then(|p| pending_ka[idx].remove(p));
                             if let Some((stamp, sent_at)) = matched {
                                 if body.stamp_us == stamp {
+                                    let now = Instant::now();
                                     let rtt = sent_at.elapsed();
+
+                                    // Windowed loss + delivered bitrate:
+                                    // diff this ack against the previous
+                                    // one for THIS path. Lifetime ratios
+                                    // dilute bursts and never drive a
+                                    // congestion controller usefully.
+                                    let cur = AckSample {
+                                        sent: body.packets_sent_on_path,
+                                        received: body.packets_received_on_path,
+                                        bytes_received: body.bytes_received_on_path,
+                                        at: now,
+                                    };
+                                    let (loss_rate, delivery_bps) = match last_ack[idx] {
+                                        Some(prev) => {
+                                            let dt = now
+                                                .saturating_duration_since(prev.at)
+                                                .as_secs_f64();
+                                            let sent_d = cur.sent.saturating_sub(prev.sent);
+                                            let recv_d = cur.received.saturating_sub(prev.received);
+                                            let bytes_d =
+                                                cur.bytes_received.saturating_sub(prev.bytes_received);
+                                            let loss = if sent_d > 0 {
+                                                sent_d.saturating_sub(recv_d) as f32 / sent_d as f32
+                                            } else {
+                                                0.0
+                                            };
+                                            let bps = if dt > 1e-6 {
+                                                (bytes_d as f64 * 8.0 / dt) as u64
+                                            } else {
+                                                0
+                                            };
+                                            (loss.clamp(0.0, 1.0), bps)
+                                        }
+                                        None => (0.0, 0),
+                                    };
+                                    last_ack[idx] = Some(cur);
+
                                     if let Some(ps) = path_stats_for(idx) {
                                         ps.rtt_us.store(rtt.as_micros() as u64, Ordering::Relaxed);
-                                        let lost = body
-                                            .packets_sent_on_path
-                                            .saturating_sub(body.packets_received_on_path);
-                                        let loss_ppm = if body.packets_sent_on_path == 0 {
-                                            0
-                                        } else {
-                                            ((lost as u128 * 1_000_000u128)
-                                                / body.packets_sent_on_path as u128) as u64
-                                        };
-                                        ps.loss_ppm.store(loss_ppm, Ordering::Relaxed);
+                                        ps.loss_ppm.store(
+                                            (loss_rate * 1_000_000.0) as u64,
+                                            Ordering::Relaxed,
+                                        );
+                                        ps.throughput_bps.store(delivery_bps, Ordering::Relaxed);
+                                        ps.jitter_us
+                                            .store(body.jitter_us as u64, Ordering::Relaxed);
                                         ps.keepalives_received.fetch_add(1, Ordering::Relaxed);
                                     }
-                                    // Feed scheduler an updated health.
+
+                                    // Feed the scheduler a full health
+                                    // snapshot — RTT, windowed loss,
+                                    // delivered bitrate, jitter.
                                     let health = PathHealth {
                                         rtt: Some(rtt),
-                                        loss_rate: if body.packets_sent_on_path == 0 {
-                                            0.0
-                                        } else {
-                                            (body.packets_sent_on_path
-                                                .saturating_sub(body.packets_received_on_path))
-                                                as f32
-                                                / body.packets_sent_on_path as f32
-                                        },
-                                        ..Default::default()
+                                        loss_rate,
+                                        throughput_bps: delivery_bps,
+                                        jitter_us: body.jitter_us as u64,
+                                        queue_depth: 0,
                                     };
                                     scheduler.on_path_update(path_id, &health);
                                     // Liveness: a fresh ack revives this
                                     // path if it was dead. Also tell the
                                     // scheduler so weights restore.
-                                    for ev in monitor.record_activity(path_id, Instant::now()) {
+                                    for ev in monitor.record_activity(path_id, now) {
                                         if matches!(ev.kind, PathEventKind::PathAlive { .. }) {
                                             scheduler.on_path_alive(path_id);
                                         }
@@ -362,6 +414,9 @@ where
             // Periodic keepalives
             _ = ka_interval.tick() => {
                 let now = Instant::now();
+                // Keep capacity estimates / token buckets fresh during a
+                // quiet period when no app packets are driving schedule().
+                scheduler.on_tick(now);
                 let stamp = (now.elapsed_since_boot_us()) as u64;
                 // `next_seq` is the NEXT seq we'd assign; the highest
                 // already-sent is `next_seq - 1`. If nothing has been
@@ -378,6 +433,10 @@ where
                         stamp_us: stamp,
                         packets_sent_on_path: path_sent_counter[idx],
                         highest_bond_seq_sent: highest,
+                        bytes_sent_on_path: path_stats
+                            .get(idx)
+                            .map(|ps| ps.bytes_sent.load(Ordering::Relaxed))
+                            .unwrap_or(0),
                     };
                     let pkt = CtrlPacket::Keepalive { header, body };
                     pkt.serialize(&mut ctrl_scratch);

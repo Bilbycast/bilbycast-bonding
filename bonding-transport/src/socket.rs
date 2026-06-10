@@ -29,6 +29,7 @@ use bonding_protocol::protocol::scheduler::{BondScheduler, PacketHints, PathId};
 use bonding_protocol::stats::{BondConnStats, PathStats};
 
 use crate::config::{BondSocketConfig, PathTransport};
+use crate::crypto::BondCrypto;
 use crate::path::{Path, PathError, UdpPath};
 use crate::receiver::{ReceiverHandle, spawn_receiver};
 use crate::sender::{OutboundMessage, SenderHandle, spawn_sender};
@@ -217,8 +218,15 @@ async fn build_paths(
     let mut stats = Vec::with_capacity(cfg.paths.len());
     let mut ids = Vec::with_capacity(cfg.paths.len());
     let mut names = Vec::with_capacity(cfg.paths.len());
+    // Build the AEAD once and share it across every path on this bond.
+    let crypto = match &cfg.encryption_key {
+        Some(key) => Some(BondCrypto::new(key).map_err(|e| {
+            BondSocketError::Path(PathError::Other(format!("bond encryption key: {e}")))
+        })?),
+        None => None,
+    };
     for p in &cfg.paths {
-        let path = build_one_path(p, sender_mode).await?;
+        let path = build_one_path(p, sender_mode, crypto.clone()).await?;
         let ps = PathStats::new();
         // Record which NIC-pin mechanism (if any) actually bound this
         // path so the resolved value reaches telemetry.
@@ -245,6 +253,7 @@ async fn build_paths(
 async fn build_one_path(
     p: &crate::config::PathConfig,
     sender_mode: bool,
+    crypto: Option<std::sync::Arc<BondCrypto>>,
 ) -> BondResult<Path> {
     match &p.transport {
         PathTransport::Udp {
@@ -255,10 +264,10 @@ async fn build_one_path(
             let iface = interface.as_deref();
             let udp = match (bind, remote, sender_mode) {
                 (Some(b), _, _) => {
-                    UdpPath::bind(p.id, p.name.clone(), *b, *remote, iface).await?
+                    UdpPath::bind(p.id, p.name.clone(), *b, *remote, iface, crypto.clone()).await?
                 }
                 (None, Some(r), true) => {
-                    UdpPath::bind_ephemeral(p.id, p.name.clone(), *r, iface).await?
+                    UdpPath::bind_ephemeral(p.id, p.name.clone(), *r, iface, crypto.clone()).await?
                 }
                 (None, _, false) => {
                     return Err(BondSocketError::Path(PathError::Other(

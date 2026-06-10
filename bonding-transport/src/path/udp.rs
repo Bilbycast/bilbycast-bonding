@@ -29,6 +29,8 @@ use tokio_util::sync::CancellationToken;
 
 use bonding_protocol::protocol::scheduler::PathId;
 
+use crate::crypto::BondCrypto;
+
 use super::{PathDatagram, PathError, PathResult};
 
 /// Default socket buffer sizes (2 MB). The kernel may cap these but
@@ -85,6 +87,9 @@ pub struct UdpPath {
     primary_ip_lo: AtomicU64,
     primary_port: AtomicU64, // high bit = set flag
     rx: Mutex<Option<mpsc::Receiver<PathDatagram>>>,
+    /// Optional AEAD — when set, every outbound datagram is sealed and
+    /// every inbound datagram is opened (and dropped on auth failure).
+    crypto: Option<Arc<BondCrypto>>,
     _recv_task: tokio::task::JoinHandle<()>,
     _cancel: CancellationToken,
 }
@@ -103,6 +108,7 @@ impl UdpPath {
         local: SocketAddr,
         primary_peer: Option<SocketAddr>,
         interface: Option<&str>,
+        crypto: Option<Arc<BondCrypto>>,
     ) -> PathResult<Self> {
         let (socket, pin_mechanism) = Self::build_socket(local, interface).await?;
         Ok(Self::from_socket(
@@ -111,6 +117,7 @@ impl UdpPath {
             socket,
             primary_peer,
             pin_mechanism,
+            crypto,
         ))
     }
 
@@ -120,13 +127,14 @@ impl UdpPath {
         name: impl Into<String>,
         primary_peer: SocketAddr,
         interface: Option<&str>,
+        crypto: Option<Arc<BondCrypto>>,
     ) -> PathResult<Self> {
         let local: SocketAddr = if primary_peer.is_ipv4() {
             "0.0.0.0:0".parse().unwrap()
         } else {
             "[::]:0".parse().unwrap()
         };
-        Self::bind(id, name, local, Some(primary_peer), interface).await
+        Self::bind(id, name, local, Some(primary_peer), interface, crypto).await
     }
 
     async fn build_socket(
@@ -189,10 +197,11 @@ impl UdpPath {
         socket: Arc<UdpSocket>,
         primary_peer: Option<SocketAddr>,
         pin_mechanism: Option<PinMechanism>,
+        crypto: Option<Arc<BondCrypto>>,
     ) -> Self {
         let (tx, rx) = mpsc::channel::<PathDatagram>(1024);
         let cancel = CancellationToken::new();
-        let recv_task = spawn_recv_loop(socket.clone(), tx, cancel.clone());
+        let recv_task = spawn_recv_loop(socket.clone(), tx, cancel.clone(), crypto.clone());
 
         let me = Self {
             id,
@@ -204,6 +213,7 @@ impl UdpPath {
             primary_ip_lo: AtomicU64::new(0),
             primary_port: AtomicU64::new(0),
             rx: Mutex::new(Some(rx)),
+            crypto,
             _recv_task: recv_task,
             _cancel: cancel,
         };
@@ -286,6 +296,18 @@ impl UdpPath {
     }
 
     pub async fn send_to(&self, data: &[u8], to: SocketAddr) -> PathResult<()> {
+        if let Some(crypto) = &self.crypto {
+            let mut sealed = Vec::with_capacity(data.len() + crate::crypto::ENVELOPE_OVERHEAD);
+            crypto
+                .seal(data, &mut sealed)
+                .map_err(|e| PathError::Other(format!("bond seal: {e}")))?;
+            return self
+                .socket
+                .send_to(&sealed, to)
+                .await
+                .map(|_| ())
+                .map_err(PathError::Send);
+        }
         self.socket
             .send_to(data, to)
             .await
@@ -306,15 +328,30 @@ fn spawn_recv_loop(
     socket: Arc<UdpSocket>,
     tx: mpsc::Sender<PathDatagram>,
     cancel: CancellationToken,
+    crypto: Option<Arc<BondCrypto>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut buf = vec![0u8; MAX_DATAGRAM];
+        let mut plain = Vec::with_capacity(MAX_DATAGRAM);
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => break,
                 r = socket.recv_from(&mut buf) => match r {
                     Ok((len, from)) => {
-                        let data = Bytes::copy_from_slice(&buf[..len]);
+                        let data = if let Some(crypto) = &crypto {
+                            // Drop any datagram that fails authentication —
+                            // a wrong-key or tampered/stray packet never
+                            // reaches the bond protocol decoder.
+                            match crypto.open(&buf[..len], &mut plain) {
+                                Ok(()) => Bytes::copy_from_slice(&plain),
+                                Err(e) => {
+                                    log::debug!("bond udp path: drop undecryptable datagram: {e}");
+                                    continue;
+                                }
+                            }
+                        } else {
+                            Bytes::copy_from_slice(&buf[..len])
+                        };
                         if tx.try_send(PathDatagram { data, from }).is_err() {
                             // Receiver is backed up — drop rather than
                             // stall the reactor. Stats at the higher
@@ -469,7 +506,7 @@ mod tests {
     #[tokio::test]
     async fn pin_to_loopback_reports_a_mechanism() {
         let local: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let path = UdpPath::bind(0, "lo-test", local, None, Some("lo"))
+        let path = UdpPath::bind(0, "lo-test", local, None, Some("lo"), None)
             .await
             .expect("bind+pin to lo should succeed");
         let mech = path.pin_mechanism().expect("a pin mechanism was requested");
@@ -483,7 +520,7 @@ mod tests {
     #[tokio::test]
     async fn no_interface_no_mechanism() {
         let local: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let path = UdpPath::bind(0, "no-pin", local, None, None)
+        let path = UdpPath::bind(0, "no-pin", local, None, None, None)
             .await
             .expect("plain bind should succeed");
         assert!(path.pin_mechanism().is_none());
@@ -495,7 +532,7 @@ mod tests {
     #[tokio::test]
     async fn pin_to_missing_interface_errors() {
         let local: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let res = UdpPath::bind(0, "bad", local, None, Some("definitely-not-a-nic0")).await;
+        let res = UdpPath::bind(0, "bad", local, None, Some("definitely-not-a-nic0"), None).await;
         assert!(res.is_err(), "pinning to a nonexistent NIC must fail loudly");
     }
 }

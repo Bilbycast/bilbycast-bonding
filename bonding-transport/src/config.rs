@@ -29,6 +29,10 @@ pub struct BondSocketConfig {
     /// Max NACK retries per gap before the receiver gives up and the
     /// gap is reported as lost.
     pub max_nack_retries: u32,
+    /// Optional 32-byte AEAD key. When set, every UDP/RIST datagram on
+    /// this bond is ChaCha20-Poly1305 sealed (both ends must share the
+    /// key). QUIC paths are already TLS-encrypted and ignore this.
+    pub encryption_key: Option<Vec<u8>>,
     /// Paths registered on this socket.
     pub paths: Vec<PathConfig>,
 }
@@ -43,6 +47,7 @@ impl Default for BondSocketConfig {
             retransmit_capacity: 8192,
             nack_delay: Duration::from_millis(30),
             max_nack_retries: 8,
+            encryption_key: None,
             paths: Vec::new(),
         }
     }

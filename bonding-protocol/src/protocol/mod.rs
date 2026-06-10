@@ -6,6 +6,7 @@
 //! [`scheduler::BondScheduler`] to pick which path each outbound packet
 //! rides.
 
+pub mod capacity_scheduler;
 pub mod path_health;
 pub mod reassembly;
 pub mod retransmit;

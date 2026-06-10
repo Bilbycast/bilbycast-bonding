@@ -140,15 +140,25 @@ pub struct KeepaliveBody {
     pub stamp_us: u64,
     pub packets_sent_on_path: u64,
     pub highest_bond_seq_sent: u32,
+    /// Total data **bytes** emitted on this path (v2 extension). Diffed
+    /// against the receiver echo so the sender can compute a windowed
+    /// delivered-bitrate per path for the capacity controller. 0 on a
+    /// v1 peer that doesn't carry the field.
+    pub bytes_sent_on_path: u64,
 }
 
 impl KeepaliveBody {
+    /// Base (v1) wire size; the v2 byte-counter is appended after this
+    /// and parsed defensively so a mixed-version bond never desyncs.
     pub const SIZE: usize = 20;
+    /// Full v2 wire size (base + `bytes_sent_on_path`).
+    pub const SIZE_V2: usize = 28;
 
     pub fn write_to(&self, out: &mut BytesMut) {
         out.put_u64(self.stamp_us);
         out.put_u64(self.packets_sent_on_path);
         out.put_u32(self.highest_bond_seq_sent);
+        out.put_u64(self.bytes_sent_on_path);
     }
 
     pub fn parse(buf: &[u8]) -> Result<Self> {
@@ -158,11 +168,17 @@ impl KeepaliveBody {
                 actual: buf.len(),
             });
         }
-        let mut r = &buf[..Self::SIZE];
+        let mut r = &buf[..];
+        let stamp_us = r.get_u64();
+        let packets_sent_on_path = r.get_u64();
+        let highest_bond_seq_sent = r.get_u32();
+        // v2 extension — present iff the peer wrote it.
+        let bytes_sent_on_path = if r.remaining() >= 8 { r.get_u64() } else { 0 };
         Ok(Self {
-            stamp_us: r.get_u64(),
-            packets_sent_on_path: r.get_u64(),
-            highest_bond_seq_sent: r.get_u32(),
+            stamp_us,
+            packets_sent_on_path,
+            highest_bond_seq_sent,
+            bytes_sent_on_path,
         })
     }
 }
@@ -177,15 +193,28 @@ pub struct KeepaliveAckBody {
     pub stamp_us: u64,
     pub packets_sent_on_path: u64,
     pub packets_received_on_path: u64,
+    /// Total data **bytes** received on this path (v2 extension). With
+    /// the ping's `bytes_sent_on_path` and successive-ack diffing this
+    /// yields a windowed per-path delivered bitrate. 0 on a v1 peer.
+    pub bytes_received_on_path: u64,
+    /// Receiver-measured interarrival jitter on this path, microseconds
+    /// (RFC 3550 A.8 style, v2 extension). 0 on a v1 peer.
+    pub jitter_us: u32,
 }
 
 impl KeepaliveAckBody {
+    /// Base (v1) wire size; v2 fields are appended and parsed
+    /// defensively.
     pub const SIZE: usize = 24;
+    /// Full v2 wire size (base + bytes + jitter).
+    pub const SIZE_V2: usize = 36;
 
     pub fn write_to(&self, out: &mut BytesMut) {
         out.put_u64(self.stamp_us);
         out.put_u64(self.packets_sent_on_path);
         out.put_u64(self.packets_received_on_path);
+        out.put_u64(self.bytes_received_on_path);
+        out.put_u32(self.jitter_us);
     }
 
     pub fn parse(buf: &[u8]) -> Result<Self> {
@@ -195,11 +224,19 @@ impl KeepaliveAckBody {
                 actual: buf.len(),
             });
         }
-        let mut r = &buf[..Self::SIZE];
+        let mut r = &buf[..];
+        let stamp_us = r.get_u64();
+        let packets_sent_on_path = r.get_u64();
+        let packets_received_on_path = r.get_u64();
+        // v2 extensions — present iff the peer wrote them.
+        let bytes_received_on_path = if r.remaining() >= 8 { r.get_u64() } else { 0 };
+        let jitter_us = if r.remaining() >= 4 { r.get_u32() } else { 0 };
         Ok(Self {
-            stamp_us: r.get_u64(),
-            packets_sent_on_path: r.get_u64(),
-            packets_received_on_path: r.get_u64(),
+            stamp_us,
+            packets_sent_on_path,
+            packets_received_on_path,
+            bytes_received_on_path,
+            jitter_us,
         })
     }
 }
@@ -287,12 +324,12 @@ impl CtrlPacket {
         out.clear();
         match self {
             CtrlPacket::Keepalive { header, body } => {
-                out.reserve(CtrlHeader::SIZE + KeepaliveBody::SIZE);
+                out.reserve(CtrlHeader::SIZE + KeepaliveBody::SIZE_V2);
                 header.write_to(out);
                 body.write_to(out);
             }
             CtrlPacket::KeepaliveAck { header, body } => {
-                out.reserve(CtrlHeader::SIZE + KeepaliveAckBody::SIZE);
+                out.reserve(CtrlHeader::SIZE + KeepaliveAckBody::SIZE_V2);
                 header.write_to(out);
                 body.write_to(out);
             }
@@ -347,12 +384,13 @@ mod tests {
             stamp_us: 123_456_789,
             packets_sent_on_path: 10_000,
             highest_bond_seq_sent: 12_345_678,
+            bytes_sent_on_path: 13_160_000,
         };
         let pkt = CtrlPacket::Keepalive { header, body };
 
         let mut buf = BytesMut::new();
         pkt.serialize(&mut buf);
-        assert_eq!(buf.len(), CtrlHeader::SIZE + KeepaliveBody::SIZE);
+        assert_eq!(buf.len(), CtrlHeader::SIZE + KeepaliveBody::SIZE_V2);
         assert_eq!(buf[0], CTRL_MAGIC);
 
         let parsed = CtrlPacket::parse(&buf).unwrap();
@@ -367,12 +405,52 @@ mod tests {
             stamp_us: 999,
             packets_sent_on_path: 1000,
             packets_received_on_path: 995,
+            bytes_received_on_path: 1_311_400,
+            jitter_us: 1234,
         };
         let pkt = CtrlPacket::KeepaliveAck { header, body };
         let mut buf = BytesMut::new();
         pkt.serialize(&mut buf);
         let parsed = CtrlPacket::parse(&buf).unwrap();
         assert_eq!(parsed, pkt);
+    }
+
+    #[test]
+    fn v1_bodies_parse_without_v2_extensions() {
+        // A v1 peer ships only the base fields; truncating a serialized
+        // v2 body to its base length must parse with the v2 fields
+        // defaulting to 0 (forward/backward compatibility — both ends are
+        // edge but a mixed-version rollout must never desync).
+        let ka = KeepaliveBody {
+            stamp_us: 1,
+            packets_sent_on_path: 2,
+            highest_bond_seq_sent: 3,
+            bytes_sent_on_path: 4,
+        };
+        let mut buf = BytesMut::new();
+        ka.write_to(&mut buf);
+        let v1 = KeepaliveBody::parse(&buf[..KeepaliveBody::SIZE]).unwrap();
+        assert_eq!(v1.bytes_sent_on_path, 0);
+        assert_eq!(v1.packets_sent_on_path, 2);
+        let v2 = KeepaliveBody::parse(&buf).unwrap();
+        assert_eq!(v2.bytes_sent_on_path, 4);
+
+        let ack = KeepaliveAckBody {
+            stamp_us: 9,
+            packets_sent_on_path: 10,
+            packets_received_on_path: 11,
+            bytes_received_on_path: 12,
+            jitter_us: 13,
+        };
+        let mut abuf = BytesMut::new();
+        ack.write_to(&mut abuf);
+        let a1 = KeepaliveAckBody::parse(&abuf[..KeepaliveAckBody::SIZE]).unwrap();
+        assert_eq!(a1.bytes_received_on_path, 0);
+        assert_eq!(a1.jitter_us, 0);
+        assert_eq!(a1.packets_received_on_path, 11);
+        let a2 = KeepaliveAckBody::parse(&abuf).unwrap();
+        assert_eq!(a2.bytes_received_on_path, 12);
+        assert_eq!(a2.jitter_us, 13);
     }
 
     #[test]

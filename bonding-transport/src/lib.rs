@@ -46,6 +46,7 @@
 //! ```
 
 pub mod config;
+pub mod crypto;
 pub(crate) mod health;
 pub mod path;
 pub mod receiver;
@@ -56,6 +57,7 @@ pub use bonding_protocol::{
     events::{PathDeadReason, PathEvent, PathEventKind},
     packet::{BondHeader, Priority},
     protocol::{
+        capacity_scheduler::{CapacityAwareScheduler, CongestionConfig, PathPrior},
         path_health::PathHealth,
         scheduler::{
             BondScheduler, PacketHints, PathId, PathSelection, RoundRobinScheduler,
@@ -65,6 +67,7 @@ pub use bonding_protocol::{
     stats::{BondConnStats, BondConnStatsSnapshot, PathStats, PathStatsSnapshot},
 };
 pub use config::{BondSocketConfig, PathConfig, PathTransport};
+pub use crypto::{BondCrypto, BondCryptoError};
 #[cfg(feature = "path-quic")]
 pub use config::{QuicRole, QuicTlsMode};
 #[cfg(feature = "path-rist")]

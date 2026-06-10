@@ -31,6 +31,9 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rcgen = { version = "0.14", optional = true }
 rustls-pemfile = { version = "2", optional = true }
 srt-transport = { path = "../../bilbycast-libsrt-rs/srt-transport", optional = true }
+# ChaCha20-Poly1305 AEAD for optional bonded-path encryption (applied
+# only when a key is configured). Same AEAD the edge QUIC tunnel uses.
+ring = "0.17"
 
 # `if_nametoindex` for NIC pinning via IP_BOUND_IF on Apple / BSD /
 # Fuchsia. Linux uses SO_BINDTODEVICE which socket2 exposes directly.

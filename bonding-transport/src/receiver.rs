@@ -129,6 +129,14 @@ async fn receiver_loop(
 
     // Per-path counters for the keepalive echo response.
     let mut path_recv_counter: HashMap<PathId, u64> = HashMap::new();
+    // Per-path received byte counter — echoed so the sender can compute
+    // a windowed delivered bitrate (the capacity controller's ground
+    // truth).
+    let mut path_recv_bytes: HashMap<PathId, u64> = HashMap::new();
+    // Per-path interarrival jitter estimator: (last_arrival, mean_gap_us,
+    // jitter_us), RFC 3550 A.8-style smoothing. Reported in the ack so a
+    // jittery link is deweighted by the scheduler.
+    let mut path_jitter: HashMap<PathId, (Instant, f64, f64)> = HashMap::new();
 
     let mut drain_scratch: Vec<DrainItem> = Vec::with_capacity(64);
     let mut ctrl_scratch = BytesMut::with_capacity(512);
@@ -192,6 +200,12 @@ async fn receiver_loop(
                     match CtrlPacket::parse(&dg.data) {
                         Ok(CtrlPacket::Keepalive { header, body }) if header.flow_id == flow_id => {
                             let received_on_path = *path_recv_counter.get(&path_id).unwrap_or(&0);
+                            let bytes_received_on_path =
+                                *path_recv_bytes.get(&path_id).unwrap_or(&0);
+                            let jitter_us = path_jitter
+                                .get(&path_id)
+                                .map(|(_, _, j)| *j as u32)
+                                .unwrap_or(0);
                             let sent_on_path = body.packets_sent_on_path;
                             let ack_header =
                                 CtrlHeader::new(CtrlType::KeepaliveAck, path_id, flow_id);
@@ -199,6 +213,8 @@ async fn receiver_loop(
                                 stamp_us: body.stamp_us,
                                 packets_sent_on_path: sent_on_path,
                                 packets_received_on_path: received_on_path,
+                                bytes_received_on_path,
+                                jitter_us,
                             };
                             let ack = CtrlPacket::KeepaliveAck {
                                 header: ack_header,
@@ -272,6 +288,32 @@ async fn receiver_loop(
                     }
                 }
                 *path_recv_counter.entry(path_id).or_insert(0) += 1;
+                *path_recv_bytes.entry(path_id).or_insert(0) += dg.data.len() as u64;
+                // Interarrival jitter (RFC 3550 A.8-style): smooth the
+                // absolute deviation of the inter-packet gap from its
+                // running mean. A bursty/jittery link reports higher and
+                // the capacity scheduler deweights it.
+                {
+                    let arrival = Instant::now();
+                    let jitter_us = {
+                        let e = path_jitter.entry(path_id).or_insert((arrival, 0.0, 0.0));
+                        let gap = arrival.saturating_duration_since(e.0).as_micros() as f64;
+                        e.0 = arrival;
+                        if e.1 == 0.0 {
+                            e.1 = gap;
+                        } else {
+                            let d = (gap - e.1).abs();
+                            e.2 += (d - e.2) / 16.0;
+                            e.1 += (gap - e.1) / 16.0;
+                        }
+                        e.2 as u64
+                    };
+                    if let Some(idx) = path_idx {
+                        if let Some(ps) = path_stats_for(idx) {
+                            ps.jitter_us.store(jitter_us, Ordering::Relaxed);
+                        }
+                    }
+                }
 
                 let outcome = reassembly.insert(header.bond_seq, payload, path_id, Instant::now());
                 if outcome.stale {

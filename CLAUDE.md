@@ -73,8 +73,12 @@ Each bonded packet is a 12-byte header followed by opaque payload:
   accounting, gap timeout).
 - `protocol/retransmit.rs` — retransmit buffer + NACK-driven resend
   bookkeeping.
-- `protocol/scheduler.rs` — `BondScheduler` trait, `RoundRobinScheduler`,
-  `WeightedRttScheduler`.
+- `protocol/scheduler.rs` — `BondScheduler` trait (`schedule` /
+  `on_path_update` / `on_tick` / `on_path_{dead,alive}`),
+  `RoundRobinScheduler`, `WeightedRttScheduler`.
+- `protocol/capacity_scheduler.rs` — `CapacityAwareScheduler` +
+  `CongestionConfig` + `PathPrior`: per-path congestion controller,
+  token-bucket capacity-proportional split, quality deweighting.
 - `protocol/path_health.rs` — `PathHealth` snapshot driven into the
   scheduler once per health tick.
 - `stats.rs` — `BondConnStats` (aggregate) + `PathStats` (per-path),
@@ -93,6 +97,8 @@ Each bonded packet is a 12-byte header followed by opaque payload:
   `ReassemblyBuffer`, drains in bond-seq order.
 - `health.rs` — per-path health tracking / `PathHealth` snapshots fed
   to the scheduler.
+- `crypto.rs` — `BondCrypto`: optional per-datagram ChaCha20-Poly1305
+  AEAD (`0xBD` envelope), applied at the UDP path.
 - `socket.rs` — public `BondSocket::sender()` / `::receiver()` API,
   plus `send` / `recv` / `stats` / `path_stats` / `path_ids` /
   `subscribe_events` / `close`.
@@ -103,18 +109,67 @@ Each bonded packet is a 12-byte header followed by opaque payload:
 |------|--------|
 | Wire header encode/parse | Done, round-trip tested |
 | Reassembly buffer (32-bit seq) | Done, gap-fill + timeout tested |
-| `BondScheduler` trait | Done |
+| `BondScheduler` trait (`schedule` / `on_path_update` / `on_tick` / `on_path_{dead,alive}`) | Done |
 | `RoundRobinScheduler` (default for bonding-only boxes) | Done |
 | `WeightedRttScheduler` (RTT-aware, Critical-duplicates) | Done |
-| Stats + snapshots | Done |
-| QUIC path adapter | Done (`path/quic.rs`, `path-quic` default feature) |
-| Raw UDP path adapter | Done (`path/udp.rs`, `path-udp` default feature) |
+| **`CapacityAwareScheduler`** (congestion-controlled, capacity-proportional split) | **Done** — `protocol/capacity_scheduler.rs`, unit + e2e tested. See "Adaptive scheduling" below. |
+| **Windowed per-path feedback** (delivered-rate + windowed loss + jitter) | **Done** — v2 keepalive (`control.rs`), populated into `PathStats` / `PathHealth` by `sender.rs` / `receiver.rs` |
+| **Optional AEAD encryption** (ChaCha20-Poly1305 per datagram) | **Done** — `crypto.rs`, applied at the UDP path; `0xBD` envelope, tamper/wrong-key tested |
+| Stats + snapshots | Done (`throughput_bps` / `jitter_us` now written from real feedback) |
+| QUIC path adapter | Done (`path/quic.rs`, `path-quic` default feature; already TLS-encrypted) |
+| Raw UDP path adapter | Done (`path/udp.rs`, `path-udp` default feature; optional `BondCrypto`) |
 | RIST path adapter (via bilbycast-rist) | Done (`path/rist.rs`, `path-rist` default feature) |
 | SRT path adapter (via bilbycast-libsrt-rs) | Outstanding — `path-srt` feature + `srt-transport` dep declared, but no `Srt` config variant or `path/srt.rs` yet |
-| `BondSocket::sender` / `::receiver` (+ `send` / `recv` / `stats` / `path_stats` / `path_ids` / `subscribe_events` / `close`) | Done (`socket.rs`) |
+| `BondSocket::sender` / `::receiver` (+ `send` / `recv` / `stats` / `path_stats` / `path_ids` / `subscribe_events` / `close`) | Done (`socket.rs`; `BondSocketConfig::encryption_key` threads the AEAD) |
 | Bonding-only binary (`bilbycast-bonder`) | Done (workspace member, `bilbycast-bonder/src/main.rs`) |
-| Edge integration (input_bonded, output_bonded) | Outstanding |
-| `MediaAwareScheduler` (edge-side, parses NAL) | Outstanding (edge-side) |
+| **Edge integration** (`input_bonded`, `output_bonded`) | **Done** — live in `bilbycast-edge`; `Adaptive` scheduler is the edge default, telemetry on `OutputStats.bond_stats` |
+| `MediaAwareScheduler` (edge-side, parses NAL) | Done (edge-side, `engine/bonded_scheduler.rs`; layered over WeightedRtt or CapacityAware) |
+| Proactive FEC (interleaved XOR) | Outstanding — resilience today is ARQ + IDR-duplication + multi-path diversity |
+
+## Adaptive scheduling, congestion control & encryption
+
+The headline capability for a heterogeneous contribution bond (several
+4G/5G modems + Starlink). The RTT-only `WeightedRttScheduler` over-drives
+a low-RTT cellular link past its capacity while under-using a high-RTT
+satellite link; `CapacityAwareScheduler` fixes that with a closed loop.
+
+- **Per-path congestion controller** (`capacity_scheduler.rs`): each leg
+  runs a hybrid loss + delay (RTT-inflation) controller that *discovers*
+  the link's usable bitrate — probe up while clean, back off toward the
+  delivered rate the moment loss or queue-building delay appears. The
+  estimate is clamped to `[min_rate, operator_ceiling]`; `weight_hint`
+  seeds the initial prior, `CongestionConfig` tunes the law.
+- **Token-bucket distribution**: each leg has a bucket refilled at its
+  discovered capacity. Per packet the scheduler picks the best-scoring
+  eligible leg (headroom × quality), so the split is **proportional to
+  measured capacity**, a saturated leg spills to one with headroom, and
+  `Low`-priority traffic is dropped first under genuine over-subscription.
+  Critical (IDR) packets duplicate across the two best affordable legs.
+- **The feedback loop**: the receiver echoes per-path **byte** counters +
+  measured jitter in the **v2 keepalive ack** (`control.rs`, length-
+  tolerant so it interops with a v1 peer). The sender differences
+  successive acks into a *windowed* loss fraction + delivered bitrate
+  (the old lifetime-cumulative ratio was far too sluggish) and feeds a
+  full `PathHealth` into the controller each ack round (~5 Hz). Those
+  values also populate the previously-dead `PathStats.throughput_bps` /
+  `jitter_us` telemetry.
+- **Time is injectable**: `CapacityAwareScheduler::schedule_at(hints,
+  now)` does the real work (token refill is `now`-based, like the
+  reassembly buffer); the trait `schedule` calls it with `Instant::now()`.
+  Tests drive controlled time for deterministic rate-paced refill.
+- **Optional encryption** (`crypto.rs`, `BondCrypto`): per-datagram
+  ChaCha20-Poly1305 with a clear `0xBD` envelope `[0xBD][12B nonce][sealed
+  inner + 16B tag]` — the receiver peeks `0xBD`, opens, then dispatches
+  the inner `0xBC`/`0xBE` magic (header authenticated). 32-byte key via
+  `BondSocketConfig::encryption_key`, shared by both edges. Applied at the
+  UDP path; QUIC legs are already TLS. Wrong-key / tampered datagrams are
+  dropped before the protocol decoder.
+
+End-to-end proof: `tests/bond_adaptive.rs` shapes one UDP path to 2 Mbps
+and another to 16 Mbps over loopback and asserts the adaptive scheduler
+shifts the **majority** of traffic to the high-capacity link (both stay
+alive) — i.e. the full sender→receiver→ack→controller→bucket loop works
+on the wire, with the encrypted variant proven alongside.
 
 ## Inter-Project Dependencies
 
