@@ -90,9 +90,17 @@ pub enum PathTransport {
     ///
     /// `interface` pins egress traffic to a specific NIC (e.g.
     /// `"eth0"`, `"wwan0"`). `None` leaves selection to the kernel
-    /// routing table. See `docs/nic-pinning.md` for platform
-    /// requirements (Linux needs `CAP_NET_RAW`; macOS / FreeBSD are
-    /// unprivileged).
+    /// routing table. See `docs/nic-pinning.md` for platform detail
+    /// (Linux prefers `SO_BINDTODEVICE` under `CAP_NET_RAW` and
+    /// falls back to the unprivileged `IP_UNICAST_IF` egress hint;
+    /// macOS / FreeBSD are unprivileged).
+    ///
+    /// Paths with an `interface` pin or a specific (non-wildcard)
+    /// `bind` IP are covered by the per-bond interface watcher:
+    /// on USB-dongle re-plug, ifindex change or DHCP renumber the
+    /// socket is rebuilt and re-pinned in place (`PathRebuilt` /
+    /// `InterfaceLost` events). UDP only — QUIC / RIST legs manage
+    /// their own connections.
     Udp {
         bind: Option<SocketAddr>,
         remote: Option<SocketAddr>,

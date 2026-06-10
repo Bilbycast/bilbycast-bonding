@@ -29,6 +29,32 @@
 //!   token buckets from the current capacity estimate (time-based, so the
 //!   caller does not have to tick on a fixed cadence).
 //!
+//! ## Estimator + selection hardening
+//!
+//! - **Windowed min-RTT** (BBR-style): the delay baseline `rtt_min` is the
+//!   minimum over the last [`CongestionConfig::rtt_min_window`], not a
+//!   lifetime latch — a permanent RTT baseline shift (5G handover,
+//!   Starlink reroute) ages out of the window instead of reading as
+//!   perpetual congestion that pins the leg at `min_rate_bps`.
+//! - **Evidence-bound probing**: a clean leg probes up only while a
+//!   delivered rate is measured, and the estimate is capped at
+//!   `delivery_bps × probe_cap_mult` — an idle or undersubscribed bond
+//!   holds its estimate instead of inflating it without bound. The cap
+//!   lifts (and probing switches to slow-start doubling) while the leg
+//!   is under *clean demand pressure* — bucket in debt with no loss /
+//!   inflation — so a surviving leg absorbs a dead sibling's share
+//!   within ~1 s of control rounds instead of staying pinned at a
+//!   multiple of its old traffic share.
+//! - **Fair tie-break**: path scans start from a cursor rotated once per
+//!   scheduled packet, so exact score ties round-robin across alive legs
+//!   (keeping failover legs warm) instead of concentrating all traffic on
+//!   the lowest index.
+//! - **Jitter deweight**: interarrival jitter above 20 ms deweights a
+//!   path's quality (down to ×0.5) alongside loss and RTT inflation.
+//!   Jitter is only re-measured at the receiver while data flows, so a
+//!   starved leg's stale sample decays every control round — a bad
+//!   reading deweights the leg but can never pin it out of the bond.
+//!
 //! No async, no locks — same constraints as the rest of `bonding-protocol`.
 //! [`std::time::Instant`] is the only time source (already used by the
 //! reassembly buffer).
@@ -47,6 +73,18 @@ use super::scheduler::{BondScheduler, PacketHints, PathId, PathSelection};
 /// capacity accounting honest without the scheduler knowing the exact
 /// framing.
 pub const TOKEN_OVERHEAD_BYTES: usize = 12;
+
+/// Capacity growth multiplier per clean control round while the leg is
+/// under demand pressure (token bucket in debt: offered load exceeds
+/// the current estimate). Slow-start-style doubling so a surviving leg
+/// absorbs a dead sibling's share within a handful of keepalive-ack
+/// rounds (~1 s at 5 Hz) instead of riding the gentle `increase` probe
+/// from a delivery-bounded estimate (1 → 10 Mbps at 1.04×/round is
+/// ~12 s of shedding a leg that was capable the whole time). Bounded
+/// by the same congestion feedback as the gentle probe: one round of
+/// loss / RTT inflation backs the estimate off toward the delivered
+/// rate.
+const DEMAND_SLOW_START_MULT: f64 = 2.0;
 
 /// Tuning for the per-path congestion controller. Defaults are chosen
 /// for a cellular + satellite contribution bond; every field is
@@ -76,6 +114,17 @@ pub struct CongestionConfig {
     /// Multiplicative back-off applied to the delivered rate on
     /// congestion. Default 0.85.
     pub decrease: f32,
+    /// Evidence bound on the probed capacity: once a delivered rate has
+    /// been measured, the estimate never exceeds `delivery_bps ×
+    /// probe_cap_mult`. Bounds undersubscribed-bond inflation while
+    /// still letting the estimate grow exponentially as the realized
+    /// rate rises after a failover. Default 2.0.
+    pub probe_cap_mult: f64,
+    /// Window over which the per-path minimum RTT is tracked
+    /// (BBR-style). A baseline shift larger than `delay_inflation`
+    /// ages out of the window instead of reading as permanent
+    /// congestion. Default 10 s.
+    pub rtt_min_window: Duration,
     /// Token-bucket burst depth, in seconds of capacity. Absorbs the
     /// per-frame arrival burst of a media feed. Default 0.25 s.
     pub burst_secs: f32,
@@ -94,6 +143,8 @@ impl Default for CongestionConfig {
             delay_inflation: Duration::from_millis(40),
             increase: 1.04,
             decrease: 0.85,
+            probe_cap_mult: 2.0,
+            rtt_min_window: Duration::from_secs(10),
             burst_secs: 0.25,
             rtt_ewma: 0.2,
         }
@@ -119,12 +170,26 @@ struct PathCc {
     // ── measurements (fed by on_path_update) ──
     /// Smoothed RTT, seconds (0 = no sample yet).
     rtt: f64,
-    /// Minimum RTT seen, seconds (the delay-based baseline).
+    /// Windowed minimum RTT, seconds (the delay-based baseline;
+    /// 0 = no sample yet).
     rtt_min: f64,
+    /// When `rtt_min` was last adopted — drives the
+    /// [`CongestionConfig::rtt_min_window`] aging so a permanent
+    /// baseline shift cannot read as congestion forever.
+    rtt_min_at: Instant,
     /// Latest windowed loss fraction.
     loss: f32,
-    /// Latest interarrival jitter, microseconds.
+    /// Latest interarrival jitter, microseconds. Decayed while the leg
+    /// is starved (see `on_path_update`) — the receiver can't re-measure
+    /// jitter on a leg that carries nothing.
     jitter_us: u64,
+    /// Whether this path was selected for at least one packet since its
+    /// last health update — distinguishes a starved leg (stale jitter)
+    /// from one with a fresh measurement.
+    picked_since_update: bool,
+    /// Scheduler `sched_serial` at this path's last health update; if it
+    /// hasn't advanced, the bond was idle and nothing was starved.
+    last_update_serial: u64,
     /// Latest measured delivered rate at the receiver, bits/sec
     /// (0 = no measurement yet).
     delivery_bps: f64,
@@ -143,8 +208,11 @@ impl PathCc {
             last_refill: now,
             rtt: 0.0,
             rtt_min: 0.0,
+            rtt_min_at: now,
             loss: 0.0,
             jitter_us: 0,
+            picked_since_update: false,
+            last_update_serial: 0,
             delivery_bps: 0.0,
         }
     }
@@ -168,17 +236,29 @@ impl PathCc {
         self.tokens = (self.tokens + (self.capacity_bps / 8.0) * dt).min(burst);
     }
 
-    /// Quality factor in (0, 1]: loss and RTT-inflation deweight a path
-    /// smoothly so a degrading link bleeds traffic continuously rather
-    /// than only at a hard cliff.
-    fn quality(&self) -> f64 {
+    /// Quality factor in (0, 1]: loss, RTT-inflation, and interarrival
+    /// jitter deweight a path smoothly so a degrading link bleeds
+    /// traffic continuously rather than only at a hard cliff.
+    fn quality(&self, delay_thresh: f64) -> f64 {
         let loss_q = (1.0 - self.loss.min(1.0) as f64).max(0.05);
-        let rtt_q = if self.rtt > 0.0 && self.rtt_min > 0.0 {
-            (self.rtt_min / self.rtt).clamp(0.1, 1.0)
+        // Inflation over the windowed min, scaled by the congestion
+        // threshold (1.0 at zero inflation, 0.5 at the threshold) — a
+        // raw min/rtt ratio would over-punish low-RTT paths, where
+        // sub-millisecond scheduler noise reads as a large ratio.
+        let rtt_q = if self.rtt > 0.0 && self.rtt_min > 0.0 && delay_thresh > 0.0 {
+            let inflation = (self.rtt - self.rtt_min).max(0.0);
+            (delay_thresh / (delay_thresh + inflation)).clamp(0.1, 1.0)
         } else {
             1.0
         };
-        loss_q * rtt_q
+        // ≤20 ms of jitter is free; beyond that deweight down to ×0.5 so
+        // a jittery leg loses ties but is never starved outright.
+        let jitter_q = if self.jitter_us <= 20_000 {
+            1.0
+        } else {
+            (20_000.0 / self.jitter_us as f64).clamp(0.5, 1.0)
+        };
+        loss_q * rtt_q * jitter_q
     }
 
     /// Headroom in (0, 1]: full bucket → 1, empty → 0.5, max debt → ~0.
@@ -191,8 +271,8 @@ impl PathCc {
 
     /// Combined selection score.
     #[inline]
-    fn score(&self, burst_secs: f32) -> f64 {
-        self.headroom(burst_secs) * self.quality()
+    fn score(&self, burst_secs: f32, delay_thresh: f64) -> f64 {
+        self.headroom(burst_secs) * self.quality(delay_thresh)
     }
 }
 
@@ -201,6 +281,14 @@ impl PathCc {
 pub struct CapacityAwareScheduler {
     paths: Vec<PathCc>,
     cfg: CongestionConfig,
+    /// Rotating scan origin for `best` / `least_debt`, advanced once per
+    /// scheduled packet — exact score ties round-robin across alive legs
+    /// instead of always landing on the lowest index (winner-takes-all
+    /// would leave failover legs cold).
+    rr_cursor: usize,
+    /// Monotonic per-packet serial; lets `on_path_update` tell a starved
+    /// leg (traffic offered, none scheduled to it) from an idle bond.
+    sched_serial: u64,
     // ── telemetry counters (read by the transport for stats) ──
     oversubscribed_drops: u64,
     /// Shared, per-path live capacity estimate (bits/sec). Cloned out via
@@ -244,6 +332,8 @@ impl CapacityAwareScheduler {
         Self {
             paths,
             cfg,
+            rr_cursor: 0,
+            sched_serial: 0,
             oversubscribed_drops: 0,
             capacity_pub,
         }
@@ -297,19 +387,28 @@ impl CapacityAwareScheduler {
     }
 
     /// Best-scoring alive path, optionally requiring it can afford
-    /// `need` bytes and optionally excluding one id.
+    /// `need` bytes and optionally excluding one id. Scans from the
+    /// rotating cursor with strict `>` so genuinely better scores still
+    /// win but exact ties round-robin instead of pinning to index 0.
     fn best(&self, need: f64, require_afford: bool, exclude: Option<PathId>) -> Option<usize> {
+        let len = self.paths.len();
+        if len == 0 {
+            return None;
+        }
         let burst = self.cfg.burst_secs;
+        let delay_thresh = self.cfg.delay_inflation.as_secs_f64();
         let mut best: Option<usize> = None;
         let mut best_score = f64::NEG_INFINITY;
-        for (i, p) in self.paths.iter().enumerate() {
+        for k in 0..len {
+            let i = (self.rr_cursor + k) % len;
+            let p = &self.paths[i];
             if !p.alive || Some(p.id) == exclude {
                 continue;
             }
             if require_afford && p.tokens < need {
                 continue;
             }
-            let s = p.score(burst);
+            let s = p.score(burst, delay_thresh);
             if s > best_score {
                 best_score = s;
                 best = Some(i);
@@ -319,11 +418,18 @@ impl CapacityAwareScheduler {
     }
 
     /// Path with the most tokens (least debt) among alive, for the
-    /// over-subscription fallback.
+    /// over-subscription fallback. Same rotating-cursor tie-break as
+    /// [`Self::best`].
     fn least_debt(&self, exclude: Option<PathId>) -> Option<usize> {
+        let len = self.paths.len();
+        if len == 0 {
+            return None;
+        }
         let mut best: Option<usize> = None;
         let mut best_tokens = f64::NEG_INFINITY;
-        for (i, p) in self.paths.iter().enumerate() {
+        for k in 0..len {
+            let i = (self.rr_cursor + k) % len;
+            let p = &self.paths[i];
             if !p.alive || Some(p.id) == exclude {
                 continue;
             }
@@ -346,6 +452,10 @@ impl CapacityAwareScheduler {
     /// time so the rate-paced refill is deterministic.
     pub fn schedule_at(&mut self, hints: &PacketHints, now: Instant) -> PathSelection {
         self.refill_all(now);
+        // Advance the tie-break cursor once per packet so equal-scoring
+        // legs alternate, and the serial so starvation is observable.
+        self.rr_cursor = self.rr_cursor.wrapping_add(1);
+        self.sched_serial = self.sched_serial.wrapping_add(1);
 
         let need = self.need_bytes(hints);
 
@@ -363,9 +473,11 @@ impl CapacityAwareScheduler {
             // Second copy: best *affordable* other path only.
             let secondary = self.best(need, true, Some(pid));
             self.paths[pi].tokens -= need;
+            self.paths[pi].picked_since_update = true;
             if let Some(si) = secondary {
                 let sid = self.paths[si].id;
                 self.paths[si].tokens -= need;
+                self.paths[si].picked_since_update = true;
                 return PathSelection::Duplicate(vec![pid, sid]);
             }
             return PathSelection::Single(pid);
@@ -383,6 +495,7 @@ impl CapacityAwareScheduler {
         //    so the next best with headroom wins.
         if let Some(i) = self.best(need, true, None) {
             self.paths[i].tokens -= need;
+            self.paths[i].picked_since_update = true;
             return PathSelection::Single(self.paths[i].id);
         }
         // 2. Every bucket is dry. `Low` traffic is discard-first.
@@ -397,6 +510,7 @@ impl CapacityAwareScheduler {
             let burst = self.paths[i].burst_bytes(self.cfg.burst_secs);
             if self.paths[i].tokens > -burst {
                 self.paths[i].tokens -= need;
+                self.paths[i].picked_since_update = true;
                 return PathSelection::Single(self.paths[i].id);
             }
         }
@@ -428,23 +542,49 @@ impl BondScheduler for CapacityAwareScheduler {
 
     fn on_path_update(&mut self, path_id: PathId, health: &PathHealth) {
         let cfg = self.cfg;
+        let serial = self.sched_serial;
         let Some(i) = self.idx(path_id) else { return };
         let p = &mut self.paths[i];
+
+        // Control path (~5 Hz keepalive-ack rounds), not the packet
+        // hot path — a direct `Instant::now()` is acceptable here.
+        let now = Instant::now();
 
         if let Some(rtt) = health.rtt {
             let s = rtt.as_secs_f64();
             if p.rtt == 0.0 {
                 p.rtt = s;
-                p.rtt_min = s;
             } else {
                 p.rtt = p.rtt * (1.0 - cfg.rtt_ewma as f64) + s * cfg.rtt_ewma as f64;
-                if s < p.rtt_min || p.rtt_min == 0.0 {
-                    p.rtt_min = s;
-                }
+            }
+            // Windowed minimum (BBR-style): adopt the sample when it ties
+            // or beats the current min, or when the min has aged out of
+            // `rtt_min_window` — a permanent baseline shift (5G handover,
+            // Starlink reroute) must not read as congestion forever.
+            if p.rtt_min == 0.0
+                || s <= p.rtt_min
+                || now.saturating_duration_since(p.rtt_min_at) > cfg.rtt_min_window
+            {
+                p.rtt_min = s;
+                p.rtt_min_at = now;
             }
         }
         p.loss = health.loss_rate;
-        p.jitter_us = health.jitter_us;
+        // Jitter is only re-measured at the receiver while data flows on
+        // the leg, so a starved leg (packets were scheduled this round
+        // but none to it) keeps echoing its last sample. Decay the
+        // stored value while starved — a stale high reading deweights
+        // the leg but must not pin it out of the bond forever; if
+        // traffic resumes and the jitter is real, the fresh sample
+        // restores the deweight.
+        let starved = !p.picked_since_update && serial != p.last_update_serial;
+        p.jitter_us = if starved {
+            p.jitter_us.min(health.jitter_us) / 2
+        } else {
+            health.jitter_us
+        };
+        p.picked_since_update = false;
+        p.last_update_serial = serial;
         if health.throughput_bps > 0 {
             p.delivery_bps = health.throughput_bps as f64;
         }
@@ -454,6 +594,14 @@ impl BondScheduler for CapacityAwareScheduler {
         let delay_thresh = cfg.delay_inflation.as_secs_f64();
         let congested = p.loss > cfg.loss_high || inflation > delay_thresh;
         let clean = p.loss < cfg.loss_low && inflation < delay_thresh * 0.5;
+        // Demand pressure: the bucket is in debt at the control step —
+        // offered load exceeds the current estimate. Distinguishes "no
+        // demand" (undersubscribed leg whose delivered rate is its small
+        // traffic share, not its capacity) from "no capacity". Refill
+        // first so a bond gone idle since the last schedule() can't read
+        // a stale negative bucket as demand and inflate on nothing.
+        p.refill(now, cfg.burst_secs);
+        let demand_pressure = p.tokens < 0.0;
 
         if congested {
             // Back off toward what's actually getting through.
@@ -463,15 +611,39 @@ impl BondScheduler for CapacityAwareScheduler {
                 p.capacity_bps
             };
             p.capacity_bps = base * cfg.decrease as f64;
-        } else if clean {
+        } else if clean && p.delivery_bps > 0.0 {
             // Probe up, but never claim less than the measured delivered
-            // rate (we know at least that much fits).
-            let probed = p.capacity_bps * cfg.increase as f64;
+            // rate (we know at least that much fits). Under clean demand
+            // pressure (sibling died, surviving leg's bucket exhausted)
+            // grow slow-start style — see `DEMAND_SLOW_START_MULT`. No
+            // delivered-rate evidence (idle bond) → hold the estimate:
+            // probing on nothing would inflate it to fiction.
+            let mult = if demand_pressure {
+                DEMAND_SLOW_START_MULT
+            } else {
+                cfg.increase as f64
+            };
+            let probed = p.capacity_bps * mult;
             p.capacity_bps = probed.max(p.delivery_bps);
         }
         p.capacity_bps = p
             .capacity_bps
             .clamp(cfg.min_rate_bps as f64, p.ceiling_bps);
+        if p.delivery_bps > 0.0 && !(clean && demand_pressure) {
+            // Evidence bound: never estimate more than probe_cap_mult ×
+            // what the leg has recently proven it can deliver. The bound
+            // rises with the realized rate, so post-failover growth is
+            // still exponential. Suspended while clean demand pressure
+            // holds — on an undersubscribed bond, delivery measures the
+            // leg's share, and pinning the estimate at probe_cap_mult ×
+            // that share would turn an instant failover into seconds of
+            // sender-side shedding. The min_rate floor stays
+            // authoritative so a leg can always re-prove itself.
+            p.capacity_bps = p
+                .capacity_bps
+                .min(p.delivery_bps * cfg.probe_cap_mult)
+                .max(cfg.min_rate_bps as f64);
+        }
         self.publish(i);
     }
 
@@ -497,7 +669,10 @@ impl BondScheduler for CapacityAwareScheduler {
                 .clamp(self.cfg.min_rate_bps as f64, p.ceiling_bps);
             p.rtt = 0.0;
             p.rtt_min = 0.0;
+            p.rtt_min_at = Instant::now();
             p.loss = 0.0;
+            p.jitter_us = 0;
+            p.picked_since_update = false;
             p.tokens = 0.0;
             self.publish(i);
         }
@@ -509,9 +684,13 @@ mod tests {
     use super::*;
 
     fn health(rtt_ms: u64, loss: f32, delivery_bps: u64) -> PathHealth {
+        health_j(rtt_ms, loss, delivery_bps, 0)
+    }
+
+    fn health_j(rtt_ms: u64, loss: f32, delivery_bps: u64, jitter_us: u64) -> PathHealth {
         PathHealth {
             rtt: Some(Duration::from_millis(rtt_ms)),
-            jitter_us: 0,
+            jitter_us,
             loss_rate: loss,
             throughput_bps: delivery_bps,
             queue_depth: 0,
@@ -525,17 +704,141 @@ mod tests {
         }
     }
 
-    /// A clean path's capacity estimate probes upward over successive
-    /// health samples.
+    /// A clean path with a measured delivered rate probes its capacity
+    /// estimate upward over successive health samples.
     #[test]
     fn clean_path_probes_capacity_up() {
         let mut s = CapacityAwareScheduler::new(vec![0]);
         let start = s.capacity_bps(0).unwrap();
         for _ in 0..20 {
-            s.on_path_update(0, &health(20, 0.0, 0));
+            s.on_path_update(0, &health(20, 0.0, 10_000_000));
         }
         let after = s.capacity_bps(0).unwrap();
         assert!(after > start, "clean path should probe up: {start} -> {after}");
+    }
+
+    /// A clean path with no delivered-rate evidence holds its estimate —
+    /// an idle bond must not inflate capacity on nothing.
+    #[test]
+    fn idle_path_holds_estimate() {
+        let mut s = CapacityAwareScheduler::new(vec![0]);
+        let start = s.capacity_bps(0).unwrap();
+        for _ in 0..50 {
+            s.on_path_update(0, &health(20, 0.0, 0));
+        }
+        let after = s.capacity_bps(0).unwrap();
+        assert_eq!(after, start, "no delivery evidence → estimate held: {start} -> {after}");
+    }
+
+    /// The estimate never exceeds probe_cap_mult × the delivered rate —
+    /// an undersubscribed bond can't inflate estimates to fiction.
+    #[test]
+    fn undersubscribed_capacity_bounded_by_delivery() {
+        let mut s = CapacityAwareScheduler::new(vec![0]);
+        for _ in 0..500 {
+            s.on_path_update(0, &health(20, 0.0, 3_000_000));
+        }
+        let cap = s.capacity_bps(0).unwrap();
+        let bound = (3_000_000.0 * CongestionConfig::default().probe_cap_mult) as u64;
+        assert!(cap <= bound, "estimate bounded by evidence: {cap} > {bound}");
+        assert!(cap > 3_000_000, "probing above the delivered rate is still allowed: {cap}");
+    }
+
+    /// Failover ramp: an undersubscribed backup leg (delivered rate ==
+    /// its small traffic share) must not stay pinned at probe_cap_mult
+    /// × that share when its sibling dies. Clean demand pressure
+    /// (bucket in debt, no loss / inflation) lifts the evidence bound
+    /// and grows the estimate slow-start style, so a 95/5 split bond
+    /// absorbs the full feed on the survivor within ~1 s of control
+    /// rounds (5 × 200 ms) of the death.
+    #[test]
+    fn failover_ramps_within_a_second_of_control_rounds() {
+        let mut s = CapacityAwareScheduler::new(vec![0, 1]);
+        // Converge a ~10 Mbps feed split 95/5: backup's estimate is
+        // evidence-bounded near 2 × 500 kbps.
+        for _ in 0..50 {
+            s.on_path_update(0, &health(20, 0.0, 9_500_000));
+            s.on_path_update(1, &health(30, 0.0, 500_000));
+        }
+        let backup_before = s.capacity_bps(1).unwrap();
+        assert!(
+            backup_before <= 1_100_000,
+            "undersubscribed backup should be evidence-bounded: {backup_before}"
+        );
+
+        // Primary dies; keep offering the full feed. 263 × 950-byte
+        // packets per 200 ms control round ≈ 10 Mbps, with a clean
+        // health sample (delivered = what the round actually carried)
+        // fed back each round — the receiver-echo loop in miniature.
+        s.on_path_dead(0);
+        let pkt = 950usize;
+        let per_round = 263u64;
+        let mut now = Instant::now();
+        let mut recovered_round = None;
+        for round in 1..=25u32 {
+            let mut sent = 0u64;
+            for _ in 0..per_round {
+                now += Duration::from_micros(760);
+                if matches!(s.schedule_at(&hints(pkt), now), PathSelection::Single(_)) {
+                    sent += 1;
+                }
+            }
+            let delivered_bps = sent * (pkt as u64 + TOKEN_OVERHEAD_BYTES as u64) * 8 * 5;
+            s.on_path_update(1, &health(30, 0.0, delivered_bps));
+            if sent == per_round && recovered_round.is_none() {
+                recovered_round = Some(round);
+            }
+        }
+        let recovered = recovered_round.expect("survivor never carried the full feed");
+        assert!(
+            recovered <= 5,
+            "failover took {recovered} control rounds (> ~1 s at 5 Hz)"
+        );
+        assert!(
+            s.capacity_bps(1).unwrap() >= 9_000_000,
+            "survivor estimate did not ramp: {}",
+            s.capacity_bps(1).unwrap()
+        );
+    }
+
+    /// A permanent RTT baseline shift (5G handover / Starlink reroute)
+    /// first reads as inflation and backs off, then ages out of the
+    /// min-RTT window and the estimate recovers — instead of pinning at
+    /// the floor forever.
+    #[test]
+    fn rtt_baseline_shift_recovers_after_window() {
+        let cfg = CongestionConfig {
+            rtt_min_window: Duration::from_millis(50),
+            ..CongestionConfig::default()
+        };
+        let priors = vec![PathPrior { id: 0, weight_hint: 1, ceiling_bps: None }];
+        let mut s = CapacityAwareScheduler::with_paths(priors, cfg);
+        for _ in 0..30 {
+            s.on_path_update(0, &health(20, 0.0, 10_000_000));
+        }
+        let high = s.capacity_bps(0).unwrap();
+        // +60 ms permanent shift, zero loss — initially indistinguishable
+        // from queue build-up, so the path backs off.
+        for _ in 0..15 {
+            s.on_path_update(0, &health(80, 0.0, 10_000_000));
+        }
+        let backed_off = s.capacity_bps(0).unwrap();
+        assert!(backed_off < high, "shift should back off first: {high} -> {backed_off}");
+        // Once the old 20 ms min ages out of the window, 80 ms becomes
+        // the new baseline, inflation reads zero, and probing resumes.
+        std::thread::sleep(Duration::from_millis(60));
+        for _ in 0..30 {
+            s.on_path_update(0, &health(80, 0.0, 10_000_000));
+        }
+        let recovered = s.capacity_bps(0).unwrap();
+        assert!(
+            recovered > backed_off,
+            "estimate should recover after the window: {backed_off} -> {recovered}"
+        );
+        assert!(
+            recovered >= 10_000_000,
+            "recovery should reach at least the delivered rate: {recovered}"
+        );
     }
 
     /// A lossy path backs its capacity estimate down toward the
@@ -614,6 +917,99 @@ mod tests {
             "high-capacity path should dominate: {counts:?}"
         );
         assert!(counts[0] > 0, "low-capacity path still carries some: {counts:?}");
+    }
+
+    /// Two identical legs with full buckets (exact score ties) share the
+    /// traffic via the rotating tie-break instead of concentrating on
+    /// the lowest index — winner-takes-all would leave the second leg
+    /// cold for failover.
+    #[test]
+    fn equal_legs_share_on_ties() {
+        let mut s = CapacityAwareScheduler::new(vec![0, 1]);
+        for _ in 0..100 {
+            s.on_path_update(0, &health(20, 0.0, 20_000_000));
+            s.on_path_update(1, &health(20, 0.0, 20_000_000));
+        }
+        // A second of idle fills both buckets; the offered rate is far
+        // below capacity so refill restores the tie before each packet.
+        let base = Instant::now() + Duration::from_secs(1);
+        let interval = Duration::from_millis(10);
+        let mut counts = [0u64; 2];
+        for i in 0..1000u32 {
+            match s.schedule_at(&hints(1316), base + interval * i) {
+                PathSelection::Single(p) => counts[p as usize] += 1,
+                PathSelection::Duplicate(v) => counts[v[0] as usize] += 1,
+                PathSelection::Drop => {}
+            }
+        }
+        let total = counts[0] + counts[1];
+        assert!(counts[0] * 10 >= total * 3, "leg 0 should carry >=30%: {counts:?}");
+        assert!(counts[1] * 10 >= total * 3, "leg 1 should carry >=30%: {counts:?}");
+    }
+
+    /// High interarrival jitter deweights a path's quality: the clean
+    /// leg of an otherwise-identical pair carries the strict majority.
+    #[test]
+    fn jitter_deweights_path() {
+        let mut s = CapacityAwareScheduler::new(vec![0, 1]);
+        for _ in 0..100 {
+            s.on_path_update(0, &health(20, 0.0, 20_000_000));
+            s.on_path_update(1, &health_j(20, 0.0, 20_000_000, 200_000));
+        }
+        let base = Instant::now() + Duration::from_secs(1);
+        let interval = Duration::from_millis(1);
+        let mut counts = [0u64; 2];
+        for i in 0..1000u32 {
+            match s.schedule_at(&hints(1316), base + interval * i) {
+                PathSelection::Single(p) => counts[p as usize] += 1,
+                PathSelection::Duplicate(v) => counts[v[0] as usize] += 1,
+                PathSelection::Drop => {}
+            }
+        }
+        assert!(
+            counts[0] > counts[1],
+            "clean leg should carry the strict majority over the jittery one: {counts:?}"
+        );
+    }
+
+    /// A starved leg's stale jitter sample decays across control rounds
+    /// so the leg re-earns traffic — the receiver can only re-measure
+    /// jitter on a leg that carries data, so without decay one bad
+    /// sample would pin the leg out of the bond forever.
+    #[test]
+    fn stale_jitter_decays_on_starved_path() {
+        let mut s = CapacityAwareScheduler::new(vec![0, 1]);
+        for _ in 0..50 {
+            s.on_path_update(0, &health_j(20, 0.0, 20_000_000, 200_000));
+            s.on_path_update(1, &health(20, 0.0, 20_000_000));
+        }
+        // Deweighted leg 0 starves while leg 1 carries everything.
+        let base = Instant::now() + Duration::from_secs(1);
+        let mut t = base;
+        for _ in 0..100 {
+            t += Duration::from_millis(1);
+            assert!(matches!(s.schedule_at(&hints(1316), t), PathSelection::Single(1)));
+        }
+        // Health rounds keep echoing the frozen 200 ms sample (no data
+        // on leg 0 → no fresh measurement). The decay must let leg 0
+        // win selections again within a few rounds.
+        let mut counts = [0u64; 2];
+        for _ in 0..10 {
+            s.on_path_update(0, &health_j(20, 0.0, 20_000_000, 200_000));
+            s.on_path_update(1, &health(20, 0.0, 20_000_000));
+            for _ in 0..5 {
+                t += Duration::from_millis(1);
+                match s.schedule_at(&hints(1316), t) {
+                    PathSelection::Single(p) => counts[p as usize] += 1,
+                    PathSelection::Duplicate(v) => counts[v[0] as usize] += 1,
+                    PathSelection::Drop => {}
+                }
+            }
+        }
+        assert!(
+            counts[0] > 0,
+            "starved leg should recover once the stale deweight decays: {counts:?}"
+        );
     }
 
     /// `Low`-priority traffic is dropped first when every bucket is dry;

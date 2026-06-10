@@ -40,6 +40,52 @@ pub enum PathEventKind {
         alive_count: usize,
         total: usize,
     },
+    /// The sender restarted: a *different* nonzero session epoch
+    /// arrived on 2 consecutive control packets and the receiver
+    /// dropped its reassembly anchor, pending NACKs and FEC state.
+    /// `old_epoch` is what was previously adopted (0 = none yet);
+    /// the event's `path_id` is the path whose control packet
+    /// completed adoption.
+    SessionReset {
+        old_epoch: u32,
+        new_epoch: u32,
+    },
+    /// A UDP path's socket was re-created, re-pinned and swapped in
+    /// place (interface churn or a run of route/device send errors).
+    /// A sender-leg rebuild takes a fresh ephemeral source port — the
+    /// receiver re-learns the return address from the next control
+    /// packet. UDP paths only; QUIC / RIST legs are never rebuilt.
+    PathRebuilt { reason: PathRebuildReason },
+    /// The pinned interface (or bound source address) disappeared
+    /// out from under a UDP path. Emitted once per disappearance;
+    /// the watcher keeps polling and fires
+    /// `PathRebuilt { InterfaceRestored }` when it returns.
+    InterfaceLost,
+}
+
+/// Why a UDP path's socket was torn down and rebuilt in place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathRebuildReason {
+    /// The pinned interface's ifindex changed under the socket (USB
+    /// dongle re-plug, NIC re-enumeration) — the old device bind /
+    /// egress hint points at a dead index and blackholes.
+    InterfaceChanged,
+    /// The pinned interface (or bound source address) came back
+    /// after an absence signalled by `InterfaceLost`.
+    InterfaceRestored,
+    /// A run of consecutive route/device errors on send (ENODEV,
+    /// EADDRNOTAVAIL, ENETUNREACH, EHOSTUNREACH).
+    SendErrors,
+}
+
+impl PathRebuildReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PathRebuildReason::InterfaceChanged => "interface changed",
+            PathRebuildReason::InterfaceRestored => "interface restored",
+            PathRebuildReason::SendErrors => "send errors",
+        }
+    }
 }
 
 /// Why a path was declared dead. Used for operator-facing event
@@ -89,6 +135,7 @@ impl PathEvent {
             PathEventKind::BondDegraded { .. }
                 | PathEventKind::BondDown { .. }
                 | PathEventKind::BondRecovered { .. }
+                | PathEventKind::SessionReset { .. }
         )
     }
 }

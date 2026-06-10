@@ -145,20 +145,30 @@ pub struct KeepaliveBody {
     /// delivered-bitrate per path for the capacity controller. 0 on a
     /// v1 peer that doesn't carry the field.
     pub bytes_sent_on_path: u64,
+    /// Sender session epoch (v3 extension). Nonzero random u32 chosen
+    /// once per sender instance. A receiver anchored to a previous
+    /// instance's seq space adopts a *different* nonzero epoch (after
+    /// 2 consecutive control packets carry it) by resetting its
+    /// reassembly state — otherwise a restarted sender's seqs drop as
+    /// stale forever. 0 on a v1/v2 peer.
+    pub session_epoch: u32,
 }
 
 impl KeepaliveBody {
     /// Base (v1) wire size; the v2 byte-counter is appended after this
     /// and parsed defensively so a mixed-version bond never desyncs.
     pub const SIZE: usize = 20;
-    /// Full v2 wire size (base + `bytes_sent_on_path`).
+    /// v2 wire size (base + `bytes_sent_on_path`).
     pub const SIZE_V2: usize = 28;
+    /// Full v3 wire size (v2 + `session_epoch`).
+    pub const SIZE_V3: usize = 32;
 
     pub fn write_to(&self, out: &mut BytesMut) {
         out.put_u64(self.stamp_us);
         out.put_u64(self.packets_sent_on_path);
         out.put_u32(self.highest_bond_seq_sent);
         out.put_u64(self.bytes_sent_on_path);
+        out.put_u32(self.session_epoch);
     }
 
     pub fn parse(buf: &[u8]) -> Result<Self> {
@@ -172,13 +182,15 @@ impl KeepaliveBody {
         let stamp_us = r.get_u64();
         let packets_sent_on_path = r.get_u64();
         let highest_bond_seq_sent = r.get_u32();
-        // v2 extension — present iff the peer wrote it.
+        // v2/v3 extensions — present iff the peer wrote them.
         let bytes_sent_on_path = if r.remaining() >= 8 { r.get_u64() } else { 0 };
+        let session_epoch = if r.remaining() >= 4 { r.get_u32() } else { 0 };
         Ok(Self {
             stamp_us,
             packets_sent_on_path,
             highest_bond_seq_sent,
             bytes_sent_on_path,
+            session_epoch,
         })
     }
 }
@@ -200,14 +212,21 @@ pub struct KeepaliveAckBody {
     /// Receiver-measured interarrival jitter on this path, microseconds
     /// (RFC 3550 A.8 style, v2 extension). 0 on a v1 peer.
     pub jitter_us: u32,
+    /// Echo of the receiver's currently-adopted session epoch (v3
+    /// extension) — diagnostic mirror of [`KeepaliveBody::session_epoch`]
+    /// so a sender can observe adoption. 0 until adopted / on a v1/v2
+    /// peer.
+    pub session_epoch: u32,
 }
 
 impl KeepaliveAckBody {
-    /// Base (v1) wire size; v2 fields are appended and parsed
+    /// Base (v1) wire size; v2/v3 fields are appended and parsed
     /// defensively.
     pub const SIZE: usize = 24;
-    /// Full v2 wire size (base + bytes + jitter).
+    /// v2 wire size (base + bytes + jitter).
     pub const SIZE_V2: usize = 36;
+    /// Full v3 wire size (v2 + `session_epoch`).
+    pub const SIZE_V3: usize = 40;
 
     pub fn write_to(&self, out: &mut BytesMut) {
         out.put_u64(self.stamp_us);
@@ -215,6 +234,7 @@ impl KeepaliveAckBody {
         out.put_u64(self.packets_received_on_path);
         out.put_u64(self.bytes_received_on_path);
         out.put_u32(self.jitter_us);
+        out.put_u32(self.session_epoch);
     }
 
     pub fn parse(buf: &[u8]) -> Result<Self> {
@@ -228,15 +248,17 @@ impl KeepaliveAckBody {
         let stamp_us = r.get_u64();
         let packets_sent_on_path = r.get_u64();
         let packets_received_on_path = r.get_u64();
-        // v2 extensions — present iff the peer wrote them.
+        // v2/v3 extensions — present iff the peer wrote them.
         let bytes_received_on_path = if r.remaining() >= 8 { r.get_u64() } else { 0 };
         let jitter_us = if r.remaining() >= 4 { r.get_u32() } else { 0 };
+        let session_epoch = if r.remaining() >= 4 { r.get_u32() } else { 0 };
         Ok(Self {
             stamp_us,
             packets_sent_on_path,
             packets_received_on_path,
             bytes_received_on_path,
             jitter_us,
+            session_epoch,
         })
     }
 }
@@ -324,12 +346,12 @@ impl CtrlPacket {
         out.clear();
         match self {
             CtrlPacket::Keepalive { header, body } => {
-                out.reserve(CtrlHeader::SIZE + KeepaliveBody::SIZE_V2);
+                out.reserve(CtrlHeader::SIZE + KeepaliveBody::SIZE_V3);
                 header.write_to(out);
                 body.write_to(out);
             }
             CtrlPacket::KeepaliveAck { header, body } => {
-                out.reserve(CtrlHeader::SIZE + KeepaliveAckBody::SIZE_V2);
+                out.reserve(CtrlHeader::SIZE + KeepaliveAckBody::SIZE_V3);
                 header.write_to(out);
                 body.write_to(out);
             }
@@ -385,12 +407,13 @@ mod tests {
             packets_sent_on_path: 10_000,
             highest_bond_seq_sent: 12_345_678,
             bytes_sent_on_path: 13_160_000,
+            session_epoch: 0x5e55_10e9,
         };
         let pkt = CtrlPacket::Keepalive { header, body };
 
         let mut buf = BytesMut::new();
         pkt.serialize(&mut buf);
-        assert_eq!(buf.len(), CtrlHeader::SIZE + KeepaliveBody::SIZE_V2);
+        assert_eq!(buf.len(), CtrlHeader::SIZE + KeepaliveBody::SIZE_V3);
         assert_eq!(buf[0], CTRL_MAGIC);
 
         let parsed = CtrlPacket::parse(&buf).unwrap();
@@ -407,6 +430,7 @@ mod tests {
             packets_received_on_path: 995,
             bytes_received_on_path: 1_311_400,
             jitter_us: 1234,
+            session_epoch: 0xfeed_f00d,
         };
         let pkt = CtrlPacket::KeepaliveAck { header, body };
         let mut buf = BytesMut::new();
@@ -416,24 +440,30 @@ mod tests {
     }
 
     #[test]
-    fn v1_bodies_parse_without_v2_extensions() {
-        // A v1 peer ships only the base fields; truncating a serialized
-        // v2 body to its base length must parse with the v2 fields
-        // defaulting to 0 (forward/backward compatibility — both ends are
-        // edge but a mixed-version rollout must never desync).
+    fn older_bodies_parse_without_extensions() {
+        // A v1/v2 peer ships only its known fields; truncating a
+        // serialized v3 body to those lengths must parse with the newer
+        // fields defaulting to 0 (forward/backward compatibility — both
+        // ends are edge but a mixed-version rollout must never desync).
         let ka = KeepaliveBody {
             stamp_us: 1,
             packets_sent_on_path: 2,
             highest_bond_seq_sent: 3,
             bytes_sent_on_path: 4,
+            session_epoch: 5,
         };
         let mut buf = BytesMut::new();
         ka.write_to(&mut buf);
         let v1 = KeepaliveBody::parse(&buf[..KeepaliveBody::SIZE]).unwrap();
         assert_eq!(v1.bytes_sent_on_path, 0);
+        assert_eq!(v1.session_epoch, 0);
         assert_eq!(v1.packets_sent_on_path, 2);
-        let v2 = KeepaliveBody::parse(&buf).unwrap();
+        let v2 = KeepaliveBody::parse(&buf[..KeepaliveBody::SIZE_V2]).unwrap();
         assert_eq!(v2.bytes_sent_on_path, 4);
+        assert_eq!(v2.session_epoch, 0);
+        let v3 = KeepaliveBody::parse(&buf).unwrap();
+        assert_eq!(v3.bytes_sent_on_path, 4);
+        assert_eq!(v3.session_epoch, 5);
 
         let ack = KeepaliveAckBody {
             stamp_us: 9,
@@ -441,16 +471,22 @@ mod tests {
             packets_received_on_path: 11,
             bytes_received_on_path: 12,
             jitter_us: 13,
+            session_epoch: 14,
         };
         let mut abuf = BytesMut::new();
         ack.write_to(&mut abuf);
         let a1 = KeepaliveAckBody::parse(&abuf[..KeepaliveAckBody::SIZE]).unwrap();
         assert_eq!(a1.bytes_received_on_path, 0);
         assert_eq!(a1.jitter_us, 0);
+        assert_eq!(a1.session_epoch, 0);
         assert_eq!(a1.packets_received_on_path, 11);
-        let a2 = KeepaliveAckBody::parse(&abuf).unwrap();
+        let a2 = KeepaliveAckBody::parse(&abuf[..KeepaliveAckBody::SIZE_V2]).unwrap();
         assert_eq!(a2.bytes_received_on_path, 12);
         assert_eq!(a2.jitter_us, 13);
+        assert_eq!(a2.session_epoch, 0);
+        let a3 = KeepaliveAckBody::parse(&abuf).unwrap();
+        assert_eq!(a3.jitter_us, 13);
+        assert_eq!(a3.session_epoch, 14);
     }
 
     #[test]

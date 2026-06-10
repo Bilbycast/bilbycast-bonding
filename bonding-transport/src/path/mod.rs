@@ -32,6 +32,7 @@ use tokio::sync::mpsc;
 use bonding_protocol::protocol::scheduler::PathId;
 
 pub use udp::{PinMechanism, UdpPath};
+pub(crate) use udp::{UdpWatchHandle, WatchTarget};
 
 #[cfg(feature = "path-rist")]
 pub use rist::RistPath;
@@ -162,6 +163,45 @@ impl Path {
     pub fn pin_mechanism(&self) -> Option<PinMechanism> {
         match self {
             Path::Udp(p) => p.pin_mechanism(),
+            #[cfg(feature = "path-rist")]
+            Path::Rist(_) => None,
+            #[cfg(feature = "path-quic")]
+            Path::Quic(_) => None,
+        }
+    }
+
+    /// Sender hot-path hook — a successful send clears the
+    /// consecutive route-error run on UDP paths. No-op elsewhere.
+    #[inline]
+    pub fn note_send_ok(&self) {
+        match self {
+            Path::Udp(p) => p.note_send_ok(),
+            #[cfg(feature = "path-rist")]
+            Path::Rist(_) => {}
+            #[cfg(feature = "path-quic")]
+            Path::Quic(_) => {}
+        }
+    }
+
+    /// Sender hot-path hook — count a send error toward the UDP
+    /// socket-rebuild trigger. Returns `true` when the error run just
+    /// caused a rebuild (caller emits `PathRebuilt { SendErrors }`).
+    /// QUIC / RIST legs manage their own connections: always `false`.
+    pub fn note_send_error(&self, err: &PathError) -> bool {
+        match self {
+            Path::Udp(p) => p.note_send_error(err),
+            #[cfg(feature = "path-rist")]
+            Path::Rist(_) => false,
+            #[cfg(feature = "path-quic")]
+            Path::Quic(_) => false,
+        }
+    }
+
+    /// Rebuild/watch handle for the per-bond interface watcher.
+    /// `None` for QUIC / RIST legs (never rebuilt at this layer).
+    pub(crate) fn udp_watch_handle(&self) -> Option<UdpWatchHandle> {
+        match self {
+            Path::Udp(p) => Some(p.watch_handle()),
             #[cfg(feature = "path-rist")]
             Path::Rist(_) => None,
             #[cfg(feature = "path-quic")]

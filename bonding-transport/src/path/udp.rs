@@ -16,11 +16,26 @@
 //! clone), and outbound `send_to` skips the channel layer entirely
 //! so the scheduler's decision hits the wire with a single syscall
 //! per packet.
+//!
+//! ## Interface-churn recovery (UDP paths only)
+//!
+//! `SO_BINDTODEVICE` / `IP_UNICAST_IF` capture the **ifindex** at
+//! socket creation. A USB-dongle re-plug, NIC re-enumeration or DHCP
+//! renumber leaves the socket pinned to a dead index — packets
+//! blackhole until the socket is rebuilt. The build parameters live
+//! in a shared [`UdpRebuilder`]; a rebuild re-creates + re-pins the
+//! socket and swaps it in via lock-free `ArcSwap`. The recv loop
+//! reads on the current snapshot with a bounded timeout
+//! ([`SOCKET_SWAP_POLL`]) so a swap is picked up within ~100 ms
+//! without poll-spinning. QUIC / RIST legs manage their own
+//! connections and are never rebuilt here.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
+use arc_swap::ArcSwap;
 use bytes::Bytes;
 use socket2::{Domain, Protocol as SockProto, Socket as Sock2, Type};
 use tokio::net::UdpSocket;
@@ -40,6 +55,28 @@ const DEFAULT_SOCK_BUF: usize = 2 * 1024 * 1024;
 
 /// Maximum UDP datagram we'll accept.
 const MAX_DATAGRAM: usize = 2048;
+
+/// Upper bound on how long the recv loop reads a stale socket
+/// snapshot after a rebuild swap.
+const SOCKET_SWAP_POLL: Duration = Duration::from_millis(100);
+
+/// Consecutive route/device send errors before the sender-side
+/// trigger rebuilds the socket.
+const SEND_ERR_REBUILD_THRESHOLD: u64 = 50;
+
+/// Minimum spacing between send-error-triggered rebuild attempts.
+const SEND_ERR_REBUILD_MIN_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Cap on the send-error rebuild backoff exponent: spacing doubles per
+/// rebuild that fails to clear the error run, up to
+/// `SEND_ERR_REBUILD_MIN_INTERVAL << SEND_ERR_REBUILD_MAX_BACKOFF_EXP`
+/// (64 s). A rebuild fixes socket-level staleness (stale ifindex pin,
+/// vanished bind address), not a dead next-hop — EHOSTUNREACH /
+/// ENETUNREACH persist across rebuilds, and without backoff a downed
+/// gateway costs one pointless rebuild (fresh ephemeral source port =
+/// NAT-mapping churn) plus one `PathRebuilt` warning per interval,
+/// indefinitely. Any successful send resets the exponent.
+const SEND_ERR_REBUILD_MAX_BACKOFF_EXP: u32 = 6;
 
 /// Which kernel primitive actually pinned this path's egress to the
 /// requested NIC. Surfaced so telemetry can show whether a path got
@@ -68,16 +105,215 @@ impl PinMechanism {
             PinMechanism::BoundIf => "ip_bound_if",
         }
     }
+
+    /// `bonding_protocol::stats::PIN_*` code for this mechanism.
+    pub fn stats_code(self) -> u64 {
+        match self {
+            PinMechanism::SoBindToDevice => bonding_protocol::stats::PIN_SO_BINDTODEVICE,
+            PinMechanism::UnicastIf => bonding_protocol::stats::PIN_IP_UNICAST_IF,
+            PinMechanism::BoundIf => bonding_protocol::stats::PIN_IP_BOUND_IF,
+        }
+    }
+
+    fn from_stats_code(code: u64) -> Option<Self> {
+        match code {
+            bonding_protocol::stats::PIN_SO_BINDTODEVICE => Some(PinMechanism::SoBindToDevice),
+            bonding_protocol::stats::PIN_IP_UNICAST_IF => Some(PinMechanism::UnicastIf),
+            bonding_protocol::stats::PIN_IP_BOUND_IF => Some(PinMechanism::BoundIf),
+            _ => None,
+        }
+    }
+}
+
+/// What the per-bond interface watcher polls for a UDP path.
+#[derive(Debug, Clone)]
+pub(crate) enum WatchTarget {
+    /// `interface`-pinned path — watch the name → ifindex mapping
+    /// (gone / changed / returned).
+    Interface(String),
+    /// Source-bound path (specific local IP, no interface pin) —
+    /// watch the address's presence (DHCP renumber, device gone).
+    SourceIp(IpAddr),
+}
+
+/// Per-path handle the bond keeps after the `Path` itself moves into
+/// the sender / receiver task: rebuild state plus the watch target
+/// derived from the path's config.
+#[derive(Clone)]
+pub(crate) struct UdpWatchHandle {
+    pub(crate) path_id: PathId,
+    pub(crate) name: String,
+    /// `None` = nothing to watch (wildcard bind, no interface pin);
+    /// the path still supports manual / send-error rebuilds.
+    pub(crate) target: Option<WatchTarget>,
+    pub(crate) rebuilder: Arc<UdpRebuilder>,
+}
+
+/// Shared, lock-free rebuild state for one UDP path: the swappable
+/// socket plus the build parameters needed to re-create it. Shared
+/// between the `UdpPath` handle, its recv loop, the per-bond
+/// interface watcher and the sender's send-error trigger.
+pub(crate) struct UdpRebuilder {
+    /// Original *requested* bind. Port 0 (sender-mode) takes a fresh
+    /// ephemeral port on every rebuild; receiver-mode re-binds its
+    /// configured port (`SO_REUSEADDR` covers the ≤100 ms window in
+    /// which the recv loop still holds the old snapshot).
+    local: SocketAddr,
+    interface: Option<String>,
+    socket: ArcSwap<UdpSocket>,
+    /// `PIN_*` code of the mechanism on the CURRENT socket — can
+    /// differ across rebuilds (capability granted/revoked between).
+    pin_code: AtomicU64,
+    /// ifindex the current socket pinned to (0 = unpinned/unknown).
+    bound_ifindex: AtomicU64,
+    /// Successful rebuilds. Mirrored into `PathStats.rebuilds` by the
+    /// caller that triggered the rebuild.
+    rebuilds: AtomicU64,
+    /// Consecutive route/device send errors (sender-side trigger).
+    consec_send_errs: AtomicU64,
+    /// Send-error rebuilds since the last successful send — the
+    /// backoff exponent for [`SEND_ERR_REBUILD_MIN_INTERVAL`] (capped
+    /// at [`SEND_ERR_REBUILD_MAX_BACKOFF_EXP`]). Nonzero means the
+    /// last rebuild did not clear the error run.
+    send_rebuild_backoff: AtomicU64,
+    /// Single-flight gate — watcher and sender trigger may race.
+    rebuild_gate: AtomicBool,
+    /// Milliseconds since `created` of the last rebuild *attempt*
+    /// (success or failure); `u64::MAX` = never attempted.
+    last_attempt_ms: AtomicU64,
+    created: Instant,
+}
+
+impl UdpRebuilder {
+    /// Initial build. Same socket recipe as every rebuild.
+    fn create(local: SocketAddr, interface: Option<&str>) -> PathResult<Arc<Self>> {
+        let (socket, pin, ifindex) = build_socket(local, interface)?;
+        Ok(Arc::new(Self {
+            local,
+            interface: interface.map(str::to_owned),
+            socket: ArcSwap::from(socket),
+            pin_code: AtomicU64::new(
+                pin.map(PinMechanism::stats_code)
+                    .unwrap_or(bonding_protocol::stats::PIN_NONE),
+            ),
+            bound_ifindex: AtomicU64::new(ifindex as u64),
+            rebuilds: AtomicU64::new(0),
+            consec_send_errs: AtomicU64::new(0),
+            send_rebuild_backoff: AtomicU64::new(0),
+            rebuild_gate: AtomicBool::new(false),
+            last_attempt_ms: AtomicU64::new(u64::MAX),
+            created: Instant::now(),
+        }))
+    }
+
+    /// Current socket snapshot. One refcount bump per call — cheap
+    /// and lock-free; the UDP syscall dominates.
+    #[inline]
+    pub(crate) fn current(&self) -> Arc<UdpSocket> {
+        self.socket.load_full()
+    }
+
+    pub(crate) fn pin_mechanism(&self) -> Option<PinMechanism> {
+        PinMechanism::from_stats_code(self.pin_code.load(Ordering::Relaxed))
+    }
+
+    pub(crate) fn bound_ifindex(&self) -> u32 {
+        self.bound_ifindex.load(Ordering::Relaxed) as u32
+    }
+
+    pub(crate) fn rebuild_count(&self) -> u64 {
+        self.rebuilds.load(Ordering::Relaxed)
+    }
+
+    /// Re-create + re-pin the socket from the stored parameters and
+    /// swap it in atomically. Must run inside a tokio runtime (the
+    /// new socket registers with the reactor).
+    ///
+    /// `None` = skipped (another rebuild in flight, or the last
+    /// attempt was less than `min_interval` ago). `Some(Ok)` = the
+    /// new socket is live; the recv loop picks it up within
+    /// [`SOCKET_SWAP_POLL`]. `Some(Err)` = build failed, the old
+    /// socket stays in place and the caller may retry later.
+    pub(crate) fn try_rebuild(&self, min_interval: Duration) -> Option<PathResult<()>> {
+        if self.rebuild_gate.swap(true, Ordering::AcqRel) {
+            return None;
+        }
+        let now_ms = self.created.elapsed().as_millis() as u64;
+        let last = self.last_attempt_ms.load(Ordering::Relaxed);
+        if last != u64::MAX && now_ms.saturating_sub(last) < min_interval.as_millis() as u64 {
+            self.rebuild_gate.store(false, Ordering::Release);
+            return None;
+        }
+        self.last_attempt_ms.store(now_ms, Ordering::Relaxed);
+        let result = match build_socket(self.local, self.interface.as_deref()) {
+            Ok((socket, pin, ifindex)) => {
+                self.socket.store(socket);
+                self.pin_code.store(
+                    pin.map(PinMechanism::stats_code)
+                        .unwrap_or(bonding_protocol::stats::PIN_NONE),
+                    Ordering::Relaxed,
+                );
+                self.bound_ifindex.store(ifindex as u64, Ordering::Relaxed);
+                self.rebuilds.fetch_add(1, Ordering::Relaxed);
+                self.consec_send_errs.store(0, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(e) => Err(e),
+        };
+        self.rebuild_gate.store(false, Ordering::Release);
+        Some(result)
+    }
+
+    /// Hot-path bookkeeping: clear the consecutive-error run (and the
+    /// rebuild backoff — a delivered packet proves the leg works
+    /// again). Loads first so the common case is two relaxed reads.
+    #[inline]
+    fn note_send_ok(&self) {
+        if self.consec_send_errs.load(Ordering::Relaxed) != 0 {
+            self.consec_send_errs.store(0, Ordering::Relaxed);
+        }
+        if self.send_rebuild_backoff.load(Ordering::Relaxed) != 0 {
+            self.send_rebuild_backoff.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// Classify a send error; at [`SEND_ERR_REBUILD_THRESHOLD`]
+    /// consecutive route/device errors, rebuild — rate-limited to one
+    /// attempt per [`SEND_ERR_REBUILD_MIN_INTERVAL`], doubling per
+    /// rebuild that failed to clear the run (see
+    /// [`SEND_ERR_REBUILD_MAX_BACKOFF_EXP`]). Returns `true` when a
+    /// rebuild was performed. A non-route error breaks the run —
+    /// "consecutive" means an unbroken run of the listed errnos.
+    fn note_send_error(&self, err: &PathError) -> bool {
+        let route_err = match err {
+            PathError::Send(io) => is_route_errno(io),
+            _ => false,
+        };
+        if !route_err {
+            self.note_send_ok();
+            return false;
+        }
+        let run = self.consec_send_errs.fetch_add(1, Ordering::Relaxed) + 1;
+        if run < SEND_ERR_REBUILD_THRESHOLD {
+            return false;
+        }
+        let exp = (self.send_rebuild_backoff.load(Ordering::Relaxed) as u32)
+            .min(SEND_ERR_REBUILD_MAX_BACKOFF_EXP);
+        match self.try_rebuild(SEND_ERR_REBUILD_MIN_INTERVAL * (1u32 << exp)) {
+            Some(Ok(())) => {
+                self.send_rebuild_backoff.fetch_add(1, Ordering::Relaxed);
+                true
+            }
+            _ => false,
+        }
+    }
 }
 
 pub struct UdpPath {
     id: PathId,
     name: String,
-    socket: Arc<UdpSocket>,
-    /// `Some` when an `interface` pin was requested; records which
-    /// kernel mechanism actually succeeded (hard bind vs the
-    /// unprivileged hint fallback).
-    pin_mechanism: Option<PinMechanism>,
+    /// Swappable socket + rebuild parameters (see module docs).
+    shared: Arc<UdpRebuilder>,
     primary_peer: Arc<Mutex<Option<SocketAddr>>>,
     /// Cached copy of the primary peer as a pair of atomics for the
     /// send hot path — avoids taking the Mutex on every
@@ -110,13 +346,12 @@ impl UdpPath {
         interface: Option<&str>,
         crypto: Option<Arc<BondCrypto>>,
     ) -> PathResult<Self> {
-        let (socket, pin_mechanism) = Self::build_socket(local, interface).await?;
-        Ok(Self::from_socket(
+        let shared = UdpRebuilder::create(local, interface)?;
+        Ok(Self::from_shared(
             id,
             name.into(),
-            socket,
+            shared,
             primary_peer,
-            pin_mechanism,
             crypto,
         ))
     }
@@ -137,77 +372,87 @@ impl UdpPath {
         Self::bind(id, name, local, Some(primary_peer), interface, crypto).await
     }
 
-    async fn build_socket(
-        local: SocketAddr,
-        interface: Option<&str>,
-    ) -> PathResult<(Arc<UdpSocket>, Option<PinMechanism>)> {
-        let domain = if local.is_ipv4() {
-            Domain::IPV4
-        } else {
-            Domain::IPV6
-        };
-        let sock = Sock2::new(domain, Type::DGRAM, Some(SockProto::UDP)).map_err(|e| {
-            PathError::Bind {
-                addr: local.to_string(),
-                source: e,
-            }
-        })?;
-        sock.set_reuse_address(true).ok();
-        sock.set_nonblocking(true).ok();
-        let _ = sock.set_recv_buffer_size(DEFAULT_SOCK_BUF);
-        let _ = sock.set_send_buffer_size(DEFAULT_SOCK_BUF);
-        // NIC pin first — some platforms require it before bind.
-        let pin_mechanism = if let Some(iface) = interface {
-            let mech =
-                bind_to_interface(&sock, iface, local.is_ipv6()).map_err(|e| {
-                    PathError::BindInterface {
-                        interface: iface.to_string(),
-                        source: e,
-                    }
-                })?;
-            log::info!(
-                "bond udp path pinned to interface '{}' via {}",
-                iface,
-                mech.as_str()
-            );
-            Some(mech)
-        } else {
-            None
-        };
-        sock.bind(&local.into()).map_err(|e| PathError::Bind {
-            addr: local.to_string(),
-            source: e,
-        })?;
-        let udp = UdpSocket::from_std(sock.into()).map_err(|e| PathError::Bind {
-            addr: local.to_string(),
-            source: e,
-        })?;
-        Ok((Arc::new(udp), pin_mechanism))
-    }
-
     /// Which NIC-pin mechanism this path is using, if an `interface`
     /// was requested. `None` = no pin (kernel routing decides egress).
+    /// Reflects the CURRENT socket — may change across rebuilds.
     pub fn pin_mechanism(&self) -> Option<PinMechanism> {
-        self.pin_mechanism
+        self.shared.pin_mechanism()
     }
 
-    fn from_socket(
+    /// Force an in-place socket rebuild (no rate limit). Testing /
+    /// operator-triggered recovery; the watcher and send-error
+    /// trigger go through `UdpRebuilder::try_rebuild` directly.
+    pub fn rebuild(&self) -> PathResult<()> {
+        match self.shared.try_rebuild(Duration::ZERO) {
+            Some(r) => r,
+            // Another rebuild is in flight — treat as success, the
+            // socket is being replaced either way.
+            None => Ok(()),
+        }
+    }
+
+    /// Successful rebuilds on this path.
+    pub fn rebuild_count(&self) -> u64 {
+        self.shared.rebuild_count()
+    }
+
+    /// Sender hot-path hook — clear the consecutive send-error run.
+    #[inline]
+    pub fn note_send_ok(&self) {
+        self.shared.note_send_ok();
+    }
+
+    /// Sender hot-path hook — classify a send error and rebuild the
+    /// socket after [`SEND_ERR_REBUILD_THRESHOLD`] consecutive
+    /// route/device errors (≥1 s between attempts). Returns `true`
+    /// when a rebuild was performed so the caller can emit
+    /// `PathRebuilt { reason: SendErrors }`.
+    pub fn note_send_error(&self, err: &PathError) -> bool {
+        let rebuilt = self.shared.note_send_error(err);
+        if rebuilt {
+            log::warn!(
+                "bond udp path '{}': rebuilt socket after {} consecutive route/device send errors",
+                self.name,
+                SEND_ERR_REBUILD_THRESHOLD
+            );
+        }
+        rebuilt
+    }
+
+    /// Handle for the per-bond interface watcher / manual rebuilds.
+    /// Survives the move of the `Path` into the sender/receiver task.
+    pub(crate) fn watch_handle(&self) -> UdpWatchHandle {
+        let target = match (&self.shared.interface, self.shared.local.ip()) {
+            // An interface pin subsumes the source-bind watch: the
+            // ifindex is the churn signal. Address-gone with a stable
+            // iface surfaces as send errors instead.
+            (Some(iface), _) => Some(WatchTarget::Interface(iface.clone())),
+            (None, ip) if !ip.is_unspecified() => Some(WatchTarget::SourceIp(ip)),
+            _ => None,
+        };
+        UdpWatchHandle {
+            path_id: self.id,
+            name: self.name.clone(),
+            target,
+            rebuilder: self.shared.clone(),
+        }
+    }
+
+    fn from_shared(
         id: PathId,
         name: String,
-        socket: Arc<UdpSocket>,
+        shared: Arc<UdpRebuilder>,
         primary_peer: Option<SocketAddr>,
-        pin_mechanism: Option<PinMechanism>,
         crypto: Option<Arc<BondCrypto>>,
     ) -> Self {
         let (tx, rx) = mpsc::channel::<PathDatagram>(1024);
         let cancel = CancellationToken::new();
-        let recv_task = spawn_recv_loop(socket.clone(), tx, cancel.clone(), crypto.clone());
+        let recv_task = spawn_recv_loop(shared.clone(), tx, cancel.clone(), crypto.clone());
 
         let me = Self {
             id,
             name,
-            socket,
-            pin_mechanism,
+            shared,
             primary_peer: Arc::new(Mutex::new(primary_peer)),
             primary_ip_hi: AtomicU64::new(0),
             primary_ip_lo: AtomicU64::new(0),
@@ -296,19 +541,21 @@ impl UdpPath {
     }
 
     pub async fn send_to(&self, data: &[u8], to: SocketAddr) -> PathResult<()> {
+        // Snapshot of the current socket — lock-free; a rebuild swaps
+        // the next send onto the new socket.
+        let socket = self.shared.current();
         if let Some(crypto) = &self.crypto {
             let mut sealed = Vec::with_capacity(data.len() + crate::crypto::ENVELOPE_OVERHEAD);
             crypto
                 .seal(data, &mut sealed)
                 .map_err(|e| PathError::Other(format!("bond seal: {e}")))?;
-            return self
-                .socket
+            return socket
                 .send_to(&sealed, to)
                 .await
                 .map(|_| ())
                 .map_err(PathError::Send);
         }
-        self.socket
+        socket
             .send_to(data, to)
             .await
             .map(|_| ())
@@ -320,12 +567,67 @@ impl UdpPath {
     }
 
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
-        self.socket.local_addr()
+        self.shared.current().local_addr()
     }
 }
 
+/// Socket build recipe shared by the initial bind and every rebuild.
+/// Returns the resolved pin mechanism plus the ifindex the pin bound
+/// to (0 when unpinned / unresolved) so the watcher can compare it
+/// against the live name → index mapping later.
+fn build_socket(
+    local: SocketAddr,
+    interface: Option<&str>,
+) -> PathResult<(Arc<UdpSocket>, Option<PinMechanism>, u32)> {
+    let domain = if local.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
+    let sock = Sock2::new(domain, Type::DGRAM, Some(SockProto::UDP)).map_err(|e| {
+        PathError::Bind {
+            addr: local.to_string(),
+            source: e,
+        }
+    })?;
+    sock.set_reuse_address(true).ok();
+    sock.set_nonblocking(true).ok();
+    let _ = sock.set_recv_buffer_size(DEFAULT_SOCK_BUF);
+    let _ = sock.set_send_buffer_size(DEFAULT_SOCK_BUF);
+    // NIC pin first — some platforms require it before bind.
+    let (pin_mechanism, ifindex) = if let Some(iface) = interface {
+        let mech =
+            bind_to_interface(&sock, iface, local.is_ipv6()).map_err(|e| {
+                PathError::BindInterface {
+                    interface: iface.to_string(),
+                    source: e,
+                }
+            })?;
+        log::info!(
+            "bond udp path pinned to interface '{}' via {}",
+            iface,
+            mech.as_str()
+        );
+        // The pin just succeeded, so the iface exists; a 0 here means
+        // it vanished in the microseconds since — the watcher
+        // self-corrects on its next tick either way.
+        (Some(mech), resolve_ifindex(iface).unwrap_or(0))
+    } else {
+        (None, 0)
+    };
+    sock.bind(&local.into()).map_err(|e| PathError::Bind {
+        addr: local.to_string(),
+        source: e,
+    })?;
+    let udp = UdpSocket::from_std(sock.into()).map_err(|e| PathError::Bind {
+        addr: local.to_string(),
+        source: e,
+    })?;
+    Ok((Arc::new(udp), pin_mechanism, ifindex))
+}
+
 fn spawn_recv_loop(
-    socket: Arc<UdpSocket>,
+    shared: Arc<UdpRebuilder>,
     tx: mpsc::Sender<PathDatagram>,
     cancel: CancellationToken,
     crypto: Option<Arc<BondCrypto>>,
@@ -334,10 +636,17 @@ fn spawn_recv_loop(
         let mut buf = vec![0u8; MAX_DATAGRAM];
         let mut plain = Vec::with_capacity(MAX_DATAGRAM);
         loop {
+            // Re-load the socket snapshot each pass; the bounded recv
+            // timeout guarantees a rebuild swap is noticed within
+            // SOCKET_SWAP_POLL without poll-spinning. Datagrams that
+            // land on the old socket inside that window are lost with
+            // it — bond ARQ recovers them like any path loss.
+            let socket = shared.current();
             tokio::select! {
                 _ = cancel.cancelled() => break,
-                r = socket.recv_from(&mut buf) => match r {
-                    Ok((len, from)) => {
+                r = tokio::time::timeout(SOCKET_SWAP_POLL, socket.recv_from(&mut buf)) => match r {
+                    Err(_elapsed) => continue,
+                    Ok(Ok((len, from))) => {
                         let data = if let Some(crypto) = &crypto {
                             // Drop any datagram that fails authentication —
                             // a wrong-key or tampered/stray packet never
@@ -359,8 +668,12 @@ fn spawn_recv_loop(
                             log::debug!("UDP path rx drop (channel full)");
                         }
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         log::warn!("UDP path recv error: {e}");
+                        // A dying socket (device gone) can return errors
+                        // in a tight loop — back off briefly; the watcher
+                        // / send-error trigger rebuilds it.
+                        tokio::time::sleep(Duration::from_millis(10)).await;
                     }
                 },
             }
@@ -373,10 +686,81 @@ impl std::fmt::Debug for UdpPath {
         f.debug_struct("UdpPath")
             .field("id", &self.id)
             .field("name", &self.name)
-            .field("local", &self.socket.local_addr().ok())
+            .field("local", &self.local_addr().ok())
             .field("primary_peer", &self.primary_peer())
             .finish()
     }
+}
+
+// ─── Interface-churn probes ──────────────────────────────────────
+//
+// Used by the per-bond interface watcher (socket.rs). Both probes
+// are cheap enough for a 2 s poll: one name→index syscall, or one
+// throwaway local bind.
+
+/// Current kernel ifindex for `iface`; `None` when the interface
+/// doesn't (currently) exist or the platform has no lookup.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple",
+    target_os = "freebsd",
+    target_os = "fuchsia",
+))]
+pub(crate) fn resolve_ifindex(iface: &str) -> Option<u32> {
+    let cname = std::ffi::CString::new(iface).ok()?;
+    // SAFETY: `cname` is a valid NUL-terminated C string.
+    let idx = unsafe { libc::if_nametoindex(cname.as_ptr()) };
+    (idx != 0).then_some(idx)
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple",
+    target_os = "freebsd",
+    target_os = "fuchsia",
+)))]
+pub(crate) fn resolve_ifindex(_iface: &str) -> Option<u32> {
+    None
+}
+
+/// Is `ip` currently assigned to some interface? Probed by binding a
+/// throwaway UDP socket to `ip:0` — EADDRNOTAVAIL means the address
+/// is gone (DHCP renumber, device removed).
+pub(crate) fn source_ip_present(ip: IpAddr) -> bool {
+    std::net::UdpSocket::bind(SocketAddr::new(ip, 0)).is_ok()
+}
+
+/// Errnos that mean "the route/device under this socket is gone" —
+/// the signal for a send-error-triggered rebuild. Anything else
+/// (buffer pressure, perms, message size) is not churn.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple",
+    target_os = "freebsd",
+    target_os = "fuchsia",
+))]
+fn is_route_errno(e: &std::io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(libc::ENODEV)
+            | Some(libc::EADDRNOTAVAIL)
+            | Some(libc::ENETUNREACH)
+            | Some(libc::EHOSTUNREACH)
+    )
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple",
+    target_os = "freebsd",
+    target_os = "fuchsia",
+)))]
+fn is_route_errno(_e: &std::io::Error) -> bool {
+    false
 }
 
 // ─── NIC pinning ─────────────────────────────────────────────────
@@ -534,5 +918,178 @@ mod tests {
         let local: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let res = UdpPath::bind(0, "bad", local, None, Some("definitely-not-a-nic0"), None).await;
         assert!(res.is_err(), "pinning to a nonexistent NIC must fail loudly");
+    }
+
+    /// Rebuild swaps in a fresh socket: an ephemeral (:0) bind takes a
+    /// new port and the rebuild counter advances. Datagrams sent after
+    /// the rebuild land on the recv channel (the recv loop notices the
+    /// swap within SOCKET_SWAP_POLL).
+    #[tokio::test]
+    async fn rebuild_swaps_socket_and_keeps_receiving() {
+        let local: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let mut path = UdpPath::bind(7, "rebuild", local, None, None, None)
+            .await
+            .expect("bind");
+        let mut rx = path.take_rx().expect("rx");
+        let before = path.local_addr().expect("local addr");
+
+        path.rebuild().expect("rebuild should succeed");
+        assert_eq!(path.rebuild_count(), 1);
+        let after = path.local_addr().expect("local addr after rebuild");
+        assert_ne!(
+            before.port(),
+            after.port(),
+            "an ephemeral bind must take a fresh port on rebuild"
+        );
+
+        // Give the recv loop one SOCKET_SWAP_POLL to adopt the swap,
+        // then prove traffic flows into the same channel.
+        tokio::time::sleep(SOCKET_SWAP_POLL + Duration::from_millis(20)).await;
+        let probe = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        probe.send_to(b"post-rebuild", after).await.unwrap();
+        let dg = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("datagram within 2s")
+            .expect("channel open");
+        assert_eq!(&dg.data[..], b"post-rebuild");
+    }
+
+    /// Send-error trigger: 50 consecutive route/device errnos rebuild
+    /// the socket once; the run resets and the next burst inside the
+    /// 1 s rate limit does NOT rebuild again.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "fuchsia",
+    ))]
+    #[tokio::test]
+    async fn send_error_run_triggers_one_rebuild() {
+        let local: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let path = UdpPath::bind(8, "errs", local, None, None, None)
+            .await
+            .expect("bind");
+        let route_err =
+            || PathError::Send(std::io::Error::from_raw_os_error(libc::ENETUNREACH));
+
+        for i in 1..SEND_ERR_REBUILD_THRESHOLD {
+            assert!(!path.note_send_error(&route_err()), "no rebuild at {i}");
+        }
+        assert!(
+            path.note_send_error(&route_err()),
+            "50th consecutive route error must rebuild"
+        );
+        assert_eq!(path.rebuild_count(), 1);
+
+        // Counter was reset by the rebuild; a second burst trips the
+        // threshold again but is inside the 1 s rate limit → skipped.
+        for _ in 0..SEND_ERR_REBUILD_THRESHOLD + 5 {
+            assert!(!path.note_send_error(&route_err()));
+        }
+        assert_eq!(path.rebuild_count(), 1, "rate limit must hold");
+    }
+
+    /// Backoff: a rebuild that fails to clear the error run doubles
+    /// the spacing to the next attempt (a downed gateway persists
+    /// across rebuilds — without backoff it costs one rebuild + one
+    /// warning event + a source-port churn per second, forever). A
+    /// successful send resets the exponent.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "fuchsia",
+    ))]
+    #[tokio::test]
+    async fn send_error_rebuild_backs_off_until_a_send_succeeds() {
+        let local: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let path = UdpPath::bind(10, "backoff", local, None, None, None)
+            .await
+            .expect("bind");
+        let route_err =
+            || PathError::Send(std::io::Error::from_raw_os_error(libc::EHOSTUNREACH));
+
+        let burst = |path: &UdpPath| -> bool {
+            let mut rebuilt = false;
+            for _ in 0..SEND_ERR_REBUILD_THRESHOLD {
+                rebuilt |= path.note_send_error(&route_err());
+            }
+            rebuilt
+        };
+
+        assert!(burst(&path), "first threshold crossing rebuilds");
+        assert_eq!(path.rebuild_count(), 1);
+
+        // Past the base 1 s interval but inside the doubled 2 s one:
+        // the errors never stopped, so the next attempt is held back.
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert!(!burst(&path), "backoff must hold the second rebuild");
+        assert_eq!(path.rebuild_count(), 1);
+
+        // One delivered packet proves the leg works → exponent resets,
+        // and the base interval (already elapsed) permits a rebuild on
+        // the next threshold crossing.
+        path.note_send_ok();
+        assert!(burst(&path), "post-recovery crossing rebuilds at the base interval");
+        assert_eq!(path.rebuild_count(), 2);
+    }
+
+    /// A successful send (or a non-route error) breaks the run.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "fuchsia",
+    ))]
+    #[tokio::test]
+    async fn send_error_run_resets_on_success_and_foreign_errno() {
+        let local: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let path = UdpPath::bind(9, "reset", local, None, None, None)
+            .await
+            .expect("bind");
+        let route_err =
+            || PathError::Send(std::io::Error::from_raw_os_error(libc::ENETUNREACH));
+
+        for _ in 0..SEND_ERR_REBUILD_THRESHOLD - 1 {
+            path.note_send_error(&route_err());
+        }
+        path.note_send_ok();
+        for i in 1..SEND_ERR_REBUILD_THRESHOLD {
+            assert!(!path.note_send_error(&route_err()), "run restarted at {i}");
+        }
+        // Foreign errno also breaks the run.
+        let foreign = PathError::Send(std::io::Error::from_raw_os_error(libc::EPERM));
+        assert!(!path.note_send_error(&foreign));
+        for i in 1..SEND_ERR_REBUILD_THRESHOLD {
+            assert!(!path.note_send_error(&route_err()), "run restarted at {i}");
+        }
+        assert_eq!(path.rebuild_count(), 0);
+    }
+
+    /// Watch-target derivation: interface pin wins, then source-bind,
+    /// wildcard binds aren't watched.
+    #[tokio::test]
+    async fn watch_handle_targets() {
+        let wild: SocketAddr = "0.0.0.0:0".parse().unwrap();
+        let p = UdpPath::bind(1, "wild", wild, None, None, None).await.unwrap();
+        assert!(p.watch_handle().target.is_none());
+
+        let src: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let p = UdpPath::bind(2, "src", src, None, None, None).await.unwrap();
+        assert!(matches!(
+            p.watch_handle().target,
+            Some(WatchTarget::SourceIp(ip)) if ip == "127.0.0.1".parse::<IpAddr>().unwrap()
+        ));
+    }
+
+    /// The loopback address is always present; a TEST-NET-1 address is
+    /// never assigned locally.
+    #[test]
+    fn source_ip_probe() {
+        assert!(source_ip_present("127.0.0.1".parse().unwrap()));
+        assert!(!source_ip_present("192.0.2.123".parse().unwrap()));
     }
 }

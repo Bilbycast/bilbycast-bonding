@@ -49,6 +49,13 @@ pub struct BondConnStats {
     pub gaps_lost: AtomicU64,
     pub duplicates_received: AtomicU64,
     pub reassembly_overflow: AtomicU64,
+    /// Sender restarts adopted by the receiver (a new session epoch on
+    /// 2 consecutive control packets → reassembly re-anchor).
+    pub session_resets: AtomicU64,
+    /// Receiver's current reassembly hold-time, milliseconds. Written
+    /// by the hold servo on init and every retarget so exporters can
+    /// watch the adaptive reorder/recovery budget breathe.
+    pub current_hold_ms: AtomicU64,
 }
 
 impl BondConnStats {
@@ -70,6 +77,8 @@ impl BondConnStats {
             gaps_lost: self.gaps_lost.load(Ordering::Relaxed),
             duplicates_received: self.duplicates_received.load(Ordering::Relaxed),
             reassembly_overflow: self.reassembly_overflow.load(Ordering::Relaxed),
+            session_resets: self.session_resets.load(Ordering::Relaxed),
+            current_hold_ms: self.current_hold_ms.load(Ordering::Relaxed),
         }
     }
 }
@@ -89,6 +98,8 @@ pub struct BondConnStatsSnapshot {
     pub gaps_lost: u64,
     pub duplicates_received: u64,
     pub reassembly_overflow: u64,
+    pub session_resets: u64,
+    pub current_hold_ms: u64,
 }
 
 /// Per-path counters. One instance per registered path.
@@ -116,10 +127,14 @@ pub struct PathStats {
     pub queue_depth: AtomicU64,
     /// 1 when the path is currently declared dead, 0 when alive.
     pub dead: AtomicU64,
-    /// Resolved NIC-pin mechanism code (see `PIN_*`). Set once at
-    /// path construction; `PIN_NONE` when no `interface` pin was
-    /// requested.
+    /// Resolved NIC-pin mechanism code (see `PIN_*`). Set at path
+    /// construction and refreshed after every socket rebuild (the
+    /// mechanism can differ across rebuilds); `PIN_NONE` when no
+    /// `interface` pin was requested.
     pub pin_mechanism: AtomicU64,
+    /// Socket rebuilds performed on this path (interface churn /
+    /// persistent send errors). UDP paths only — stays 0 elsewhere.
+    pub rebuilds: AtomicU64,
 }
 
 impl PathStats {
@@ -146,6 +161,7 @@ impl PathStats {
             queue_depth: self.queue_depth.load(Ordering::Relaxed),
             dead: self.dead.load(Ordering::Relaxed) != 0,
             pin_mechanism: self.pin_mechanism.load(Ordering::Relaxed),
+            rebuilds: self.rebuilds.load(Ordering::Relaxed),
         }
     }
 }
@@ -170,6 +186,8 @@ pub struct PathStatsSnapshot {
     pub dead: bool,
     /// Resolved NIC-pin mechanism code (see `PIN_*`).
     pub pin_mechanism: u64,
+    /// Socket rebuilds performed on this path (UDP paths only).
+    pub rebuilds: u64,
 }
 
 impl PathStatsSnapshot {

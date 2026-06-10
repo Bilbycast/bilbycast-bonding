@@ -28,12 +28,15 @@ Add `interface` to your path config:
 }
 ```
 
-On Linux this calls `SO_BINDTODEVICE` and **needs `CAP_NET_RAW`**
-(see [capability grant](#granting-cap_net_raw) below). On macOS and
+On Linux this calls `SO_BINDTODEVICE`, which **prefers `CAP_NET_RAW`**
+(see [capability grant](#granting-cap_net_raw) below); without the
+capability it **automatically falls back** to the unprivileged
+`IP_UNICAST_IF` egress hint (TX steering only — see
+[the fallback](#what-if-i-dont-grant-the-capability)). On macOS and
 FreeBSD it calls `IP_BOUND_IF` / `IPV6_BOUND_IF` and is **fully
 unprivileged**.
 
-If you cannot or do not want to grant the capability, omit
+If you prefer not to rely on the fallback semantics, omit
 `interface` and use [policy routing](#option-2-source-ip-binding--policy-routing)
 instead — no runtime privilege needed.
 
@@ -64,10 +67,14 @@ least-surprising way to get per-NIC egress.
 
 | Platform | Mechanism | Privilege |
 |----------|-----------|-----------|
-| Linux, Android | `SO_BINDTODEVICE` | `CAP_NET_RAW` |
+| Linux, Android | `SO_BINDTODEVICE`, falling back to `IP_UNICAST_IF` / `IPV6_UNICAST_IF` | `CAP_NET_RAW` for the hard bind; the fallback is unprivileged |
 | macOS, iOS, tvOS, watchOS | `IP_BOUND_IF` / `IPV6_BOUND_IF` | none |
 | FreeBSD, Fuchsia | `IP_BOUND_IF` / `IPV6_BOUND_IF` | none |
 | Windows, Others | not implemented | — |
+
+Which mechanism actually bound each path is surfaced in telemetry as
+`PathStats.pin_mechanism` (`so_bindtodevice` / `ip_unicast_if` /
+`ip_bound_if` / `none`).
 
 ### Granting `CAP_NET_RAW`
 
@@ -119,13 +126,22 @@ securityContext:
 
 ### What if I don't grant the capability?
 
-The bind fails at startup with a clear error:
+The pin does **not** fail outright. On `EPERM` / `EACCES` the code
+automatically degrades to the unprivileged `IP_UNICAST_IF` /
+`IPV6_UNICAST_IF` egress hint and logs:
 
 ```
-path 'lte-0' pin to interface 'wwan0' failed: Operation not permitted (os error 1)
+bond udp: SO_BINDTODEVICE('wwan0') denied (no CAP_NET_RAW); using unprivileged IP_UNICAST_IF
 ```
 
-Pick one of the other options below, or grant the capability.
+The fallback steers the **egress route lookup** to the requested NIC
+but, unlike `SO_BINDTODEVICE`, does not hard-bind **receive** to the
+device. For sender-mode paths (the common contribution direction)
+this is usually equivalent in practice; if you need the hard TX+RX
+bind, grant the capability or switch to
+[policy routing](#option-2-source-ip-binding--policy-routing).
+Telemetry shows which mechanism each path actually got
+(`pin_mechanism`).
 
 ## Option 2: Source-IP binding + policy routing
 
@@ -188,6 +204,56 @@ them up anyway.
 Not wired into bilbycast-bonding today. If you need this, run one
 `bilbycast-bonder` process per namespace and aggregate externally.
 
+## Interface churn (USB re-plug, re-enumeration, DHCP renumber)
+
+Both pin mechanisms capture the **ifindex** at socket creation. If
+the device is re-created — USB dongle re-plugged, modem firmware
+reset, NIC re-enumerated — the old socket stays pinned to a dead
+index and silently blackholes, even though `ip link` shows the
+interface "back up" under the same name. (A plain link flap on the
+**same** ifindex needs no intervention: keepalive liveness marks the
+path dead and revives it when packets flow again.)
+
+bilbycast-bonding recovers from churn automatically, **for UDP paths
+only** (QUIC and RIST legs manage their own connections and are not
+covered):
+
+- **Interface watcher** — every bond polls each UDP path that has an
+  `interface` pin or a specific (non-wildcard) `bind` IP on a 2 s
+  cadence. Interface gone → one `InterfaceLost` event, keep polling.
+  ifindex changed under the socket, or the interface returned after
+  an absence → the socket is re-created, re-pinned and atomically
+  swapped in, with a `PathRebuilt` event
+  (`reason: interface changed` / `interface restored`). For
+  source-bound paths the watched signal is the address's presence
+  (DHCP renumber / device gone); a rebuild succeeds once the same
+  address is assigned again.
+- **Send-error trigger** — 50 consecutive route/device send errors
+  (`ENODEV`, `EADDRNOTAVAIL`, `ENETUNREACH`, `EHOSTUNREACH`) on a
+  sender leg also force a rebuild (`reason: send errors`, at most one
+  attempt per second), catching gateway-loss cases the ifindex poll
+  cannot see. A rebuild can't fix a dead next-hop (`EHOSTUNREACH`
+  persists across rebuilds), so the spacing doubles per rebuild that
+  fails to clear the error run — up to 64 s — and resets on the first
+  delivered packet; rebuilds on a path already declared dead are not
+  surfaced as events (PathDead / PathAlive carry that signal).
+
+Behaviour notes:
+
+- A **sender-leg** rebuild takes a fresh ephemeral source port. The
+  receiver re-learns the return address from the next control packet
+  (keepalives flow continuously), so NACK/ack traffic re-routes
+  within roughly one keepalive interval. On CGNAT uplinks the new
+  source port also re-opens the NAT mapping.
+- A **receiver-leg** rebuild re-binds its configured port
+  (`SO_REUSEADDR` covers the brief overlap with the old socket).
+- The receive loop notices the swap within ~100 ms; datagrams that
+  land on the dying socket inside that window are recovered by the
+  normal ARQ machinery like any path loss.
+- Each rebuild is counted in `PathStats.rebuilds` and refreshes
+  `pin_mechanism` (the mechanism can differ across rebuilds, e.g.
+  a capability granted since startup).
+
 ## Operational notes
 
 - **One `interface` per path**, not one per bond. Different paths in
@@ -211,9 +277,9 @@ Not wired into bilbycast-bonding today. If you need this, run one
   pins both IPv4 and IPv6 UDP sockets.
 - **Mobile interfaces can change index on reconnect**; the bonding
   stack re-resolves the name → index mapping at socket creation
-  time, not once at process start, so `wwan0` coming back up after
-  a drop works as expected. (Linux also accepts the name directly,
-  which sidesteps the index entirely.)
+  time, and the [interface watcher](#interface-churn-usb-re-plug-re-enumeration-dhcp-renumber)
+  rebuilds the socket when the index changes underneath a running
+  path, so `wwan0` coming back up after a re-plug works as expected.
 - **This only affects UDP paths.** QUIC, RIST, and SRT paths have
   their own bind configurations; pinning for those transports is
   tracked separately.
@@ -222,7 +288,8 @@ Not wired into bilbycast-bonding today. If you need this, run one
 
 | Symptom | Likely cause | Fix |
 |---------|--------------|-----|
-| `path pin to interface 'xxx' failed: Operation not permitted` | Linux without `CAP_NET_RAW`. | [Grant the capability](#granting-cap_net_raw) or switch to [policy routing](#option-2-source-ip-binding--policy-routing). |
+| Log line `SO_BINDTODEVICE('xxx') denied (no CAP_NET_RAW); using unprivileged IP_UNICAST_IF` | Linux without `CAP_NET_RAW` — the path is running on the TX-only egress hint. | Fine for sender-mode paths. For the hard TX+RX bind, [grant the capability](#granting-cap_net_raw) or switch to [policy routing](#option-2-source-ip-binding--policy-routing). |
+| `path pin to interface 'xxx' failed: Operation not permitted` | Both `SO_BINDTODEVICE` **and** the `IP_UNICAST_IF` fallback were denied (unusual — e.g. an LSM policy). | [Grant the capability](#granting-cap_net_raw) or switch to [policy routing](#option-2-source-ip-binding--policy-routing). |
 | `path pin to interface 'xxx' failed: No such device` (Linux) / `… if_nametoindex returned 0` (macOS/BSD) | Interface doesn't exist or is typo'd. | Check `ip link` / `ifconfig`. Mobile interfaces may still be coming up — retry after the modem attaches. |
 | `NIC pinning is not supported on this platform` | Running on Windows or another unsupported OS. | Use policy routing. Windows has `IP_UNICAST_IF` but it is not wired into bilbycast-bonding yet. |
 | Traffic still all on one NIC despite `interface` set | Destination is reachable only through one gateway and the pinned NIC has no route back. | Check return path: pinned egress still needs a working reverse path to the remote. |

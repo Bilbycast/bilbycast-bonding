@@ -255,6 +255,14 @@ impl FecDecoder {
         seq - (seq % block)
     }
 
+    /// Drop all in-flight block state — the session-reset path for a
+    /// restarted sender. Blocks keyed on the old seq space would never
+    /// complete, and a late recovery against them would emit wrong
+    /// seqs into the freshly re-anchored reassembly buffer.
+    pub fn reset(&mut self) {
+        self.blocks.clear();
+    }
+
     fn block_mut(&mut self, base: u32, columns: u16, rows: u16) -> &mut BlockState {
         self.blocks.entry(base).or_insert_with(|| BlockState {
             columns,
@@ -465,6 +473,31 @@ mod tests {
         assert_eq!(recovered.get(&1), Some(&payloads[1]));
         // Column 0's double loss does NOT.
         assert!(recovered.get(&0).is_none() && recovered.get(&3).is_none());
+    }
+
+    /// `reset` drops in-flight block state so a stale repair from the
+    /// old session can't recover into the new seq space.
+    #[test]
+    fn decoder_reset_clears_inflight_blocks() {
+        let params = FecParams { columns: 3, rows: 3 };
+        let mut enc = FecEncoder::new(params);
+        let mut dec = FecDecoder::new(params);
+        let payloads: Vec<Bytes> = (0..9).map(|i| pkt(i as u8 + 1, 30)).collect();
+        let mut repairs = Vec::new();
+        for (seq, p) in payloads.iter().enumerate() {
+            repairs.extend(enc.push(seq as u32, p));
+        }
+        // All sources except seq 4 delivered, then a session reset.
+        for (seq, p) in payloads.iter().enumerate() {
+            if seq != 4 {
+                dec.push_source(seq as u32, p);
+            }
+        }
+        dec.reset();
+        // Without the pre-reset sources, the old block's repair finds
+        // 3 missing in its column and recovers nothing.
+        let col1 = repairs.iter().find(|r| r.column == 1).unwrap().clone();
+        assert!(dec.push_repair(col1).is_empty());
     }
 
     #[test]

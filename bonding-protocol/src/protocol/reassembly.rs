@@ -143,6 +143,48 @@ impl ReassemblyBuffer {
         self.capacity
     }
 
+    /// Whether the buffer has anchored its delivery base on a seq
+    /// space (i.e. at least one insert since construction / `reset`).
+    /// An anchored buffer rejects everything "behind" its base as
+    /// stale, so adopting a new session epoch without a reset is only
+    /// safe while this is `false`.
+    #[inline]
+    pub fn is_anchored(&self) -> bool {
+        self.base_seq.is_some()
+    }
+
+    /// Whether a sender-advertised tip plausibly belongs to the seq
+    /// space this buffer is anchored on: within one ring capacity
+    /// (either side) of the highest seq seen. A restarted sender's tip
+    /// (near 0) against a long-lived anchor fails this; a receiver
+    /// that joined mid-stream (anchored on this same sender's data)
+    /// passes. Un-anchored buffers have no opinion (`true`).
+    #[inline]
+    pub fn tip_in_window(&self, peer_tip: u32) -> bool {
+        match self.highest_seq {
+            None => true,
+            Some(h) => {
+                let diff = peer_tip.wrapping_sub(h) as i32;
+                diff.unsigned_abs() <= self.capacity as u32
+            }
+        }
+    }
+
+    /// Clear the ring and un-anchor so the next insert re-anchors
+    /// fresh — the session-reset path for a restarted sender whose
+    /// bond_seq space restarted near 0 (every packet would otherwise
+    /// be stale against the old base forever). `hold_time` and
+    /// capacity are preserved; cumulative counters live with the
+    /// caller and are untouched.
+    pub fn reset(&mut self) {
+        for slot in &mut self.slots {
+            slot.seq = 0;
+            slot.state = SlotState::Empty;
+        }
+        self.base_seq = None;
+        self.highest_seq = None;
+    }
+
     /// Insert an arriving packet. `now` is the monotonic arrival time;
     /// `path_id` is echoed back in [`InsertOutcome::accepted_path`] for
     /// stats.
@@ -564,6 +606,50 @@ mod tests {
             kinds,
             vec![("D", 100), ("D", 101), ("L", 102), ("L", 103), ("L", 104), ("L", 105)]
         );
+    }
+
+    #[test]
+    fn reset_reanchors_for_new_session() {
+        let mut buf = ReassemblyBuffer::new(Duration::from_millis(20));
+        let t0 = Instant::now();
+        // Old session anchored high in the seq space.
+        buf.insert(1_000_000, b(1), 0, t0);
+        buf.insert(1_000_001, b(2), 0, t0);
+        let _ = drain(&mut buf, t0 + Duration::from_millis(30));
+        // A restarted sender's low seq is stale against the old base.
+        assert!(buf.insert(3, b(9), 0, t0 + Duration::from_millis(31)).stale);
+        buf.reset();
+        // After reset the same seq re-anchors and delivers.
+        let t1 = t0 + Duration::from_millis(40);
+        let out = buf.insert(3, b(9), 0, t1);
+        assert!(!out.stale && !out.duplicate);
+        let drained = drain(&mut buf, t1 + Duration::from_millis(30));
+        assert_eq!(delivered_only(&drained), vec![(3, 0, 9)]);
+        assert_eq!(buf.hold_time(), Duration::from_millis(20));
+    }
+
+    #[test]
+    fn anchoring_and_tip_window_track_the_seq_space() {
+        let mut buf = ReassemblyBuffer::new(Duration::from_millis(20));
+        let t0 = Instant::now();
+        // Un-anchored: no opinion on any tip.
+        assert!(!buf.is_anchored());
+        assert!(buf.tip_in_window(0));
+        assert!(buf.tip_in_window(500_000_000));
+
+        buf.insert(500_000_000, b(1), 0, t0);
+        assert!(buf.is_anchored());
+        // Tips near the anchor (either side, within one capacity) pass.
+        assert!(buf.tip_in_window(500_000_000));
+        assert!(buf.tip_in_window(500_010_000));
+        assert!(buf.tip_in_window(499_995_000));
+        // A restarted sender's tip near 0 is a foreign seq space.
+        assert!(!buf.tip_in_window(0));
+        assert!(!buf.tip_in_window(100));
+
+        buf.reset();
+        assert!(!buf.is_anchored());
+        assert!(buf.tip_in_window(0));
     }
 
     #[test]

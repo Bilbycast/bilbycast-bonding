@@ -54,7 +54,7 @@ pub mod sender;
 pub mod socket;
 
 pub use bonding_protocol::{
-    events::{PathDeadReason, PathEvent, PathEventKind},
+    events::{PathDeadReason, PathEvent, PathEventKind, PathRebuildReason},
     packet::{BondHeader, Priority},
     protocol::{
         capacity_scheduler::{CapacityAwareScheduler, CongestionConfig, PathPrior},

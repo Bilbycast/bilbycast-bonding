@@ -22,7 +22,7 @@ use tokio_util::sync::CancellationToken;
 use bonding_protocol::control::{
     CtrlHeader, CtrlPacket, CtrlType, KeepaliveBody, is_control,
 };
-use bonding_protocol::events::{PathDeadReason, PathEvent, PathEventKind};
+use bonding_protocol::events::{PathDeadReason, PathEvent, PathEventKind, PathRebuildReason};
 use bonding_protocol::packet::{BondHeader, Priority, write_packet};
 use bonding_protocol::protocol::fec::{FecEncoder, FecParams};
 use bonding_protocol::protocol::path_health::PathHealth;
@@ -83,6 +83,12 @@ where
 {
     let (tx, rx) = mpsc::channel::<OutboundMessage>(512);
 
+    // Nonzero random epoch identifying THIS sender instance, carried on
+    // every keepalive. A receiver anchored to a previous instance's seq
+    // space detects the change and re-anchors instead of dropping every
+    // packet of the new instance as stale.
+    let session_epoch = random_session_epoch();
+
     // Lift per-path rx channels out of the paths so we can multiplex
     // them through a single mpsc into the sender loop. Control
     // messages (acks, NACKs) land here and never block the hot send
@@ -107,6 +113,7 @@ where
     let join = tokio::spawn(async move {
         if let Err(e) = sender_loop(
             flow_id,
+            session_epoch,
             paths,
             scheduler,
             conn_stats,
@@ -133,6 +140,7 @@ where
 #[allow(clippy::too_many_arguments)]
 async fn sender_loop<S>(
     flow_id: u32,
+    session_epoch: u32,
     paths: Vec<Path>,
     mut scheduler: S,
     conn_stats: Arc<BondConnStats>,
@@ -219,34 +227,51 @@ where
                     log::info!("bond sender: app channel closed");
                     return Ok(());
                 };
-                let seq = next_seq;
-                next_seq = next_seq.wrapping_add(1);
-
                 let selection = scheduler.schedule(&PacketHints {
                     size: msg.data.len(),
                     ..msg.hints
                 });
-                match selection {
+                // bond_seq is assigned only AFTER a non-Drop selection.
+                // A dropped packet must consume no seq: the keepalive
+                // tip advertises `next_seq - 1`, and a consumed-but-
+                // never-sent seq makes the receiver NACK a packet that
+                // never existed (up to max_nack_retries), then count it
+                // lost after a full hold-time.
+                let sent_seq = match selection {
                     PathSelection::Drop => {
                         conn_stats.packets_dropped_no_path.fetch_add(1, Ordering::Relaxed);
+                        None
                     }
                     PathSelection::Single(path_id) => {
-                        send_on_path(
+                        let seq = next_seq;
+                        next_seq = next_seq.wrapping_add(1);
+                        let rebuilt = send_on_path(
                             flow_id, seq, path_id, msg.hints.priority, msg.hints.marker, false,
                             &msg.data, &paths, &path_stats, &mut frame_scratch,
                             &conn_stats, &mut path_sent_counter,
                         ).await;
+                        if rebuilt {
+                            note_send_error_rebuild(&events_tx, &paths, &path_names, &path_stats, path_id);
+                        }
                         retx_buf.insert(seq, frame_scratch.clone().freeze());
+                        Some(seq)
                     }
                     PathSelection::Duplicate(path_ids) => {
+                        // One seq shared by every copy — the receiver
+                        // dedups on it.
+                        let seq = next_seq;
+                        next_seq = next_seq.wrapping_add(1);
                         let mut first = true;
                         for pid in &path_ids {
                             let duplicated = !first;
-                            send_on_path(
+                            let rebuilt = send_on_path(
                                 flow_id, seq, *pid, msg.hints.priority, msg.hints.marker, duplicated,
                                 &msg.data, &paths, &path_stats, &mut frame_scratch,
                                 &conn_stats, &mut path_sent_counter,
                             ).await;
+                            if rebuilt {
+                                note_send_error_rebuild(&events_tx, &paths, &path_names, &path_stats, *pid);
+                            }
                             if duplicated {
                                 conn_stats.packets_duplicated.fetch_add(1, Ordering::Relaxed);
                             }
@@ -254,15 +279,17 @@ where
                         }
                         // Stash the *primary* copy for retransmit.
                         retx_buf.insert(seq, frame_scratch.clone().freeze());
+                        Some(seq)
                     }
-                }
+                };
 
-                // Proactive FEC: feed every original payload to the
-                // encoder (contiguous seqs keep blocks aligned even across
-                // a sender drop) and emit any completed XOR repair packets
-                // across paths. Repairs ride FEC-flagged datagrams and do
-                // not consume media bond_seq space.
-                if let Some(enc) = fec_encoder.as_mut() {
+                // Proactive FEC: feed each *sent* payload to the encoder
+                // (dropped packets consume no seq, so sent seqs stay
+                // contiguous and blocks aligned) and emit any completed
+                // XOR repair packets across paths. Repairs ride
+                // FEC-flagged datagrams and do not consume media
+                // bond_seq space.
+                if let (Some(seq), Some(enc)) = (sent_seq, fec_encoder.as_mut()) {
                     for rep in enc.push(seq, &msg.data) {
                         rep.serialize(&mut fec_payload);
                         let sel = scheduler.schedule(&PacketHints {
@@ -401,8 +428,13 @@ where
                         }
                     }
                     Ok(CtrlPacket::Nack { body, .. }) => {
+                        let now = Instant::now();
                         for lost_seq in &body.missing {
-                            if let Some(pkt) = retx_buf.get(*lost_seq).cloned() {
+                            // Dedup: receivers re-NACK on their retry
+                            // cadence and duplicate seqs can land in a
+                            // burst — one resend per seq per
+                            // RETRANSMIT_DEDUP window.
+                            if let Some(pkt) = retx_buf.get_for_retransmit(*lost_seq, now).cloned() {
                                 let selection = scheduler.schedule(&PacketHints {
                                     priority: Priority::High,
                                     ..Default::default()
@@ -488,19 +520,33 @@ where
                             .get(idx)
                             .map(|ps| ps.bytes_sent.load(Ordering::Relaxed))
                             .unwrap_or(0),
+                        session_epoch,
                     };
                     let pkt = CtrlPacket::Keepalive { header, body };
                     pkt.serialize(&mut ctrl_scratch);
-                    if path.send_to(&ctrl_scratch, peer).await.is_ok() {
-                        // Record the in-flight KA. Cap the deque so
-                        // a dead path can't grow its pending set
-                        // forever — drop the oldest when full.
-                        if pending_ka[idx].len() >= MAX_OUTSTANDING_KA {
-                            pending_ka[idx].pop_front();
+                    match path.send_to(&ctrl_scratch, peer).await {
+                        Ok(()) => {
+                            path.note_send_ok();
+                            // Record the in-flight KA. Cap the deque so
+                            // a dead path can't grow its pending set
+                            // forever — drop the oldest when full.
+                            if pending_ka[idx].len() >= MAX_OUTSTANDING_KA {
+                                pending_ka[idx].pop_front();
+                            }
+                            pending_ka[idx].push_back((stamp, now));
+                            if let Some(ps) = path_stats_for(idx) {
+                                ps.keepalives_sent.fetch_add(1, Ordering::Relaxed);
+                            }
                         }
-                        pending_ka[idx].push_back((stamp, now));
-                        if let Some(ps) = path_stats_for(idx) {
-                            ps.keepalives_sent.fetch_add(1, Ordering::Relaxed);
+                        // Keepalives keep probing during quiet periods,
+                        // so route/device errors trip the rebuild even
+                        // with no app traffic flowing.
+                        Err(e) => {
+                            if path.note_send_error(&e) {
+                                note_send_error_rebuild(
+                                    &events_tx, &paths, &path_names, &path_stats, path.id(),
+                                );
+                            }
                         }
                     }
                 }
@@ -512,7 +558,8 @@ where
 /// Small helper — write a bond data packet and dispatch on the chosen
 /// path. Updates per-path + aggregate counters. Leaves the frame in
 /// `frame_scratch` so callers that want to stash in the retransmit
-/// buffer can `.freeze()` it.
+/// buffer can `.freeze()` it. Returns `true` when the send error run
+/// just triggered a socket rebuild (caller emits the event).
 #[allow(clippy::too_many_arguments)]
 async fn send_on_path(
     flow_id: u32,
@@ -527,7 +574,7 @@ async fn send_on_path(
     frame_scratch: &mut BytesMut,
     conn_stats: &Arc<BondConnStats>,
     path_sent_counter: &mut [u64],
-) {
+) -> bool {
     let mut header = BondHeader::new(flow_id, bond_seq, path_id, priority);
     if marker {
         header.set_marker();
@@ -538,7 +585,7 @@ async fn send_on_path(
     write_packet(&header, payload, frame_scratch);
 
     let Some(idx) = paths.iter().position(|p| p.id() == path_id) else {
-        return;
+        return false;
     };
     let path = &paths[idx];
     let peer = path.primary_peer();
@@ -546,18 +593,94 @@ async fn send_on_path(
         Some(p) => path.send_to(frame_scratch, p).await,
         None => path.send(frame_scratch).await,
     };
-    if send_result.is_ok() {
-        conn_stats.packets_sent.fetch_add(1, Ordering::Relaxed);
-        conn_stats
-            .bytes_sent
-            .fetch_add(frame_scratch.len() as u64, Ordering::Relaxed);
-        if let Some(ps) = path_stats.get(idx) {
-            ps.packets_sent.fetch_add(1, Ordering::Relaxed);
-            ps.bytes_sent
+    match &send_result {
+        Ok(()) => {
+            path.note_send_ok();
+            conn_stats.packets_sent.fetch_add(1, Ordering::Relaxed);
+            conn_stats
+                .bytes_sent
                 .fetch_add(frame_scratch.len() as u64, Ordering::Relaxed);
+            if let Some(ps) = path_stats.get(idx) {
+                ps.packets_sent.fetch_add(1, Ordering::Relaxed);
+                ps.bytes_sent
+                    .fetch_add(frame_scratch.len() as u64, Ordering::Relaxed);
+            }
+            path_sent_counter[idx] = path_sent_counter[idx].wrapping_add(1);
+            false
         }
-        path_sent_counter[idx] = path_sent_counter[idx].wrapping_add(1);
+        // Route/device errors accumulate toward a UDP socket rebuild
+        // (interface-churn recovery, see path/udp.rs).
+        Err(e) => path.note_send_error(e),
     }
+}
+
+/// Bookkeeping for a send-error-triggered socket rebuild: mirror the
+/// rebuild into `PathStats`, refresh the (possibly changed) pin code,
+/// and broadcast `PathRebuilt`. The rebuild itself already happened
+/// inside `note_send_error`. A sender-leg rebuild takes a fresh
+/// ephemeral source port; the receiver re-learns the return address
+/// from the next control packet it sees.
+fn note_send_error_rebuild(
+    events_tx: &broadcast::Sender<PathEvent>,
+    paths: &[Path],
+    path_names: &[String],
+    path_stats: &[Arc<PathStats>],
+    path_id: PathId,
+) {
+    let Some(idx) = paths.iter().position(|p| p.id() == path_id) else {
+        return;
+    };
+    let mut already_dead = false;
+    if let Some(ps) = path_stats.get(idx) {
+        ps.rebuilds.fetch_add(1, Ordering::Relaxed);
+        let code = paths[idx]
+            .pin_mechanism()
+            .map(|m| m.stats_code())
+            .unwrap_or(bonding_protocol::stats::PIN_NONE);
+        ps.pin_mechanism.store(code, Ordering::Relaxed);
+        already_dead = ps.dead.load(Ordering::Relaxed) != 0;
+    }
+    // A path already declared dead is still keepalive-probed, so a
+    // persistent route failure (downed gateway: EHOSTUNREACH survives
+    // any rebuild) would otherwise emit a PathRebuilt warning per
+    // backoff interval forever — PathDead/PathAlive transitions are the
+    // operator's signal there. Stats above stay accurate either way.
+    if already_dead {
+        return;
+    }
+    let _ = events_tx.send(PathEvent {
+        path_id,
+        path_name: path_names.get(idx).cloned().unwrap_or_default(),
+        kind: PathEventKind::PathRebuilt {
+            reason: PathRebuildReason::SendErrors,
+        },
+    });
+}
+
+/// Nonzero random session epoch, fresh per sender instance. Uses
+/// ring's `SystemRandom` (already in the dependency tree for the bond
+/// AEAD); 0 is reserved on the wire for "no epoch" (legacy peer), so
+/// retry on the 2^-32 zero draw. The fallback (OS RNG failure — not a
+/// real failure mode) degrades to the std hasher's per-process random
+/// seed rather than panicking on the data path's setup.
+fn random_session_epoch() -> u32 {
+    use ring::rand::{SecureRandom, SystemRandom};
+    let rng = SystemRandom::new();
+    let mut buf = [0u8; 4];
+    for _ in 0..4 {
+        if rng.fill(&mut buf).is_ok() {
+            let v = u32::from_le_bytes(buf);
+            if v != 0 {
+                return v;
+            }
+        }
+    }
+    use std::hash::{BuildHasher, Hasher};
+    let h = std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish();
+    let v = (h ^ (h >> 32)) as u32;
+    if v != 0 { v } else { 1 }
 }
 
 /// Portable "elapsed since process boot" in microseconds. Good enough

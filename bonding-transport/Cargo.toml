@@ -23,6 +23,10 @@ thiserror = "2.0"
 anyhow = "1.0"
 tokio-util = "0.7"
 socket2 = "0.6"
+# Lock-free hot-swap of a UDP path's socket on interface churn
+# (USB-dongle re-plug / ifindex change / DHCP renumber). The send
+# path loads the current snapshot with no Mutex/RwLock.
+arc-swap = "1.9"
 
 # Optional path transports
 rist-transport = { path = "../../bilbycast-rist/rist-transport", optional = true }
