@@ -33,6 +33,8 @@
 //! [`std::time::Instant`] is the only time source (already used by the
 //! reassembly buffer).
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::packet::Priority;
@@ -201,6 +203,10 @@ pub struct CapacityAwareScheduler {
     cfg: CongestionConfig,
     // ── telemetry counters (read by the transport for stats) ──
     oversubscribed_drops: u64,
+    /// Shared, per-path live capacity estimate (bits/sec). Cloned out via
+    /// [`Self::capacity_handles`] so the edge can publish it as telemetry
+    /// after the scheduler is moved into the sender task.
+    capacity_pub: Vec<Arc<AtomicU64>>,
 }
 
 impl CapacityAwareScheduler {
@@ -223,7 +229,7 @@ impl CapacityAwareScheduler {
     pub fn with_paths(priors: Vec<PathPrior>, cfg: CongestionConfig) -> Self {
         let now = Instant::now();
         let start = cfg.start_rate_bps as f64;
-        let paths = priors
+        let paths: Vec<PathCc> = priors
             .into_iter()
             .map(|p| {
                 let weight = (p.weight_hint.max(1)) as f64;
@@ -231,10 +237,35 @@ impl CapacityAwareScheduler {
                 PathCc::new(p.id, weight, ceiling, start, now)
             })
             .collect();
+        let capacity_pub = paths
+            .iter()
+            .map(|p| Arc::new(AtomicU64::new(p.capacity_bps as u64)))
+            .collect();
         Self {
             paths,
             cfg,
             oversubscribed_drops: 0,
+            capacity_pub,
+        }
+    }
+
+    /// Shared handles to each path's live discovered capacity estimate
+    /// (bits/sec), keyed by path id. Grab these before moving the
+    /// scheduler into the sender so the edge can surface them on
+    /// per-path telemetry.
+    pub fn capacity_handles(&self) -> Vec<(PathId, Arc<AtomicU64>)> {
+        self.paths
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (p.id, self.capacity_pub[i].clone()))
+            .collect()
+    }
+
+    /// Mirror path `i`'s current capacity estimate into its shared atomic.
+    #[inline]
+    fn publish(&self, i: usize) {
+        if let Some(a) = self.capacity_pub.get(i) {
+            a.store(self.paths[i].capacity_bps as u64, Ordering::Relaxed);
         }
     }
 
@@ -441,6 +472,7 @@ impl BondScheduler for CapacityAwareScheduler {
         p.capacity_bps = p
             .capacity_bps
             .clamp(cfg.min_rate_bps as f64, p.ceiling_bps);
+        self.publish(i);
     }
 
     fn on_tick(&mut self, now: Instant) {
@@ -467,6 +499,7 @@ impl BondScheduler for CapacityAwareScheduler {
             p.rtt_min = 0.0;
             p.loss = 0.0;
             p.tokens = 0.0;
+            self.publish(i);
         }
     }
 }

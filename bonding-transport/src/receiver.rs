@@ -39,6 +39,7 @@ pub(crate) fn spawn_receiver(
     flow_id: u32,
     mut paths: Vec<Path>,
     hold_time: Duration,
+    hold_max: Option<Duration>,
     conn_stats: Arc<BondConnStats>,
     path_stats: Vec<Arc<PathStats>>,
     path_names: Vec<String>,
@@ -76,6 +77,7 @@ pub(crate) fn spawn_receiver(
             flow_id,
             paths,
             hold_time,
+            hold_max,
             conn_stats,
             path_stats,
             path_names,
@@ -112,6 +114,7 @@ async fn receiver_loop(
     flow_id: u32,
     paths: Vec<Path>,
     hold_time: Duration,
+    hold_max: Option<Duration>,
     conn_stats: Arc<BondConnStats>,
     path_stats: Vec<Arc<PathStats>>,
     path_names: Vec<String>,
@@ -130,6 +133,16 @@ async fn receiver_loop(
     // column's XOR repair with no NACK round-trip; recovered packets are
     // inserted into the reassembly buffer like a late path arrival.
     let mut fec_decoder: Option<FecDecoder> = fec.map(FecDecoder::new);
+
+    // Adaptive hold-time servo (opt-in via hold_max > hold_time). Grows
+    // the reorder/recovery budget toward the realized recovery latency
+    // and decays back when the network calms, bounded by the floor and
+    // ceiling — so end-to-end latency tracks the links.
+    let hold_floor = hold_time;
+    let hold_autogrow = hold_max.filter(|m| *m > hold_floor);
+    let mut hold_cur = hold_time;
+    let mut hold_window_max = Duration::ZERO;
+    let mut hold_last_adjust = Instant::now();
 
     // `bond_seq -> pending NACK state`. Grows only as gaps appear;
     // cleared on recovery or drain-as-lost.
@@ -294,6 +307,11 @@ async fn receiver_loop(
                                 if o.recovered {
                                     conn_stats.gaps_recovered.fetch_add(1, Ordering::Relaxed);
                                     pending_nacks.remove(&rseq);
+                                    if let Some(age) = o.recovered_age {
+                                        if age > hold_window_max {
+                                            hold_window_max = age;
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -358,6 +376,11 @@ async fn receiver_loop(
                 if outcome.recovered {
                     conn_stats.gaps_recovered.fetch_add(1, Ordering::Relaxed);
                     pending_nacks.remove(&header.bond_seq);
+                    if let Some(age) = outcome.recovered_age {
+                        if age > hold_window_max {
+                            hold_window_max = age;
+                        }
+                    }
                 }
                 // Register every newly-exposed gap in the NACK
                 // scheduler so the pump tick can flush due NACKs. The
@@ -383,6 +406,11 @@ async fn receiver_loop(
                         if o.recovered {
                             conn_stats.gaps_recovered.fetch_add(1, Ordering::Relaxed);
                             pending_nacks.remove(&rseq);
+                            if let Some(age) = o.recovered_age {
+                                if age > hold_window_max {
+                                    hold_window_max = age;
+                                }
+                            }
                         }
                     }
                 }
@@ -422,6 +450,26 @@ async fn receiver_loop(
 
                 // Prune retried-to-death entries so the map doesn't grow.
                 pending_nacks.retain(|_, pn| pn.nacks_sent < max_nack_retries);
+
+                // Adaptive hold-time (opt-in): ~1 Hz, retarget toward the
+                // realized recovery latency (×1.5) within [floor, max],
+                // decaying toward the floor when nothing needed recovery
+                // so latency drops back as the links calm.
+                if let Some(hmax) = hold_autogrow {
+                    if now.saturating_duration_since(hold_last_adjust) >= Duration::from_secs(1) {
+                        let target = if hold_window_max > Duration::ZERO {
+                            hold_window_max.mul_f32(1.5).clamp(hold_floor, hmax)
+                        } else {
+                            hold_cur.mul_f32(0.9).max(hold_floor)
+                        };
+                        if target != hold_cur {
+                            hold_cur = target;
+                            reassembly.set_hold_time(hold_cur);
+                        }
+                        hold_window_max = Duration::ZERO;
+                        hold_last_adjust = now;
+                    }
+                }
             }
         }
     }

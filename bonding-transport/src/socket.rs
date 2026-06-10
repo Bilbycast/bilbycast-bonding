@@ -125,6 +125,7 @@ impl BondSocket {
             cfg.flow_id,
             paths,
             cfg.hold_time,
+            cfg.hold_max,
             conn_stats.clone(),
             path_stats.clone(),
             path_names,

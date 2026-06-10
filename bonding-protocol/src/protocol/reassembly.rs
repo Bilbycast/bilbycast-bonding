@@ -68,6 +68,11 @@ pub struct InsertOutcome {
     pub new_gap_seqs: Vec<u32>,
     /// `path_id` that this insert accepted (the first delivery wins).
     pub accepted_path: u8,
+    /// When `recovered`, how long the gap had been outstanding before
+    /// this packet filled it (late path arrival, retransmit, or FEC).
+    /// The realized reorder/recovery latency — drives adaptive
+    /// hold-time. `None` unless `recovered`.
+    pub recovered_age: Option<Duration>,
 }
 
 impl InsertOutcome {
@@ -122,6 +127,15 @@ impl ReassemblyBuffer {
     #[inline]
     pub fn hold_time(&self) -> Duration {
         self.hold_time
+    }
+
+    /// Adjust the in-order delivery hold-time at runtime (adaptive
+    /// reorder/recovery budget). Only the value used by *future* drains
+    /// changes; already-buffered packets keep their original arrival
+    /// stamps, so a shrink can't retroactively age a packet out.
+    #[inline]
+    pub fn set_hold_time(&mut self, d: Duration) {
+        self.hold_time = d;
     }
 
     #[inline]
@@ -185,8 +199,9 @@ impl ReassemblyBuffer {
                     outcome.duplicate = true;
                     return outcome;
                 }
-                SlotState::Gap { .. } => {
+                SlotState::Gap { first_noticed } => {
                     outcome.recovered = true;
+                    outcome.recovered_age = Some(now.saturating_duration_since(first_noticed));
                     self.slots[idx].state = SlotState::Filled {
                         data,
                         arrival: now,
@@ -426,6 +441,36 @@ mod tests {
             delivered_only(&drained),
             vec![(100, 0, 1), (101, 1, 2), (102, 0, 3)]
         );
+    }
+
+    #[test]
+    fn recovered_age_reports_gap_latency() {
+        let mut buf = ReassemblyBuffer::new(Duration::from_millis(300));
+        let t0 = Instant::now();
+        buf.insert(100, b(1), 0, t0);
+        buf.insert(102, b(3), 0, t0); // gap at 101 first noticed at t0
+        // 101 arrives 50 ms later — the realized recovery latency.
+        let out = buf.insert(101, b(2), 1, t0 + Duration::from_millis(50));
+        assert!(out.recovered);
+        assert_eq!(out.recovered_age, Some(Duration::from_millis(50)));
+        // A plain in-order arrival reports no recovery age.
+        let out2 = buf.insert(103, b(4), 0, t0 + Duration::from_millis(60));
+        assert!(!out2.recovered);
+        assert_eq!(out2.recovered_age, None);
+    }
+
+    #[test]
+    fn set_hold_time_changes_delivery_budget() {
+        let mut buf = ReassemblyBuffer::new(Duration::from_millis(50));
+        assert_eq!(buf.hold_time(), Duration::from_millis(50));
+        buf.set_hold_time(Duration::from_millis(300));
+        assert_eq!(buf.hold_time(), Duration::from_millis(300));
+        let t0 = Instant::now();
+        buf.insert(1, b(1), 0, t0);
+        // Not deliverable at +60 ms under the new 300 ms budget.
+        assert!(drain(&mut buf, t0 + Duration::from_millis(60)).is_empty());
+        let out = drain(&mut buf, t0 + Duration::from_millis(310));
+        assert_eq!(delivered_only(&out), vec![(1, 0, 1)]);
     }
 
     #[test]

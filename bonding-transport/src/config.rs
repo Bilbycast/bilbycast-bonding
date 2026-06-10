@@ -14,8 +14,16 @@ pub struct BondSocketConfig {
     pub flow_id: u32,
     /// Reassembly hold time (receiver only). 32-bit seq space lets
     /// this go large without wrap concerns; 500 ms is a reasonable
-    /// baseline for multi-path broadcast links.
+    /// baseline for multi-path broadcast links. When `hold_max` is set
+    /// this is the **floor** the adaptive servo grows up from.
     pub hold_time: Duration,
+    /// Optional ceiling for adaptive hold-time (receiver only). When set
+    /// above `hold_time`, the receiver grows the reorder/recovery budget
+    /// toward the realized recovery latency (×1.5) within
+    /// `[hold_time, hold_max]` and decays back when the network calms —
+    /// so latency tracks the links instead of a fixed guess. `None` =
+    /// fixed `hold_time` (default, unchanged behaviour).
+    pub hold_max: Option<Duration>,
     /// Periodic keepalive interval across every path.
     pub keepalive_interval: Duration,
     /// Max missed keepalives before a path is declared dead.
@@ -47,6 +55,7 @@ impl Default for BondSocketConfig {
         Self {
             flow_id: 0,
             hold_time: Duration::from_millis(500),
+            hold_max: None,
             keepalive_interval: Duration::from_millis(200),
             keepalive_miss_threshold: 5,
             retransmit_capacity: 8192,
