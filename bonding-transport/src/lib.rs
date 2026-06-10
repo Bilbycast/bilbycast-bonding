@@ -58,6 +58,7 @@ pub use bonding_protocol::{
     packet::{BondHeader, Priority},
     protocol::{
         capacity_scheduler::{CapacityAwareScheduler, CongestionConfig, PathPrior},
+        fec::{FecDecoder, FecEncoder, FecParams, FecRepair},
         path_health::PathHealth,
         scheduler::{
             BondScheduler, PacketHints, PathId, PathSelection, RoundRobinScheduler,

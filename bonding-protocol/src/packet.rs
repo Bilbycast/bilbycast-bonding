@@ -54,8 +54,11 @@ pub mod flags {
     pub const DUPLICATED: u8 = 0b0010;
     /// Marker bit — caller-defined boundary (typically end of a media frame).
     pub const MARKER: u8 = 0b0100;
-    /// Reserved for future use. Senders MUST set 0; receivers MUST ignore.
-    pub const RESERVED: u8 = 0b1000;
+    /// This datagram carries a FEC **repair** packet (its payload is a
+    /// `protocol::fec::FecRepair`, not media bytes). The receiver routes
+    /// it to the FEC decoder and does NOT treat its `bond_seq` as a media
+    /// sequence number.
+    pub const FEC: u8 = 0b1000;
 }
 
 /// Priority hint attached to a bond packet.
@@ -138,6 +141,18 @@ impl BondHeader {
     pub fn set_marker(&mut self) -> &mut Self {
         self.flags |= flags::MARKER;
         self
+    }
+
+    /// Mark this datagram as a FEC repair packet.
+    #[inline]
+    pub fn set_fec(&mut self) -> &mut Self {
+        self.flags |= flags::FEC;
+        self
+    }
+
+    #[inline]
+    pub fn is_fec(&self) -> bool {
+        self.flags & flags::FEC != 0
     }
 
     #[inline]

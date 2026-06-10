@@ -24,6 +24,7 @@ use bonding_protocol::control::{
 };
 use bonding_protocol::events::{PathDeadReason, PathEvent, PathEventKind};
 use bonding_protocol::packet::{BondHeader, Priority, write_packet};
+use bonding_protocol::protocol::fec::{FecEncoder, FecParams};
 use bonding_protocol::protocol::path_health::PathHealth;
 use bonding_protocol::protocol::retransmit::RetransmitBuffer;
 use bonding_protocol::protocol::scheduler::{
@@ -73,6 +74,7 @@ pub(crate) fn spawn_sender<S>(
     keepalive_interval: Duration,
     keepalive_miss_threshold: u32,
     retransmit_capacity: usize,
+    fec: Option<FecParams>,
     events_tx: broadcast::Sender<PathEvent>,
     cancel: CancellationToken,
 ) -> (SenderHandle, JoinHandle<()>)
@@ -113,6 +115,7 @@ where
             keepalive_interval,
             keepalive_miss_threshold,
             retransmit_capacity,
+            fec,
             events_tx,
             rx,
             ctrl_rx,
@@ -138,6 +141,7 @@ async fn sender_loop<S>(
     keepalive_interval: Duration,
     keepalive_miss_threshold: u32,
     retransmit_capacity: usize,
+    fec: Option<FecParams>,
     events_tx: broadcast::Sender<PathEvent>,
     mut app_rx: mpsc::Receiver<OutboundMessage>,
     mut ctrl_rx: mpsc::Receiver<(PathId, PathDatagram)>,
@@ -150,6 +154,12 @@ where
     let mut next_seq: u32 = 0;
     let mut frame_scratch = BytesMut::with_capacity(1600);
     let mut ctrl_scratch = BytesMut::with_capacity(128);
+    // Proactive FEC encoder (opt-in). Emits XOR repair packets at column
+    // completion; repairs ride FEC-flagged bond datagrams and do not
+    // consume media bond_seq space.
+    let mut fec_encoder: Option<FecEncoder> = fec.map(FecEncoder::new);
+    let mut fec_payload = BytesMut::with_capacity(1600);
+    let mut fec_frame = BytesMut::with_capacity(1700);
 
     let mut ka_interval = tokio::time::interval(keepalive_interval);
     // Track in-flight keepalive stamps per path for RTT computation.
@@ -244,6 +254,47 @@ where
                         }
                         // Stash the *primary* copy for retransmit.
                         retx_buf.insert(seq, frame_scratch.clone().freeze());
+                    }
+                }
+
+                // Proactive FEC: feed every original payload to the
+                // encoder (contiguous seqs keep blocks aligned even across
+                // a sender drop) and emit any completed XOR repair packets
+                // across paths. Repairs ride FEC-flagged datagrams and do
+                // not consume media bond_seq space.
+                if let Some(enc) = fec_encoder.as_mut() {
+                    for rep in enc.push(seq, &msg.data) {
+                        rep.serialize(&mut fec_payload);
+                        let sel = scheduler.schedule(&PacketHints {
+                            size: fec_payload.len(),
+                            ..Default::default()
+                        });
+                        let pid = match sel {
+                            PathSelection::Single(p) => Some(p),
+                            PathSelection::Duplicate(v) => v.first().copied(),
+                            PathSelection::Drop => None,
+                        };
+                        if let Some(pid) = pid {
+                            if let Some(pos) = path_index_by_id(pid) {
+                                let mut header =
+                                    BondHeader::new(flow_id, rep.base_seq, pid, Priority::Normal);
+                                header.set_fec();
+                                write_packet(&header, &fec_payload, &mut fec_frame);
+                                if let Some(path) = paths.get(pos) {
+                                    // FEC bytes are NOT counted in the
+                                    // per-path media byte counter — that
+                                    // would read as loss to the controller
+                                    // (sent > delivered) and trigger false
+                                    // backoff. The token-bucket deduction
+                                    // above already charges FEC bandwidth
+                                    // against capacity.
+                                    let _ = match path.primary_peer() {
+                                        Some(peer) => path.send_to(&fec_frame, peer).await,
+                                        None => path.send(&fec_frame).await,
+                                    };
+                                }
+                            }
+                        }
                     }
                 }
             }

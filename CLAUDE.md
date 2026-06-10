@@ -124,7 +124,7 @@ Each bonded packet is a 12-byte header followed by opaque payload:
 | Bonding-only binary (`bilbycast-bonder`) | Done (workspace member, `bilbycast-bonder/src/main.rs`) |
 | **Edge integration** (`input_bonded`, `output_bonded`) | **Done** — live in `bilbycast-edge`; `Adaptive` scheduler is the edge default, telemetry on `OutputStats.bond_stats` |
 | `MediaAwareScheduler` (edge-side, parses NAL) | Done (edge-side, `engine/bonded_scheduler.rs`; layered over WeightedRtt or CapacityAware) |
-| Proactive FEC (interleaved XOR) | Outstanding — resilience today is ARQ + IDR-duplication + multi-path diversity |
+| **Proactive FEC** (interleaved XOR) | **Done (opt-in, off by default)** — `protocol/fec.rs`, FEC-flagged repair datagrams; sender emits, receiver recovers into reassembly. Codec + e2e (recover-without-ARQ) tested. Complements ARQ + IDR-dup + multi-path. |
 
 ## Adaptive scheduling, congestion control & encryption
 

@@ -3,6 +3,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use bonding_protocol::protocol::fec::FecParams;
 use bonding_protocol::protocol::scheduler::PathId;
 
 /// Top-level socket config. A bond socket binds N paths and either
@@ -33,6 +34,10 @@ pub struct BondSocketConfig {
     /// this bond is ChaCha20-Poly1305 sealed (both ends must share the
     /// key). QUIC paths are already TLS-encrypted and ignore this.
     pub encryption_key: Option<Vec<u8>>,
+    /// Optional proactive FEC geometry. `None` = off (default). When set,
+    /// the sender emits XOR repair packets and the receiver recovers
+    /// sparse loss without a NACK round-trip. Both ends must agree.
+    pub fec: Option<FecParams>,
     /// Paths registered on this socket.
     pub paths: Vec<PathConfig>,
 }
@@ -48,6 +53,7 @@ impl Default for BondSocketConfig {
             nack_delay: Duration::from_millis(30),
             max_nack_retries: 8,
             encryption_key: None,
+            fec: None,
             paths: Vec::new(),
         }
     }

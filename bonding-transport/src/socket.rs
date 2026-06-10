@@ -94,6 +94,7 @@ impl BondSocket {
             cfg.keepalive_interval,
             cfg.keepalive_miss_threshold,
             cfg.retransmit_capacity,
+            cfg.fec,
             events_tx.clone(),
             cancel.clone(),
         );
@@ -133,6 +134,7 @@ impl BondSocket {
             cancel.clone(),
             cfg.nack_delay,
             cfg.max_nack_retries,
+            cfg.fec,
         );
 
         Ok(Self {

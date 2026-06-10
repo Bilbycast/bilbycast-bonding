@@ -7,6 +7,7 @@
 //! rides.
 
 pub mod capacity_scheduler;
+pub mod fec;
 pub mod path_health;
 pub mod reassembly;
 pub mod retransmit;

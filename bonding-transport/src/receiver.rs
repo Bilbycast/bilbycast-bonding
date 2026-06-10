@@ -22,6 +22,7 @@ use bonding_protocol::control::{
 };
 use bonding_protocol::events::{PathDeadReason, PathEvent};
 use bonding_protocol::packet::BondHeader;
+use bonding_protocol::protocol::fec::{FecDecoder, FecParams, FecRepair};
 use bonding_protocol::protocol::reassembly::{DrainItem, ReassemblyBuffer};
 use bonding_protocol::protocol::scheduler::PathId;
 use bonding_protocol::stats::{BondConnStats, PathStats};
@@ -47,6 +48,7 @@ pub(crate) fn spawn_receiver(
     cancel: CancellationToken,
     nack_delay: Duration,
     max_nack_retries: u32,
+    fec: Option<FecParams>,
 ) -> (ReceiverHandle, JoinHandle<()>) {
     let (app_tx, app_rx) = mpsc::channel::<Bytes>(1024);
 
@@ -85,6 +87,7 @@ pub(crate) fn spawn_receiver(
             cancel,
             nack_delay,
             max_nack_retries,
+            fec,
         )
         .await
         {
@@ -120,8 +123,13 @@ async fn receiver_loop(
     cancel: CancellationToken,
     nack_delay: Duration,
     max_nack_retries: u32,
+    fec: Option<FecParams>,
 ) -> anyhow::Result<()> {
     let mut reassembly = ReassemblyBuffer::new(hold_time);
+    // Proactive FEC decoder (opt-in). Recovers a sparse loss from the
+    // column's XOR repair with no NACK round-trip; recovered packets are
+    // inserted into the reassembly buffer like a late path arrival.
+    let mut fec_decoder: Option<FecDecoder> = fec.map(FecDecoder::new);
 
     // `bond_seq -> pending NACK state`. Grows only as gaps appear;
     // cleared on recovery or drain-as-lost.
@@ -273,6 +281,26 @@ async fn receiver_loop(
                     }
                 }
                 let payload = dg.data.slice(consumed..);
+
+                // FEC repair packet → decoder, never the media reassembly
+                // buffer (it carries no media bond_seq). Recovered packets
+                // are inserted as late path arrivals.
+                if header.is_fec() {
+                    if let Some(dec) = fec_decoder.as_mut() {
+                        if let Some(rep) = FecRepair::parse(&payload) {
+                            let fnow = Instant::now();
+                            for (rseq, rpayload) in dec.push_repair(rep) {
+                                let o = reassembly.insert(rseq, rpayload, path_id, fnow);
+                                if o.recovered {
+                                    conn_stats.gaps_recovered.fetch_add(1, Ordering::Relaxed);
+                                    pending_nacks.remove(&rseq);
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
+
                 conn_stats.packets_received.fetch_add(1, Ordering::Relaxed);
                 conn_stats
                     .bytes_received
@@ -315,7 +343,8 @@ async fn receiver_loop(
                     }
                 }
 
-                let outcome = reassembly.insert(header.bond_seq, payload, path_id, Instant::now());
+                let outcome =
+                    reassembly.insert(header.bond_seq, payload.clone(), path_id, Instant::now());
                 if outcome.stale {
                     conn_stats
                         .reassembly_overflow
@@ -342,6 +371,19 @@ async fn receiver_loop(
                             next_nack_at: now2 + nack_delay,
                             nacks_sent: 0,
                         });
+                    }
+                }
+
+                // Feed the FEC decoder so a later repair (or a sibling
+                // source) can recover a loss in this column with no NACK.
+                if let Some(dec) = fec_decoder.as_mut() {
+                    let fnow = Instant::now();
+                    for (rseq, rpayload) in dec.push_source(header.bond_seq, &payload) {
+                        let o = reassembly.insert(rseq, rpayload, path_id, fnow);
+                        if o.recovered {
+                            conn_stats.gaps_recovered.fetch_add(1, Ordering::Relaxed);
+                            pending_nacks.remove(&rseq);
+                        }
                     }
                 }
             }

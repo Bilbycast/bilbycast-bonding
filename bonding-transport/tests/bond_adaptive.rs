@@ -18,8 +18,8 @@ use tokio::net::UdpSocket;
 use tokio::time::{sleep, timeout};
 
 use bonding_transport::{
-    BondSocket, BondSocketConfig, CapacityAwareScheduler, CongestionConfig, PacketHints,
-    PathConfig, PathPrior, PathTransport,
+    BondSocket, BondSocketConfig, CapacityAwareScheduler, CongestionConfig, FecParams,
+    PacketHints, PathConfig, PathPrior, PathTransport,
 };
 
 async fn free_port() -> u16 {
@@ -123,6 +123,117 @@ async fn spawn_shaped_relay(
         }
     });
     RelayHandle { stop }
+}
+
+/// UDP relay that drops every `drop_every`-th **media data** datagram
+/// (bond magic `0xBC`, FEC flag clear) and forwards everything else —
+/// FEC repair packets, control, and the reverse direction all pass. Used
+/// to prove FEC recovery in isolation.
+async fn spawn_fec_drop_relay(
+    listen: SocketAddr,
+    target: SocketAddr,
+    drop_every: u32,
+) -> RelayHandle {
+    use std::sync::Mutex;
+    let stop = Arc::new(AtomicBool::new(false));
+    let sock = Arc::new(UdpSocket::bind(listen).await.unwrap());
+    let client: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
+    let sock_c = sock.clone();
+    let stop_c = stop.clone();
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 2048];
+        let mut data_count: u32 = 0;
+        loop {
+            if stop_c.load(Ordering::Relaxed) {
+                break;
+            }
+            let r = timeout(Duration::from_millis(50), sock_c.recv_from(&mut buf)).await;
+            let Ok(Ok((len, from))) = r else { continue };
+            if from == target {
+                let to = *client.lock().unwrap();
+                if let Some(c) = to {
+                    let _ = sock_c.send_to(&buf[..len], c).await;
+                }
+                continue;
+            }
+            *client.lock().unwrap() = Some(from);
+            // 0xBC = bond data magic; byte1 low nibble bit 3 (0x08) = FEC.
+            let is_media = len >= 2 && buf[0] == 0xBC && (buf[1] & 0x08) == 0;
+            if is_media {
+                data_count += 1;
+                if data_count % drop_every == 0 {
+                    continue; // drop this media packet — FEC must recover it
+                }
+            }
+            let _ = sock_c.send_to(&buf[..len], target).await;
+        }
+    });
+    RelayHandle { stop }
+}
+
+/// FEC recovers sparse loss with **ARQ disabled** — the only way a
+/// dropped packet reaches the app is the XOR repair. One media drop per
+/// 16-packet block lands in a rotating column, so every loss is
+/// recoverable; assert zero unrecovered gaps.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fec_recovers_sparse_loss_without_arq() {
+    let rx = format!("127.0.0.1:{}", free_port().await).parse().unwrap();
+    let relay: SocketAddr = format!("127.0.0.1:{}", free_port().await).parse().unwrap();
+    // Drop every 13th media packet → ~1 per 16-packet block, each in a
+    // different column (13 mod 4 rotates), all FEC-recoverable.
+    let _r = spawn_fec_drop_relay(relay, rx, 13).await;
+
+    let fec = Some(FecParams { columns: 4, rows: 4 });
+    let receiver = BondSocket::receiver(BondSocketConfig {
+        flow_id: 99,
+        hold_time: Duration::from_millis(500),
+        keepalive_interval: Duration::from_millis(120),
+        max_nack_retries: 0, // ARQ OFF — recovery can only be FEC
+        nack_delay: Duration::from_secs(3600),
+        fec,
+        paths: vec![PathConfig { id: 0, name: "p".into(), weight_hint: 1, transport: udp_recv(rx) }],
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+
+    let sender = BondSocket::sender(
+        BondSocketConfig {
+            flow_id: 99,
+            keepalive_interval: Duration::from_millis(120),
+            max_nack_retries: 0,
+            fec,
+            paths: vec![PathConfig { id: 0, name: "p".into(), weight_hint: 1, transport: udp_send(relay) }],
+            ..Default::default()
+        },
+        CapacityAwareScheduler::new(vec![0]),
+    )
+    .await
+    .unwrap();
+
+    sleep(Duration::from_millis(200)).await;
+    const N: u32 = 256;
+    for i in 0..N {
+        sender.send(Bytes::from(format!("fec-{i:06}")), PacketHints::default()).await.unwrap();
+        sleep(Duration::from_millis(1)).await; // pace so repairs arrive within hold
+    }
+    // Drain.
+    let mut got = 0u32;
+    while got < N {
+        match timeout(Duration::from_secs(3), receiver.recv()).await {
+            Ok(Some(_)) => got += 1,
+            _ => break,
+        }
+    }
+    sleep(Duration::from_millis(200)).await;
+
+    let s = receiver.stats().snapshot();
+    assert!(s.gaps_recovered > 0, "FEC should have recovered drops, got {}", s.gaps_recovered);
+    assert_eq!(
+        s.gaps_lost, 0,
+        "with 1 recoverable loss/block + FEC, nothing should be lost (recovered={}, lost={}, delivered={})",
+        s.gaps_recovered, s.gaps_lost, s.packets_delivered
+    );
 }
 
 /// Two-path encrypted bond delivers in order with the adaptive
