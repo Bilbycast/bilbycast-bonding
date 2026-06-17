@@ -131,7 +131,26 @@ pub struct CongestionConfig {
     /// EWMA factor for the smoothed RTT (0..1, higher = snappier).
     /// Default 0.2.
     pub rtt_ewma: f32,
+    /// Auto-derive the queue-building delay threshold per leg from its
+    /// own windowed baseline RTT instead of using the fixed
+    /// `delay_inflation`. A high-baseline link (bufferbloated cellular)
+    /// gets a proportionally looser threshold — auto-deriving the value
+    /// such links otherwise need hand-tuned — while a low-baseline
+    /// terrestrial link keeps the tight `delay_inflation` floor. The
+    /// derived threshold is `rtt_min × DELAY_AUTO_FRAC`, clamped to
+    /// `[delay_inflation, DELAY_AUTO_CEILING]`. Opt-in (default `false`)
+    /// so existing fixed-threshold deployments are unchanged. Default
+    /// `false`.
+    pub delay_inflation_auto: bool,
 }
+
+/// Auto delay-threshold = baseline RTT × this fraction. 0.7 places a
+/// ~360 ms cellular baseline at ~250 ms (the value such links need
+/// hand-tuned today) and a ~22 ms terrestrial baseline below the floor.
+const DELAY_AUTO_FRAC: f64 = 0.7;
+/// Hard ceiling on the auto-derived threshold (seconds) so a
+/// pathological baseline can't blind the controller to real congestion.
+const DELAY_AUTO_CEILING_SECS: f64 = 1.0;
 
 impl Default for CongestionConfig {
     fn default() -> Self {
@@ -147,6 +166,7 @@ impl Default for CongestionConfig {
             rtt_min_window: Duration::from_secs(10),
             burst_secs: 0.25,
             rtt_ewma: 0.2,
+            delay_inflation_auto: false,
         }
     }
 }
@@ -274,6 +294,21 @@ impl PathCc {
     fn score(&self, burst_secs: f32, delay_thresh: f64) -> f64 {
         self.headroom(burst_secs) * self.quality(delay_thresh)
     }
+
+    /// The queue-building delay threshold for this leg, in seconds.
+    /// Fixed `delay_inflation` by default; when `delay_inflation_auto`
+    /// is set (and a baseline RTT has been measured) it scales with the
+    /// leg's own windowed `rtt_min` so a bufferbloated cellular link
+    /// gets a proportionally looser threshold while a terrestrial link
+    /// keeps the tight floor. Bounded to `[delay_inflation, ceiling]`.
+    #[inline]
+    fn effective_delay_thresh(&self, cfg: &CongestionConfig) -> f64 {
+        let fixed = cfg.delay_inflation.as_secs_f64();
+        if !cfg.delay_inflation_auto || self.rtt_min <= 0.0 {
+            return fixed;
+        }
+        (self.rtt_min * DELAY_AUTO_FRAC).clamp(fixed, DELAY_AUTO_CEILING_SECS)
+    }
 }
 
 /// Capacity-aware, congestion-controlled scheduler.
@@ -396,7 +431,6 @@ impl CapacityAwareScheduler {
             return None;
         }
         let burst = self.cfg.burst_secs;
-        let delay_thresh = self.cfg.delay_inflation.as_secs_f64();
         let mut best: Option<usize> = None;
         let mut best_score = f64::NEG_INFINITY;
         for k in 0..len {
@@ -408,7 +442,9 @@ impl CapacityAwareScheduler {
             if require_afford && p.tokens < need {
                 continue;
             }
-            let s = p.score(burst, delay_thresh);
+            // Per-leg threshold: with delay_inflation_auto it scales with
+            // each leg's own baseline RTT (see effective_delay_thresh).
+            let s = p.score(burst, p.effective_delay_thresh(&self.cfg));
             if s > best_score {
                 best_score = s;
                 best = Some(i);
@@ -591,7 +627,7 @@ impl BondScheduler for CapacityAwareScheduler {
 
         // Capacity control step.
         let inflation = (p.rtt - p.rtt_min).max(0.0);
-        let delay_thresh = cfg.delay_inflation.as_secs_f64();
+        let delay_thresh = p.effective_delay_thresh(&cfg);
         let congested = p.loss > cfg.loss_high || inflation > delay_thresh;
         let clean = p.loss < cfg.loss_low && inflation < delay_thresh * 0.5;
         // Demand pressure: the bucket is in debt at the control step —
@@ -878,6 +914,48 @@ mod tests {
         assert!(
             low < high,
             "delay inflation should back off without loss: {high} -> {low}"
+        );
+    }
+
+    #[test]
+    fn auto_delay_threshold_tolerates_high_baseline_inflation() {
+        // A cellular-like leg with a ~360 ms baseline. With the fixed
+        // 40 ms threshold a 100 ms inflation reads as congestion and the
+        // leg backs off — the exact false-backoff the live cellular test
+        // had to hand-tune `delay_inflation_ms: 250` around. With
+        // `delay_inflation_auto` the threshold derives to ~0.7×360 ≈
+        // 252 ms, so the same inflation stays "clean" and the leg holds
+        // its capacity instead of collapsing.
+        fn run(auto: bool) -> (u64, u64) {
+            let cfg = CongestionConfig {
+                delay_inflation_auto: auto,
+                ..Default::default()
+            };
+            let priors = vec![PathPrior {
+                id: 0,
+                weight_hint: 1,
+                ceiling_bps: Some(20_000_000),
+            }];
+            let mut s = CapacityAwareScheduler::with_paths(priors, cfg);
+            for _ in 0..20 {
+                s.on_path_update(0, &health(360, 0.0, 8_000_000));
+            }
+            let base = s.capacity_bps(0).unwrap();
+            for _ in 0..8 {
+                // +100 ms over the 360 ms baseline.
+                s.on_path_update(0, &health(460, 0.0, 8_000_000));
+            }
+            (base, s.capacity_bps(0).unwrap())
+        }
+        let (fixed_base, fixed_after) = run(false);
+        let (auto_base, auto_after) = run(true);
+        assert!(
+            fixed_after < fixed_base,
+            "fixed 40ms threshold should back off on 100ms inflation: {fixed_base} -> {fixed_after}"
+        );
+        assert!(
+            auto_after >= auto_base,
+            "auto threshold (~252ms) should tolerate 100ms inflation: {auto_base} -> {auto_after}"
         );
     }
 
