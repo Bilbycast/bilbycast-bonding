@@ -279,7 +279,22 @@ async fn build_paths(
         None => None,
     };
     for p in &cfg.paths {
-        let path = build_one_path(p, sender_mode, crypto.clone()).await?;
+        // A single leg failing to come up at setup (e.g. an unreachable
+        // or slow-to-handshake QUIC peer) must NOT abort the whole bond —
+        // start with the legs that connect. Previously the `?` here meant
+        // one timed-out QUIC handshake tore down every other (working)
+        // leg. Skip the failed leg and carry on; require at least one.
+        let path = match build_one_path(p, sender_mode, crypto.clone()).await {
+            Ok(path) => path,
+            Err(e) => {
+                log::warn!(
+                    "bond path '{}' (id {}) failed to build, skipping leg: {e}",
+                    p.name,
+                    p.id
+                );
+                continue;
+            }
+        };
         let ps = PathStats::new();
         // Record which NIC-pin mechanism (if any) actually bound this
         // path so the resolved value reaches telemetry.
@@ -293,6 +308,11 @@ async fn build_paths(
         ids.push(p.id);
         names.push(p.name.clone());
         paths.push(path);
+    }
+    if paths.is_empty() {
+        return Err(BondSocketError::Path(PathError::Other(
+            "no bond legs could be established (all paths failed to build)".into(),
+        )));
     }
     Ok((paths, stats, ids, names))
 }

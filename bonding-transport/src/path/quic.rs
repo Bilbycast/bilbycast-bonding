@@ -75,8 +75,10 @@ pub struct QuicPath {
     /// further connections (server mode). Client mode uses it to
     /// open the initial connection.
     endpoint: Endpoint,
-    conn: Mutex<Option<Connection>>,
-    primary_peer: Mutex<Option<SocketAddr>>,
+    // Shared with the rx-pump task so a server path can swap in a fresh
+    // connection on re-accept (and `send()` then follows it).
+    conn: Arc<Mutex<Option<Connection>>>,
+    primary_peer: Arc<Mutex<Option<SocketAddr>>>,
     rx: Mutex<Option<mpsc::Receiver<PathDatagram>>>,
     cancel: CancellationToken,
     _task: tokio::task::JoinHandle<()>,
@@ -134,6 +136,7 @@ impl QuicPath {
             endpoint,
             conn,
             Some(remote),
+            false, // client: no server-side re-accept
         ))
     }
 
@@ -176,38 +179,73 @@ impl QuicPath {
             endpoint,
             conn,
             Some(peer),
+            true, // server: re-accept on connection loss (no poisoning)
         ))
     }
 
+    /// `re_accept = true` (server paths): when the connection ends, accept
+    /// a fresh one on the same endpoint instead of dying — otherwise a
+    /// single closed connection poisons the server for the endpoint's
+    /// lifetime (the receiver could never re-attach a dropped leg without
+    /// a full restart). Client paths pass `false` (a dropped client is
+    /// handled by bond-level liveness, not a server-side accept).
     fn spawn_rx_pump(
         id: PathId,
         name: String,
         endpoint: Endpoint,
         conn: Connection,
         primary_peer: Option<SocketAddr>,
+        re_accept: bool,
     ) -> Self {
         let (tx, rx) = mpsc::channel::<PathDatagram>(1024);
         let cancel = CancellationToken::new();
-        let conn_clone = conn.clone();
+        let shared_conn = Arc::new(Mutex::new(Some(conn.clone())));
+        let shared_peer = Arc::new(Mutex::new(primary_peer));
         let cancel_child = cancel.clone();
-        let peer_for_from = primary_peer.unwrap_or_else(|| conn.remote_address());
+        let task_conn = shared_conn.clone();
+        let task_peer = shared_peer.clone();
+        let task_ep = endpoint.clone();
+        let task_name = name.clone();
         let task = tokio::spawn(async move {
+            let mut current = conn;
+            let mut peer_for_from = primary_peer.unwrap_or_else(|| current.remote_address());
             loop {
                 tokio::select! {
                     _ = cancel_child.cancelled() => break,
-                    r = conn_clone.read_datagram() => match r {
+                    r = current.read_datagram() => match r {
                         Ok(data) => {
-                            let dg = PathDatagram {
-                                data,
-                                from: peer_for_from,
-                            };
+                            let dg = PathDatagram { data, from: peer_for_from };
                             if tx.try_send(dg).is_err() {
                                 log::debug!("quic path rx drop (mpsc full)");
                             }
                         }
                         Err(e) => {
-                            log::info!("quic path rx stream ended: {e}");
-                            break;
+                            if !re_accept {
+                                log::info!("quic path '{task_name}' rx stream ended: {e}");
+                                break;
+                            }
+                            // Server: connection dropped — re-accept so the
+                            // leg can recover instead of being poisoned.
+                            log::info!(
+                                "quic server path '{task_name}' connection ended ({e}); re-accepting"
+                            );
+                            match accept_next(&task_ep).await {
+                                Ok(new_conn) => {
+                                    peer_for_from = new_conn.remote_address();
+                                    *task_peer.lock().await = Some(peer_for_from);
+                                    *task_conn.lock().await = Some(new_conn.clone());
+                                    current = new_conn;
+                                    log::info!(
+                                        "quic server path '{task_name}' re-accepted from {peer_for_from}"
+                                    );
+                                }
+                                Err(e2) => {
+                                    log::warn!(
+                                        "quic server path '{task_name}' re-accept failed: {e2}"
+                                    );
+                                    break;
+                                }
+                            }
                         }
                     }
                 }
@@ -218,8 +256,8 @@ impl QuicPath {
             id,
             name,
             endpoint,
-            conn: Mutex::new(Some(conn)),
-            primary_peer: Mutex::new(primary_peer),
+            conn: shared_conn,
+            primary_peer: shared_peer,
             rx: Mutex::new(Some(rx)),
             cancel,
             _task: task,
@@ -286,6 +324,17 @@ impl Drop for QuicPath {
 }
 
 // ── TLS configuration helpers ───────────────────────────────────────────────
+
+/// Accept the next inbound connection on a server endpoint and finish its
+/// handshake. Used by the server rx pump to re-attach a dropped leg
+/// instead of dying after the first connection ends.
+async fn accept_next(endpoint: &Endpoint) -> std::result::Result<Connection, String> {
+    let incoming = endpoint
+        .accept()
+        .await
+        .ok_or_else(|| "endpoint closed".to_string())?;
+    incoming.await.map_err(|e| format!("accept handshake: {e}"))
+}
 
 fn install_default_crypto_provider() {
     // rustls 0.23 requires an explicit default crypto provider. Install
