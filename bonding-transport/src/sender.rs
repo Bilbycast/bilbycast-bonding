@@ -214,6 +214,14 @@ where
     // Swallow the immediate first tick; it fires at t=0.
     liveness_tick.tick().await;
 
+    // Whether the control-rx multiplex still has live senders. An
+    // all-send-only bond (e.g. every leg is a RIST *sender* path, which
+    // cannot carry a bond back-channel) has no control paths at all, so
+    // `ctrl_rx` closes immediately. That is NOT a shutdown condition —
+    // we disable the branch and keep pushing data, relying on RIST's own
+    // per-leg ARQ. Shutdown is driven by `app_rx` close or `cancel`.
+    let mut ctrl_open = true;
+
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
@@ -326,11 +334,16 @@ where
                 }
             }
 
-            // Control messages arriving on any path (keepalive acks, NACKs)
-            maybe_ctrl = ctrl_rx.recv() => {
+            // Control messages arriving on any path (keepalive acks, NACKs).
+            // Once the control channel has no live senders we disable this
+            // branch rather than exit — see `ctrl_open` above. A bond with
+            // no rx-bearing leg (all-RIST / all-send-only) must still push
+            // data; real shutdown comes from `app_rx` close or `cancel`.
+            maybe_ctrl = ctrl_rx.recv(), if ctrl_open => {
                 let Some((path_id, dg)) = maybe_ctrl else {
-                    log::info!("bond sender: all path rx channels closed");
-                    return Ok(());
+                    log::debug!("bond sender: control rx closed (no rx-bearing legs); disabling branch");
+                    ctrl_open = false;
+                    continue;
                 };
                 if !is_control(&dg.data) {
                     // The sender side shouldn't normally receive data

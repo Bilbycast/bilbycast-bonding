@@ -527,6 +527,8 @@ async fn build_one_path(
             addr,
             server_name,
             tls,
+            bind,
+            interface,
         } => {
             use crate::config::{QuicRole, QuicTlsMode};
             use crate::path::quic::QuicTls;
@@ -545,10 +547,26 @@ async fn build_one_path(
             };
             let qp = match role {
                 QuicRole::Client => {
-                    QuicPath::client(p.id, p.name.clone(), *addr, server_name, tls_inner).await?
+                    QuicPath::client(
+                        p.id,
+                        p.name.clone(),
+                        *addr,
+                        server_name,
+                        tls_inner,
+                        *bind,
+                        interface.as_deref(),
+                    )
+                    .await?
                 }
                 QuicRole::Server => {
-                    QuicPath::server(p.id, p.name.clone(), *addr, tls_inner).await?
+                    QuicPath::server(
+                        p.id,
+                        p.name.clone(),
+                        *addr,
+                        tls_inner,
+                        interface.as_deref(),
+                    )
+                    .await?
                 }
             };
             let _ = sender_mode;

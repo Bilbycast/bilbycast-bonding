@@ -85,22 +85,41 @@ pub struct QuicPath {
 impl QuicPath {
     /// Client: dial `remote`, present the supplied TLS material,
     /// negotiate ALPN `bilbycast-bond`, and start pumping datagrams.
+    ///
+    /// `bind` sets the local source `ip:port` (port usually 0) and
+    /// `interface` pins egress to a NIC — both required to keep two
+    /// QUIC legs on a multi-homed host from collapsing onto the default
+    /// route (see the `PathTransport::Quic` docs). `bind = None` ⇒
+    /// `0.0.0.0:0` / `[::]:0`; `interface = None` ⇒ routing-table egress.
     pub async fn client(
         id: PathId,
         name: impl Into<String>,
         remote: SocketAddr,
         server_name: &str,
         tls: QuicTls,
+        bind: Option<SocketAddr>,
+        interface: Option<&str>,
     ) -> PathResult<Self> {
         install_default_crypto_provider();
-        let bind: SocketAddr = if remote.is_ipv4() {
-            "0.0.0.0:0".parse().unwrap()
-        } else {
-            "[::]:0".parse().unwrap()
-        };
-        let mut endpoint = Endpoint::client(bind)
-            .map_err(|e| PathError::Other(format!("quic client bind: {e}")))?;
+        let bind_addr: SocketAddr = bind.unwrap_or_else(|| {
+            if remote.is_ipv4() {
+                "0.0.0.0:0".parse().unwrap()
+            } else {
+                "[::]:0".parse().unwrap()
+            }
+        });
+        // Pin the underlying UDP socket the same way the UDP leg does
+        // (SO_BINDTODEVICE → IP_UNICAST_IF fallback), then hand it to a
+        // client-only quinn endpoint.
+        let (std_socket, _pin) = crate::path::udp::build_pinned_std_socket(bind_addr, interface)?;
         let client_cfg = build_client_config(&tls)?;
+        let mut endpoint = Endpoint::new(
+            EndpointConfig::default(),
+            None,
+            std_socket,
+            Arc::new(TokioRuntime),
+        )
+        .map_err(|e| PathError::Other(format!("quic client endpoint: {e}")))?;
         endpoint.set_default_client_config(client_cfg);
         let connecting = endpoint
             .connect(remote, server_name)
@@ -126,12 +145,14 @@ impl QuicPath {
         name: impl Into<String>,
         local: SocketAddr,
         tls: QuicTls,
+        interface: Option<&str>,
     ) -> PathResult<Self> {
         install_default_crypto_provider();
         let server_cfg = build_server_config(&tls)?;
         let endpoint_cfg = EndpointConfig::default();
-        let std_socket = std::net::UdpSocket::bind(local)
-            .map_err(|e| PathError::Other(format!("quic server bind: {e}")))?;
+        // Optional NIC pin on the listen socket too (symmetry with the
+        // client); `interface = None` ⇒ a plain bind to `local`.
+        let (std_socket, _pin) = crate::path::udp::build_pinned_std_socket(local, interface)?;
         let endpoint = Endpoint::new(
             endpoint_cfg,
             Some(server_cfg),

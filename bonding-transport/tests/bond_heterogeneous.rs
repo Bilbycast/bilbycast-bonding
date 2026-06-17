@@ -51,6 +51,8 @@ async fn two_quic_paths_deliver_in_order() {
                     addr: a_addr,
                     server_name: "localhost".into(),
                     tls: QuicTlsMode::SelfSigned,
+                    bind: None,
+                    interface: None,
                 },
             },
             PathConfig {
@@ -62,6 +64,8 @@ async fn two_quic_paths_deliver_in_order() {
                     addr: b_addr,
                     server_name: "localhost".into(),
                     tls: QuicTlsMode::SelfSigned,
+                    bind: None,
+                    interface: None,
                 },
             },
         ],
@@ -87,6 +91,8 @@ async fn two_quic_paths_deliver_in_order() {
                     addr: a_addr,
                     server_name: "localhost".into(),
                     tls: QuicTlsMode::SelfSigned,
+                    bind: None,
+                    interface: None,
                 },
             },
             PathConfig {
@@ -98,6 +104,8 @@ async fn two_quic_paths_deliver_in_order() {
                     addr: b_addr,
                     server_name: "localhost".into(),
                     tls: QuicTlsMode::SelfSigned,
+                    bind: None,
+                    interface: None,
                 },
             },
         ],
@@ -174,6 +182,8 @@ async fn udp_plus_quic_deliver_in_order() {
                     addr: quic_addr,
                     server_name: "localhost".into(),
                     tls: QuicTlsMode::SelfSigned,
+                    bind: None,
+                    interface: None,
                 },
             },
         ],
@@ -206,6 +216,8 @@ async fn udp_plus_quic_deliver_in_order() {
                     addr: quic_addr,
                     server_name: "localhost".into(),
                     tls: QuicTlsMode::SelfSigned,
+                    bind: None,
+                    interface: None,
                 },
             },
         ],
@@ -244,4 +256,83 @@ async fn udp_plus_quic_deliver_in_order() {
         udp_stats.packets_sent > 0 && quic_stats.packets_sent > 0,
         "heterogeneous bond should carry traffic on both paths: udp={udp_stats:?} quic={quic_stats:?}"
     );
+}
+
+/// QUIC client with an **explicit source bind** (`bind: Some(...)`).
+/// Exercises the per-leg pinning path added for multi-homed senders —
+/// the client endpoint is built on a socket bound to a chosen source
+/// address (here loopback) via `build_pinned_std_socket` rather than
+/// the default `0.0.0.0:0`. Proves the pinned-socket path connects and
+/// carries bond frames end-to-end. (Interface pinning itself needs
+/// CAP_NET_RAW and a real NIC, so it isn't asserted here.)
+#[tokio::test(flavor = "current_thread", start_paused = false)]
+async fn quic_client_with_explicit_bind_delivers() {
+    let s_port = free_port().await;
+    let s_addr: SocketAddr = format!("127.0.0.1:{s_port}").parse().unwrap();
+
+    let rx_cfg = BondSocketConfig {
+        flow_id: 11,
+        hold_time: Duration::from_millis(100),
+        keepalive_interval: Duration::from_millis(150),
+        paths: vec![PathConfig {
+            id: 0,
+            name: "quic".into(),
+            weight_hint: 1,
+            transport: PathTransport::Quic {
+                role: QuicRole::Server,
+                addr: s_addr,
+                server_name: "localhost".into(),
+                tls: QuicTlsMode::SelfSigned,
+                bind: None,
+                interface: None,
+            },
+        }],
+        ..Default::default()
+    };
+    let rx_handle = tokio::spawn(async move { BondSocket::receiver(rx_cfg).await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let tx_cfg = BondSocketConfig {
+        flow_id: 11,
+        keepalive_interval: Duration::from_millis(150),
+        paths: vec![PathConfig {
+            id: 0,
+            name: "quic".into(),
+            weight_hint: 1,
+            transport: PathTransport::Quic {
+                role: QuicRole::Client,
+                addr: s_addr,
+                server_name: "localhost".into(),
+                tls: QuicTlsMode::SelfSigned,
+                // The new per-leg source bind — pin egress to loopback.
+                bind: Some("127.0.0.1:0".parse().unwrap()),
+                interface: None,
+            },
+        }],
+        ..Default::default()
+    };
+    let sched = WeightedRttScheduler::new(vec![0]);
+    let sender = BondSocket::sender(tx_cfg, sched).await.unwrap();
+    let receiver = rx_handle.await.unwrap().unwrap();
+
+    const N: u32 = 50;
+    for i in 0..N {
+        sender
+            .send(Bytes::from(format!("bind-{i:05}")), PacketHints::default())
+            .await
+            .unwrap();
+    }
+    for i in 0..N {
+        let r = timeout(Duration::from_secs(5), receiver.recv())
+            .await
+            .expect("bound-quic recv timed out")
+            .expect("channel closed");
+        assert_eq!(r.as_ref(), format!("bind-{i:05}").as_bytes());
+    }
+
+    let s0 = sender.path_stats(0).unwrap().snapshot();
+    assert!(s0.packets_sent > 0, "bound QUIC client must carry traffic: {s0:?}");
+
+    let rstats = receiver.stats().snapshot();
+    assert_eq!(rstats.gaps_lost, 0);
 }

@@ -626,6 +626,50 @@ fn build_socket(
     Ok((Arc::new(udp), pin_mechanism, ifindex))
 }
 
+/// Build a blocking `std::net::UdpSocket` bound to `local` with an
+/// optional NIC pin, for handing to a non-UDP path adapter that owns
+/// its own socket thereafter (e.g. quinn's QUIC endpoint). Mirrors
+/// [`build_socket`]'s pinning but returns the std socket + resolved pin
+/// mechanism rather than a tokio `UdpSocket`. The caller's transport
+/// layer (quinn) reconfigures non-blocking mode as needed.
+pub(crate) fn build_pinned_std_socket(
+    local: SocketAddr,
+    interface: Option<&str>,
+) -> PathResult<(std::net::UdpSocket, Option<PinMechanism>)> {
+    let domain = if local.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
+    let sock = Sock2::new(domain, Type::DGRAM, Some(SockProto::UDP)).map_err(|e| PathError::Bind {
+        addr: local.to_string(),
+        source: e,
+    })?;
+    sock.set_reuse_address(true).ok();
+    // NIC pin first — some platforms require it before bind.
+    let pin = if let Some(iface) = interface {
+        let mech = bind_to_interface(&sock, iface, local.is_ipv6()).map_err(|e| {
+            PathError::BindInterface {
+                interface: iface.to_string(),
+                source: e,
+            }
+        })?;
+        log::info!(
+            "bond quic path pinned to interface '{}' via {}",
+            iface,
+            mech.as_str()
+        );
+        Some(mech)
+    } else {
+        None
+    };
+    sock.bind(&local.into()).map_err(|e| PathError::Bind {
+        addr: local.to_string(),
+        source: e,
+    })?;
+    Ok((sock.into(), pin))
+}
+
 fn spawn_recv_loop(
     shared: Arc<UdpRebuilder>,
     tx: mpsc::Sender<PathDatagram>,

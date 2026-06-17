@@ -130,6 +130,20 @@ pub enum PathTransport {
         /// Client: server name for SNI / ALPN. Ignored on server.
         server_name: String,
         tls: QuicTlsMode,
+        /// Client-only local source bind (`ip:port`, port usually 0).
+        /// Without it the client endpoint binds `0.0.0.0:0` and the
+        /// kernel routing table picks the egress NIC — so on a
+        /// multi-homed host (several modems) every QUIC leg collapses
+        /// onto the default route and the bond is cosmetic. Set this to
+        /// a source IP that policy-routes out the intended uplink.
+        /// Ignored on the server side (it binds `addr`).
+        bind: Option<SocketAddr>,
+        /// Optional NIC pin (e.g. `"wwan0"`, `"eno4"`) — same mechanism
+        /// as the UDP leg (`SO_BINDTODEVICE` under `CAP_NET_RAW`,
+        /// falling back to the unprivileged `IP_UNICAST_IF` egress
+        /// hint). Applies to both client and server endpoints. `None`
+        /// leaves egress to the routing table / `bind`.
+        interface: Option<String>,
     },
 }
 
