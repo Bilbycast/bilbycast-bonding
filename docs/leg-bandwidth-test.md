@@ -184,6 +184,30 @@ Response (`command_ack.data` = `LegTestReport`):
 | manager | `crates/manager-server/src/api/nodes.rs` | 75 s ACK budget for `test_bond_leg` (multi-second probe) |
 | manager | `ui/static/js/config/bonding.js` | per-leg "Test leg" + "Measure capacity" buttons (browser-orchestrates responder→probe→stop) |
 
+## Live verification (2026-06-21, firewall hairpin, ms02)
+
+Verified over a real WAN hairpin (out to the public IP, DNAT'd back) with two
+standalone edges — rig + method in `testbed/bond-hairpin-live/`:
+
+- **Capacity probe (Phase 2) over the real WAN path**: 20/20 reachability echoes,
+  0% loss, ~1.4 ms RTT, clean capacity ramp to **44.5 Mbps measured** (0% loss to
+  the 80 Mbps offered ceiling). Loopback end-to-end test also green in unit tests.
+- **Bonded A/V steady state** (4.79 Mbps, 2-leg adaptive split, FEC 10×5):
+  **0 CC discontinuities**, PCR pacing jitter **p99 ≈ 0.41 ms**, decodes clean.
+- **Single-leg failover**: with the **defaults** (`hold_ms=500`) a leg kill cost
+  22 CC discontinuities + an 8.86 ms PCR blip (recoverable, self-heals — *not*
+  hitless). **Tuned hitless** (`hold_ms=1500`, `hold_max_ms=3000`,
+  `keepalive_ms=100` → 500 ms dead-detect, `nack_delay_ms=3`,
+  `max_nack_retries=20`): **0 CC discontinuities**, PCR jitter max 1.07 ms, no
+  freeze, full bitrate held — at the cost of ~1.5 s added latency (the recovery
+  buffer). **Takeaway: hitless leg failover is a hold-buffer/keepalive tuning
+  trade-off, not a default.**
+
+Caveats: both legs egressed one physical uplink (different ports) — validates the
+protocol/scheduler/ARQ/FEC/failover logic, not multi-uplink aggregation; host had
+no `CAP_SYS_NICE` (wire-emit SCHED_OTHER, ms-range PCR_AC floor); the capacity
+probe ran via the edge probe code over the hairpin, not the manager WS/UI path.
+
 ## Validation & security
 
 - `transport` is deserialised into the existing `BondPathTransportConfig` and runs through
