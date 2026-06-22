@@ -13,7 +13,7 @@
 //! - Lock-free [`stats`] counters populated by the transport layer.
 //!
 //! **This crate has zero async / I/O dependencies.** The async networking
-//! layer (path managers, QUIC/SRT/RIST transport adapters, reassembly
+//! layer (path managers, UDP/QUIC/RIST transport adapters, reassembly
 //! task) lives in `bonding-transport`. Consumers who only want to
 //! understand the wire format or run protocol-level unit tests can depend
 //! on this crate alone.
@@ -27,7 +27,7 @@
 //!    can leave hints at their default and still get weighted-RTT
 //!    aggregation.
 //! 2. **Transport-agnostic.** The bond header wraps arbitrary payload
-//!    bytes. Paths can ride QUIC, SRT, RIST, or raw UDP independently.
+//!    bytes. Paths can ride QUIC, RIST, or raw UDP independently.
 //! 3. **Lock-free hot path.** Stats use `AtomicU64`; the reassembly
 //!    buffer is a single-writer flat ring indexed by `bond_seq %
 //!    capacity`.

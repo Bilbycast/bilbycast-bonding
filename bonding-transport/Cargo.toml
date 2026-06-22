@@ -11,8 +11,10 @@ default = ["path-udp", "path-rist", "path-quic"]
 path-udp = []
 path-rist = ["dep:rist-transport"]
 path-quic = ["dep:quinn", "dep:rustls", "dep:rcgen", "dep:rustls-pemfile"]
-# SRT is opt-in so lightweight bonder builds don't need libsrt
-path-srt = ["dep:srt-transport"]
+# No SRT leg: UDP/QUIC/RIST already span the carrier design space, and
+# SRT's TSBPD/TLPKTDROP delivery model fights the bond's own cross-leg
+# reassembly + ARQ. For SRT bonding to a 3rd party, use libsrt
+# socket-group bonding on the edge's SRT I/O instead.
 
 [dependencies]
 bonding-protocol = { path = "../bonding-protocol" }
@@ -34,7 +36,6 @@ quinn = { version = "0.11", default-features = false, features = ["rustls-ring",
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
 rcgen = { version = "0.14", optional = true }
 rustls-pemfile = { version = "2", optional = true }
-srt-transport = { path = "../../bilbycast-libsrt-rs/srt-transport", optional = true }
 # ChaCha20-Poly1305 AEAD for optional bonded-path encryption (applied
 # only when a key is configured). Same AEAD the edge QUIC tunnel uses.
 ring = "0.17"

@@ -1,9 +1,8 @@
 //! Async bonding transport: path managers, sender/receiver tasks,
 //! scheduler wiring, stats publication.
 //!
-//! Phase 2: UDP path + `BondSocket` sender/receiver with end-to-end
-//! NACK-based recovery and per-path keepalive-driven RTT/loss.
-//! Phase 3 adds QUIC / SRT / RIST path adapters.
+//! UDP / QUIC / RIST path adapters + `BondSocket` sender/receiver with
+//! end-to-end NACK-based recovery and per-path keepalive-driven RTT/loss.
 //!
 //! ## Example
 //!

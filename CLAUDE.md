@@ -26,8 +26,8 @@ into two crates following the same pattern:
    gets RTT-aware aggregation.
 2. **Transport-agnostic.** The 12-byte bond header wraps arbitrary bytes.
    Paths can ride any datagram-ish transport independently; the header
-   stays the same. Current adapters: QUIC, RIST, raw UDP. SRT is a Phase 3
-   target — see the implementation-status table below.
+   stays the same. Adapters: QUIC, RIST, raw UDP. (No SRT leg — see the
+   implementation-status table for the rationale.)
 3. **Lock-free hot path.** Stats are `AtomicU64`; reassembly is a flat
    ring indexed by `bond_seq % capacity`. Same constraints as the edge
    data plane.
@@ -88,7 +88,7 @@ Each bonded packet is a 12-byte header followed by opaque payload:
 
 ### bonding-transport
 - `config.rs` — `BondSocketConfig`, `PathConfig`, `PathTransport` enum
-  (`Udp` / `Rist` / `Quic` variants today; `Srt` not yet wired).
+  (`Udp` / `Rist` / `Quic` variants).
 - `path/` — uniform `BondPath` trait (`mod.rs`) plus the concrete
   adapters: `udp.rs`, `rist.rs`, `quic.rs`.
 - `sender.rs` — outbound task: consults scheduler, frames header,
@@ -119,7 +119,7 @@ Each bonded packet is a 12-byte header followed by opaque payload:
 | QUIC path adapter | Done (`path/quic.rs`, `path-quic` default feature; already TLS-encrypted) |
 | Raw UDP path adapter | Done (`path/udp.rs`, `path-udp` default feature; optional `BondCrypto`) |
 | RIST path adapter (via bilbycast-rist) | Done (`path/rist.rs`, `path-rist` default feature) |
-| SRT path adapter (via bilbycast-libsrt-rs) | Outstanding — `path-srt` feature + `srt-transport` dep declared, but no `Srt` config variant or `path/srt.rs` yet |
+| SRT leg path adapter | **Not planned (decided 2026-06-22).** UDP/QUIC/RIST already span the carrier design space — raw (UDP), TLS + congestion-control + NAT (QUIC), per-leg ARQ (RIST). SRT adds nothing unique: its TSBPD latency-window delivery + TLPKTDROP *fight* the bond's own cross-leg reassembly + ARQ, it gives **no** 3rd-party interop (the `0xBC` bond is proprietary at both ends), and it would drag the heavy libsrt/OpenSSL/CMake build chain into the deliberately-lean bonder. For SRT bonding **to a 3rd party**, use libsrt **socket-group bonding** (Broadcast/Backup groups) on the edge's SRT I/O — that already ships. |
 | `BondSocket::sender` / `::receiver` (+ `send` / `recv` / `stats` / `path_stats` / `path_ids` / `subscribe_events` / `close`) | Done (`socket.rs`; `BondSocketConfig::encryption_key` threads the AEAD) |
 | Bonding-only binary (`bilbycast-bonder`) | Done (workspace member, `bilbycast-bonder/src/main.rs`) |
 | **Edge integration** (`input_bonded`, `output_bonded`) | **Done** — live in `bilbycast-edge`; `Adaptive` scheduler is the edge default, telemetry on `OutputStats.bond_stats` |
@@ -184,8 +184,7 @@ bilbycast-bonder         (Phase 5)
 bonding-transport
   ├── compiles against: bonding-protocol
   ├── compiles against: tokio
-  └── optionally wraps: bilbycast-relay (QUIC), bilbycast-libsrt-rs (SRT),
-                        bilbycast-rist (RIST)
+  └── optionally wraps: bilbycast-relay (QUIC), bilbycast-rist (RIST)
 
 bonding-protocol         (pure Rust, no async)
 ```

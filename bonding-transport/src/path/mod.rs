@@ -1,7 +1,7 @@
 //! Path adapters — uniform surface over concrete transports.
 //!
 //! A `BondPath` is the small contract the sender and receiver tasks
-//! need from every transport (UDP, QUIC, SRT, RIST): send a
+//! need from every transport (UDP, QUIC, RIST): send a
 //! pre-framed datagram, receive the next one, report liveness, close
 //! cleanly. Framing is done above the path — paths are content-blind
 //! and simply carry bytes.
