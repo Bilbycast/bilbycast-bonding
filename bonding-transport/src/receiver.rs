@@ -638,6 +638,22 @@ async fn receiver_loop(
                         }
                     }
                 }
+
+                // Opportunistic in-order release: hand any now-contiguous,
+                // hold-satisfied head to the application immediately rather
+                // than waiting for the next pump tick. This removes the
+                // 0..pump-interval delivery-jitter that otherwise clumped
+                // egress into ~10 ms bursts. hold_time (the reorder budget)
+                // is still honoured; gap-loss + NACKs stay on the pump.
+                drain_reassembly(
+                    &mut reassembly,
+                    &app_tx,
+                    &conn_stats,
+                    &mut drain_scratch,
+                    Instant::now(),
+                    &mut pending_nacks,
+                    false,
+                );
             }
 
             _ = liveness_tick.tick() => {
@@ -648,7 +664,7 @@ async fn receiver_loop(
 
             _ = pump.tick() => {
                 let now = Instant::now();
-                drain_reassembly(&mut reassembly, &app_tx, &conn_stats, &mut drain_scratch, now, &mut pending_nacks).await;
+                drain_reassembly(&mut reassembly, &app_tx, &conn_stats, &mut drain_scratch, now, &mut pending_nacks, true);
 
                 // Any NACKs due? Retry cadence is RTT-aware — re-asking
                 // before a retransmit could possibly arrive only buys
@@ -715,16 +731,36 @@ async fn receiver_loop(
     }
 }
 
-async fn drain_reassembly(
+/// Move the deliverable reassembly prefix to the application.
+///
+/// `declare_lost` selects the drain mode:
+/// - `true` (the timed pump): aged-out gaps are force-advanced as `Lost`
+///   and NACK bookkeeping is reconciled — the authoritative loss/recovery
+///   cadence, and the path that flushes a stream that has gone idle.
+/// - `false` (per data-packet arrival): deliver only the in-order,
+///   hold-satisfied prefix; never give up on a missing seq. Called on
+///   every data packet so a contiguous head is released within an
+///   inter-packet gap of its hold-time expiry rather than waiting up to a
+///   full pump tick — that pump quantisation is what clumped delivery into
+///   bursty ~10 ms batches. Delivery still respects `hold_time`.
+///
+/// Synchronous: there is no await on this path (delivery is a non-blocking
+/// `try_send`), so it is cheap to call once per packet.
+fn drain_reassembly(
     reassembly: &mut ReassemblyBuffer,
     app_tx: &mpsc::Sender<Bytes>,
     conn_stats: &Arc<BondConnStats>,
     scratch: &mut Vec<DrainItem>,
     now: Instant,
     pending_nacks: &mut HashMap<u32, PendingNack>,
+    declare_lost: bool,
 ) {
     scratch.clear();
-    reassembly.drain_ready(now, scratch);
+    if declare_lost {
+        reassembly.drain_ready(now, scratch);
+    } else {
+        reassembly.deliver_ready(now, scratch);
+    }
     for item in scratch.drain(..) {
         match item {
             DrainItem::Delivered { data, bond_seq, .. } => {

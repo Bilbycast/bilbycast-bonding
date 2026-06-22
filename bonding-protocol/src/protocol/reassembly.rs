@@ -301,6 +301,33 @@ impl ReassemblyBuffer {
     /// `DrainItem::Lost` so stats and downstream consumers see the same
     /// sequence-number skip.
     pub fn drain_ready(&mut self, now: Instant, out: &mut Vec<DrainItem>) {
+        self.drain_inner(now, out, true);
+    }
+
+    /// Deliver only the in-order, hold-satisfied prefix from `base_seq`.
+    ///
+    /// Unlike [`drain_ready`], this never declares a gap `Lost` and never
+    /// advances past a missing seq — it stops at the first hole and leaves
+    /// it for a late retransmit / FEC repair. It is cheap enough to call on
+    /// every packet arrival, so a contiguous head is released within an
+    /// inter-packet gap of its hold-time expiry instead of waiting up to a
+    /// full timed pump tick (which is what quantised delivery into bursty
+    /// ~pump-interval clumps). Delivery still honours `hold_time` (the
+    /// reorder/recovery budget); only the pump-quantisation jitter is
+    /// removed. Loss declaration + NACK cadence stay exclusively on the
+    /// pump's [`drain_ready`], so recovery timing is unchanged.
+    ///
+    /// Single-writer: the receiver task owns the buffer and calls this and
+    /// `drain_ready` from the same `select!` loop, so the two never race.
+    pub fn deliver_ready(&mut self, now: Instant, out: &mut Vec<DrainItem>) {
+        self.drain_inner(now, out, false);
+    }
+
+    /// Shared drain core. `declare_lost` gates whether an aged-out gap — or
+    /// a base position that never arrived — is force-advanced as `Lost`.
+    /// With it `false`, draining stops at the first missing seq and only
+    /// the contiguous hold-satisfied prefix is delivered.
+    fn drain_inner(&mut self, now: Instant, out: &mut Vec<DrainItem>, declare_lost: bool) {
         loop {
             let base = match self.base_seq {
                 Some(b) => b,
@@ -314,6 +341,12 @@ impl ReassemblyBuffer {
             let idx = (base as usize) & self.mask;
             let slot = &mut self.slots[idx];
             if slot.seq != base {
+                // Base position never arrived. Only the timed pump gives
+                // up on it; the per-arrival path leaves it for a late
+                // retransmit / FEC repair within the hold budget.
+                if !declare_lost {
+                    return;
+                }
                 *slot = Slot {
                     seq: 0,
                     state: SlotState::Empty,
@@ -341,7 +374,9 @@ impl ReassemblyBuffer {
                     return;
                 }
                 SlotState::Gap { first_noticed } => {
-                    if now.saturating_duration_since(*first_noticed) >= self.hold_time {
+                    if declare_lost
+                        && now.saturating_duration_since(*first_noticed) >= self.hold_time
+                    {
                         slot.state = SlotState::Empty;
                         out.push(DrainItem::Lost { bond_seq: base });
                         self.base_seq = Some(base.wrapping_add(1));
@@ -440,6 +475,12 @@ mod tests {
         v
     }
 
+    fn deliver(buf: &mut ReassemblyBuffer, now: Instant) -> Vec<DrainItem> {
+        let mut v = Vec::new();
+        buf.deliver_ready(now, &mut v);
+        v
+    }
+
     fn delivered_only(items: &[DrainItem]) -> Vec<(u32, u8, u8)> {
         items
             .iter()
@@ -464,6 +505,63 @@ mod tests {
             delivered_only(&out),
             vec![(1000, 0, 1), (1001, 0, 2)]
         );
+    }
+
+    #[test]
+    fn deliver_ready_respects_hold_time_and_is_prompt() {
+        // deliver_ready never releases a packet earlier than drain_ready
+        // would (hold_time is the reorder budget), but once hold has
+        // elapsed it releases the contiguous head immediately — the
+        // per-arrival call that removes pump-quantisation jitter.
+        let mut buf = ReassemblyBuffer::new(Duration::from_millis(50));
+        let t0 = Instant::now();
+        buf.insert(1000, b(1), 0, t0);
+        buf.insert(1001, b(2), 0, t0);
+        // Before hold expiry: nothing (same floor as drain_ready).
+        assert!(deliver(&mut buf, t0).is_empty());
+        assert!(deliver(&mut buf, t0 + Duration::from_millis(49)).is_empty());
+        // After hold expiry: contiguous head out, no pump tick needed.
+        let out = deliver(&mut buf, t0 + Duration::from_millis(51));
+        assert_eq!(delivered_only(&out), vec![(1000, 0, 1), (1001, 0, 2)]);
+    }
+
+    #[test]
+    fn deliver_ready_never_declares_gap_lost() {
+        // The safety property: even with a gap aged well past hold_time,
+        // deliver_ready leaves it for the pump (a late retransmit / FEC
+        // repair may still fill it). drain_ready, by contrast, gives up.
+        let mut buf = ReassemblyBuffer::new(Duration::from_millis(50));
+        let t0 = Instant::now();
+        buf.insert(10, b(1), 0, t0);
+        buf.insert(12, b(3), 0, t0); // gap at 11
+        // Deliver 10 (head), then stop at the gap — long after hold.
+        let out = deliver(&mut buf, t0 + Duration::from_millis(500));
+        assert_eq!(delivered_only(&out), vec![(10, 0, 1)]);
+        // 11 must NOT have been declared Lost or skipped: a late arrival
+        // still lands and unblocks 12.
+        let late = buf.insert(11, b(2), 1, t0 + Duration::from_millis(600));
+        assert!(late.recovered, "gap must still be open for deliver_ready");
+        let out2 = deliver(&mut buf, t0 + Duration::from_millis(700));
+        assert_eq!(delivered_only(&out2), vec![(11, 1, 2), (12, 0, 3)]);
+    }
+
+    #[test]
+    fn deliver_ready_matches_drain_ready_on_clean_in_order_stream() {
+        // With no gaps, deliver_ready and drain_ready deliver the same
+        // sequence — the per-arrival path is a strict latency tightening,
+        // not a behaviour change, for the common case.
+        let hold = Duration::from_millis(40);
+        let t0 = Instant::now();
+        let mut a = ReassemblyBuffer::new(hold);
+        let mut d = ReassemblyBuffer::new(hold);
+        for i in 0..8u32 {
+            let seq = 500 + i;
+            let at = t0 + Duration::from_millis(i as u64);
+            a.insert(seq, b(i as u8), 0, at);
+            d.insert(seq, b(i as u8), 0, at);
+        }
+        let t_end = t0 + Duration::from_millis(100);
+        assert_eq!(delivered_only(&deliver(&mut a, t_end)), delivered_only(&drain(&mut d, t_end)));
     }
 
     #[test]
