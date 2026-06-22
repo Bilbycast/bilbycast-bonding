@@ -138,15 +138,24 @@ impl QuicPath {
             id,
             name.into(),
             endpoint,
-            conn,
+            Some(conn),
             Some(remote),
             false, // client: no server-side re-accept
         ))
     }
 
-    /// Server: bind to `local`, accept one connection, then pump
-    /// its datagrams into the bond loop. Only one connection is
-    /// accepted per path — additional connections go to fresh paths.
+    /// Server: bind to `local`, then accept the first client (and
+    /// re-accept on loss) in the **background** pump. Binding the endpoint
+    /// is all that's needed to build the path.
+    ///
+    /// Crucially this does **not** block on `accept()`. A bonded receiver
+    /// builds all its legs (`BondSocket::receiver` → `build_paths`) before
+    /// its receive loop starts; blocking here on a client that connects
+    /// late — or, for an over-provisioned receiver with more server legs
+    /// than the sender dials, *never* — would stall the entire bond build
+    /// forever, leaving every leg dead. Unlike UDP (which only binds), the
+    /// old blocking-accept made QUIC legs fragile to leg-count mismatch and
+    /// startup ordering.
     pub async fn server(
         id: PathId,
         name: impl Into<String>,
@@ -168,22 +177,13 @@ impl QuicPath {
         )
         .map_err(|e| PathError::Other(format!("quic endpoint: {e}")))?;
 
-        let incoming = endpoint
-            .accept()
-            .await
-            .ok_or_else(|| PathError::Other("quic endpoint closed before accept".into()))?;
-        let conn = incoming
-            .await
-            .map_err(|e| PathError::Other(format!("quic accept handshake: {e}")))?;
-        let peer = conn.remote_address();
-
         Ok(Self::spawn_rx_pump(
             id,
             name.into(),
             endpoint,
-            conn,
-            Some(peer),
-            true, // server: re-accept on connection loss (no poisoning)
+            None, // accept the first client in the background pump
+            None,
+            true, // server: (re-)accept on the endpoint, never blocking build
         ))
     }
 
@@ -197,13 +197,13 @@ impl QuicPath {
         id: PathId,
         name: String,
         endpoint: Endpoint,
-        conn: Connection,
+        conn: Option<Connection>,
         primary_peer: Option<SocketAddr>,
         re_accept: bool,
     ) -> Self {
         let (tx, rx) = mpsc::channel::<PathDatagram>(1024);
         let cancel = CancellationToken::new();
-        let shared_conn = Arc::new(ArcSwapOption::from(Some(Arc::new(conn.clone()))));
+        let shared_conn = Arc::new(ArcSwapOption::from(conn.clone().map(Arc::new)));
         let shared_peer = Arc::new(Mutex::new(primary_peer));
         let cancel_child = cancel.clone();
         let task_conn = shared_conn.clone();
@@ -211,12 +211,47 @@ impl QuicPath {
         let task_ep = endpoint.clone();
         let task_name = name.clone();
         let task = tokio::spawn(async move {
-            let mut current = conn;
-            let mut peer_for_from = primary_peer.unwrap_or_else(|| current.remote_address());
+            let mut current: Option<Connection> = conn;
             loop {
+                // Ensure we have a live connection. A server starts with
+                // `None` and accepts its first client here; both server and
+                // client re-establish after a drop (server re-accepts;
+                // client relies on bond liveness and breaks). Accepting in
+                // this background loop is what keeps `server()` from blocking
+                // the bond build.
+                let active = match current.clone() {
+                    Some(c) => c,
+                    None => {
+                        if !re_accept {
+                            break;
+                        }
+                        tokio::select! {
+                            _ = cancel_child.cancelled() => break,
+                            res = accept_next(&task_ep) => match res {
+                                Ok(new_conn) => {
+                                    let peer = new_conn.remote_address();
+                                    *task_peer.lock().await = Some(peer);
+                                    task_conn.store(Some(Arc::new(new_conn.clone())));
+                                    log::info!(
+                                        "quic server path '{task_name}' accepted from {peer}"
+                                    );
+                                    current = Some(new_conn);
+                                    continue;
+                                }
+                                Err(e) => {
+                                    log::warn!(
+                                        "quic server path '{task_name}' accept failed: {e}"
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                };
+                let peer_for_from = active.remote_address();
                 tokio::select! {
                     _ = cancel_child.cancelled() => break,
-                    r = current.read_datagram() => match r {
+                    r = active.read_datagram() => match r {
                         Ok(data) => {
                             let dg = PathDatagram { data, from: peer_for_from };
                             if tx.try_send(dg).is_err() {
@@ -224,32 +259,17 @@ impl QuicPath {
                             }
                         }
                         Err(e) => {
+                            task_conn.store(None);
+                            current = None;
                             if !re_accept {
                                 log::info!("quic path '{task_name}' rx stream ended: {e}");
                                 break;
                             }
-                            // Server: connection dropped — re-accept so the
-                            // leg can recover instead of being poisoned.
+                            // Server: connection dropped — loop re-accepts so
+                            // the leg recovers instead of being poisoned.
                             log::info!(
                                 "quic server path '{task_name}' connection ended ({e}); re-accepting"
                             );
-                            match accept_next(&task_ep).await {
-                                Ok(new_conn) => {
-                                    peer_for_from = new_conn.remote_address();
-                                    *task_peer.lock().await = Some(peer_for_from);
-                                    task_conn.store(Some(Arc::new(new_conn.clone())));
-                                    current = new_conn;
-                                    log::info!(
-                                        "quic server path '{task_name}' re-accepted from {peer_for_from}"
-                                    );
-                                }
-                                Err(e2) => {
-                                    log::warn!(
-                                        "quic server path '{task_name}' re-accept failed: {e2}"
-                                    );
-                                    break;
-                                }
-                            }
                         }
                     }
                 }
