@@ -20,7 +20,7 @@ use tokio::net::UdpSocket;
 use tokio::time::{sleep, timeout};
 
 use bonding_transport::{
-    BondSocket, BondSocketConfig, PacketHints, PathConfig, PathTransport, Priority,
+    BondSocket, BondSocketConfig, PacketHints, PathConfig, PathTransport,
     WeightedRttScheduler,
 };
 

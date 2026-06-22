@@ -76,6 +76,15 @@ pub(crate) fn spawn_receiver(
         let mux_tx = mux_tx.clone();
         tokio::spawn(async move {
             while let Some(dg) = path_rx.recv().await {
+                // Blocking handoff into the receiver-loop mux is deliberate
+                // on the MEDIA path: `.send().await` lets the 1024-deep mux
+                // (plus each path's 1024-deep rx) absorb a transient
+                // receiver-loop stall *losslessly*, whereas a drop-on-full
+                // `try_send` would shed media for a brief scheduler hiccup.
+                // The head-of-line coupling this trades away only bites
+                // under *sustained* overload, where loss is unavoidable
+                // anyway and the protocol's ARQ/FEC recover it. Keep this
+                // blocking — don't "optimise" it to try_send.
                 if mux_tx.send((path_id, dg)).await.is_err() {
                     break;
                 }

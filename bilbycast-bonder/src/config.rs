@@ -153,6 +153,15 @@ pub enum PathTransportSpec {
         addr: SocketAddr,
         server_name: String,
         tls: TlsCfg,
+        /// Client-only local source bind (`ip:port`, port usually 0) so a
+        /// multi-homed host can policy-route this leg out a chosen uplink.
+        /// Ignored on the server side (it binds `addr`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bind: Option<SocketAddr>,
+        /// Optional NIC pin (`"wwan0"`, `"eno4"`…) — same mechanism as the
+        /// UDP leg. See `docs/nic-pinning.md`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        interface: Option<String>,
     },
 }
 
@@ -269,6 +278,8 @@ fn translate_transport(t: &PathTransportSpec) -> anyhow::Result<TxPathTransport>
             addr,
             server_name,
             tls,
+            bind,
+            interface,
         } => {
             let tls_mode = match tls {
                 TlsCfg::SelfSigned => QuicTlsMode::SelfSigned,
@@ -303,6 +314,8 @@ fn translate_transport(t: &PathTransportSpec) -> anyhow::Result<TxPathTransport>
                 addr: *addr,
                 server_name: server_name.clone(),
                 tls: tls_mode,
+                bind: *bind,
+                interface: interface.clone(),
             }
         }
     })

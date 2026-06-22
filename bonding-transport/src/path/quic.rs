@@ -40,6 +40,7 @@ use quinn::{
     ClientConfig, Connection, Endpoint, EndpointConfig, ServerConfig, TokioRuntime,
     TransportConfig, crypto::rustls::{QuicClientConfig, QuicServerConfig},
 };
+use arc_swap::ArcSwapOption;
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
@@ -76,8 +77,11 @@ pub struct QuicPath {
     /// open the initial connection.
     endpoint: Endpoint,
     // Shared with the rx-pump task so a server path can swap in a fresh
-    // connection on re-accept (and `send()` then follows it).
-    conn: Arc<Mutex<Option<Connection>>>,
+    // connection on re-accept (and `send()` then follows it). Lock-free
+    // (`ArcSwapOption`, mirroring the UDP leg's socket hot-swap) so the
+    // per-datagram send path never takes a blocking lock — the rx-pump
+    // `store()`s a new connection on re-accept, the next send `load()`s it.
+    conn: Arc<ArcSwapOption<Connection>>,
     primary_peer: Arc<Mutex<Option<SocketAddr>>>,
     rx: Mutex<Option<mpsc::Receiver<PathDatagram>>>,
     cancel: CancellationToken,
@@ -199,7 +203,7 @@ impl QuicPath {
     ) -> Self {
         let (tx, rx) = mpsc::channel::<PathDatagram>(1024);
         let cancel = CancellationToken::new();
-        let shared_conn = Arc::new(Mutex::new(Some(conn.clone())));
+        let shared_conn = Arc::new(ArcSwapOption::from(Some(Arc::new(conn.clone()))));
         let shared_peer = Arc::new(Mutex::new(primary_peer));
         let cancel_child = cancel.clone();
         let task_conn = shared_conn.clone();
@@ -233,7 +237,7 @@ impl QuicPath {
                                 Ok(new_conn) => {
                                     peer_for_from = new_conn.remote_address();
                                     *task_peer.lock().await = Some(peer_for_from);
-                                    *task_conn.lock().await = Some(new_conn.clone());
+                                    task_conn.store(Some(Arc::new(new_conn.clone())));
                                     current = new_conn;
                                     log::info!(
                                         "quic server path '{task_name}' re-accepted from {peer_for_from}"
@@ -286,7 +290,10 @@ impl QuicPath {
     /// is below the payload — bond chunking should account for QUIC
     /// overhead (~35 bytes vs raw UDP).
     pub async fn send(&self, data: &[u8]) -> PathResult<()> {
-        let guard = self.conn.lock().await;
+        // Lock-free snapshot of the current connection — no await on a
+        // mutex on the per-datagram hot path. A re-accept swaps the next
+        // send onto the fresh connection.
+        let guard = self.conn.load();
         let Some(conn) = guard.as_ref() else {
             return Err(PathError::Other("quic connection closed".into()));
         };
@@ -314,10 +321,8 @@ impl QuicPath {
 impl Drop for QuicPath {
     fn drop(&mut self) {
         self.cancel.cancel();
-        if let Ok(mut g) = self.conn.try_lock() {
-            if let Some(conn) = g.take() {
-                conn.close(0u32.into(), b"bond path closed");
-            }
+        if let Some(conn) = self.conn.swap(None) {
+            conn.close(0u32.into(), b"bond path closed");
         }
         self.endpoint.close(0u32.into(), b"bond path closed");
     }
