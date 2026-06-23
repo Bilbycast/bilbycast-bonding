@@ -127,20 +127,22 @@ impl QuicPath {
         )
         .map_err(|e| PathError::Other(format!("quic client endpoint: {e}")))?;
         endpoint.set_default_client_config(client_cfg);
-        let connecting = endpoint
-            .connect(remote, server_name)
-            .map_err(|e| PathError::Other(format!("quic connect: {e}")))?;
-        let conn = connecting
-            .await
-            .map_err(|e| PathError::Other(format!("quic handshake: {e}")))?;
-
+        // Non-blocking: do NOT await the handshake here. The dial runs in the
+        // background pump (`Reconnect::ClientDial`) so building a bonded output
+        // never stalls ~25s on a leg whose uplink is down — and a leg that
+        // drops mid-stream (e.g. a Starlink satellite handover) re-dials itself
+        // and rejoins the LIVE bond, with no flow restart. The send path
+        // already tolerates a not-yet-connected leg (`send()` errors → the
+        // scheduler treats it as dead until the keepalive-ack revives it).
         Ok(Self::spawn_rx_pump(
             id,
             name.into(),
             endpoint,
-            Some(conn),
             Some(remote),
-            false, // client: no server-side re-accept
+            Reconnect::ClientDial {
+                remote,
+                server_name: server_name.to_string(),
+            },
         ))
     }
 
@@ -181,29 +183,28 @@ impl QuicPath {
             id,
             name.into(),
             endpoint,
-            None, // accept the first client in the background pump
-            None,
-            true, // server: (re-)accept on the endpoint, never blocking build
+            None, // server: peer is learned on accept
+            Reconnect::ServerAccept,
         ))
     }
 
-    /// `re_accept = true` (server paths): when the connection ends, accept
-    /// a fresh one on the same endpoint instead of dying — otherwise a
-    /// single closed connection poisons the server for the endpoint's
-    /// lifetime (the receiver could never re-attach a dropped leg without
-    /// a full restart). Client paths pass `false` (a dropped client is
-    /// handled by bond-level liveness, not a server-side accept).
+    /// Spawn the background pump that owns this path's connection lifecycle:
+    /// (re)establish per [`Reconnect`], then pump inbound datagrams into the
+    /// mpsc. Establishing in this task (never in `client()` / `server()`) is
+    /// what keeps `BondSocket::{sender,receiver}` from blocking on a slow or
+    /// down leg; the re-establish-on-drop loop is what lets a dropped leg
+    /// rejoin the live bond with no flow restart — both roles self-heal
+    /// (server re-accepts, client re-dials with backoff).
     fn spawn_rx_pump(
         id: PathId,
         name: String,
         endpoint: Endpoint,
-        conn: Option<Connection>,
         primary_peer: Option<SocketAddr>,
-        re_accept: bool,
+        reconnect: Reconnect,
     ) -> Self {
         let (tx, rx) = mpsc::channel::<PathDatagram>(1024);
         let cancel = CancellationToken::new();
-        let shared_conn = Arc::new(ArcSwapOption::from(conn.clone().map(Arc::new)));
+        let shared_conn: Arc<ArcSwapOption<Connection>> = Arc::new(ArcSwapOption::from(None));
         let shared_peer = Arc::new(Mutex::new(primary_peer));
         let cancel_child = cancel.clone();
         let task_conn = shared_conn.clone();
@@ -211,39 +212,50 @@ impl QuicPath {
         let task_ep = endpoint.clone();
         let task_name = name.clone();
         let task = tokio::spawn(async move {
-            let mut current: Option<Connection> = conn;
+            let mut current: Option<Connection> = None;
+            // 0 = (re)establish immediately (first attempt / right after a
+            // clean handoff); grows on repeated failure (client dial backoff).
+            let mut backoff = Duration::ZERO;
             loop {
-                // Ensure we have a live connection. A server starts with
-                // `None` and accepts its first client here; both server and
-                // client re-establish after a drop (server re-accepts;
-                // client relies on bond liveness and breaks). Accepting in
-                // this background loop is what keeps `server()` from blocking
-                // the bond build.
                 let active = match current.clone() {
                     Some(c) => c,
                     None => {
-                        if !re_accept {
-                            break;
+                        if !backoff.is_zero() {
+                            tokio::select! {
+                                _ = cancel_child.cancelled() => break,
+                                _ = tokio::time::sleep(backoff) => {}
+                            }
                         }
-                        tokio::select! {
-                            _ = cancel_child.cancelled() => break,
-                            res = accept_next(&task_ep) => match res {
-                                Ok(new_conn) => {
-                                    let peer = new_conn.remote_address();
-                                    *task_peer.lock().await = Some(peer);
-                                    task_conn.store(Some(Arc::new(new_conn.clone())));
-                                    log::info!(
-                                        "quic server path '{task_name}' accepted from {peer}"
-                                    );
-                                    current = Some(new_conn);
-                                    continue;
+                        let established = match &reconnect {
+                            Reconnect::ServerAccept => {
+                                tokio::select! {
+                                    _ = cancel_child.cancelled() => break,
+                                    res = accept_next(&task_ep) => res,
                                 }
-                                Err(e) => {
-                                    log::warn!(
-                                        "quic server path '{task_name}' accept failed: {e}"
-                                    );
-                                    break;
+                            }
+                            Reconnect::ClientDial { remote, server_name } => {
+                                tokio::select! {
+                                    _ = cancel_child.cancelled() => break,
+                                    res = dial(&task_ep, *remote, server_name) => res,
                                 }
+                            }
+                        };
+                        match established {
+                            Ok(new_conn) => {
+                                let peer = new_conn.remote_address();
+                                *task_peer.lock().await = Some(peer);
+                                task_conn.store(Some(Arc::new(new_conn.clone())));
+                                log::info!("quic path '{task_name}' connected ({peer})");
+                                current = Some(new_conn);
+                                backoff = Duration::ZERO;
+                                continue;
+                            }
+                            Err(e) => {
+                                backoff = next_backoff(backoff);
+                                log::warn!(
+                                    "quic path '{task_name}' (re)connect failed: {e}; retry in {backoff:?}"
+                                );
+                                continue;
                             }
                         }
                     }
@@ -259,16 +271,15 @@ impl QuicPath {
                             }
                         }
                         Err(e) => {
+                            // Connection ended — drop it and re-establish
+                            // (both roles). A small initial delay avoids a hot
+                            // loop when the remote is hard-down; the bond
+                            // keepalive marks the leg dead within ~1s meanwhile.
                             task_conn.store(None);
                             current = None;
-                            if !re_accept {
-                                log::info!("quic path '{task_name}' rx stream ended: {e}");
-                                break;
-                            }
-                            // Server: connection dropped — loop re-accepts so
-                            // the leg recovers instead of being poisoned.
+                            backoff = Duration::from_millis(250);
                             log::info!(
-                                "quic server path '{task_name}' connection ended ({e}); re-accepting"
+                                "quic path '{task_name}' connection ended ({e}); re-establishing"
                             );
                         }
                     }
@@ -345,6 +356,54 @@ impl Drop for QuicPath {
             conn.close(0u32.into(), b"bond path closed");
         }
         self.endpoint.close(0u32.into(), b"bond path closed");
+    }
+}
+
+// ── Connection lifecycle ────────────────────────────────────────────────────
+
+/// How a path (re)establishes its QUIC connection from the background pump.
+/// Both roles self-heal: a server re-accepts, a client re-dials with backoff.
+enum Reconnect {
+    /// Server leg: accept inbound connections on the endpoint (and re-accept
+    /// after a drop, so one closed connection doesn't poison the leg).
+    ServerAccept,
+    /// Client leg: dial `remote` presenting `server_name`, and re-dial with
+    /// backoff after a failure or drop — so a leg that's down at flow start,
+    /// or drops mid-stream (Starlink satellite handover), comes up / rejoins
+    /// the LIVE bond on its own, with no flow restart and no ~25s build stall.
+    ClientDial {
+        remote: SocketAddr,
+        server_name: String,
+    },
+}
+
+/// Client re-dial backoff: 250 ms → 8 s, doubling. A handful of legs don't
+/// warrant full jitter; the doubling alone keeps a hard-down remote from
+/// being hammered.
+fn next_backoff(cur: Duration) -> Duration {
+    if cur.is_zero() {
+        Duration::from_millis(250)
+    } else {
+        std::cmp::min(cur.saturating_mul(2), Duration::from_secs(8))
+    }
+}
+
+/// Dial a client connection with a bounded handshake timeout — well under the
+/// 25 s `max_idle_timeout` — so a dead remote fails fast and the bond's
+/// keepalive dead-detect can flip the scheduler off the leg promptly, rather
+/// than the leg sitting in a long handshake.
+async fn dial(
+    endpoint: &Endpoint,
+    remote: SocketAddr,
+    server_name: &str,
+) -> std::result::Result<Connection, String> {
+    let connecting = endpoint
+        .connect(remote, server_name)
+        .map_err(|e| format!("connect: {e}"))?;
+    match tokio::time::timeout(Duration::from_secs(6), connecting).await {
+        Ok(Ok(conn)) => Ok(conn),
+        Ok(Err(e)) => Err(format!("handshake: {e}")),
+        Err(_) => Err("handshake timed out (6s)".to_string()),
     }
 }
 
