@@ -222,6 +222,11 @@ where
     // per-leg ARQ. Shutdown is driven by `app_rx` close or `cancel`.
     let mut ctrl_open = true;
 
+    // Per-path edge-trigger so a QUIC leg's background re-dial surfaces ONE
+    // `PathReconnecting{reason}` event per down-episode (not one per retry).
+    let mut was_reconnecting: std::collections::HashMap<PathId, bool> =
+        std::collections::HashMap::new();
+
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
@@ -504,6 +509,27 @@ where
                         scheduler.on_path_dead(ev.path_id);
                     }
                     let _ = events_tx.send(ev);
+                }
+                // Surface QUIC self-redial: one PathReconnecting{reason} per
+                // down-episode so operators see WHY a leg won't come up (e.g.
+                // "handshake timed out"), beyond the generic PathDead.
+                for p in paths.iter() {
+                    let id = p.id();
+                    match p.reconnect_reason() {
+                        Some(reason) => {
+                            if !was_reconnecting.get(&id).copied().unwrap_or(false) {
+                                was_reconnecting.insert(id, true);
+                                let _ = events_tx.send(PathEvent {
+                                    path_id: id,
+                                    path_name: p.name().to_string(),
+                                    kind: PathEventKind::PathReconnecting { reason },
+                                });
+                            }
+                        }
+                        None => {
+                            was_reconnecting.insert(id, false);
+                        }
+                    }
                 }
             }
 

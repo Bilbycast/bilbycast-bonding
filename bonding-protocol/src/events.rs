@@ -24,6 +24,13 @@ pub enum PathEventKind {
         alive_count: usize,
         total: usize,
     },
+    /// A path's underlying link dropped or is failing to (re)establish and
+    /// the transport is re-dialing it in the background (see the QUIC client
+    /// self-redial). Carries the SPECIFIC cause (e.g. "handshake timed out")
+    /// so operators see *why* a leg won't come up — beyond the generic
+    /// keepalive-timeout `PathDead`. Fired once per down-episode, on the
+    /// transition into reconnecting.
+    PathReconnecting { reason: String },
     /// Bond dropped to exactly one alive path (from ≥ 2 alive).
     /// Fired once per transition into the degraded state.
     BondDegraded {

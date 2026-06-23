@@ -157,6 +157,19 @@ impl Path {
         }
     }
 
+    /// The current link-down / reconnect cause for this path, or `None`
+    /// when connected. Only QUIC legs self-redial and report a cause (e.g.
+    /// "handshake timed out"); UDP / RIST legs return `None`.
+    pub fn reconnect_reason(&self) -> Option<String> {
+        match self {
+            Path::Udp(_) => None,
+            #[cfg(feature = "path-rist")]
+            Path::Rist(_) => None,
+            #[cfg(feature = "path-quic")]
+            Path::Quic(p) => p.reconnect_reason(),
+        }
+    }
+
     /// The NIC-pin mechanism in effect for this path, if an
     /// `interface` was requested. Only UDP paths can be NIC-pinned;
     /// RIST / QUIC paths return `None`.

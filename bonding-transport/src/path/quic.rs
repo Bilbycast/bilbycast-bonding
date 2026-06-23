@@ -83,6 +83,11 @@ pub struct QuicPath {
     // `store()`s a new connection on re-accept, the next send `load()`s it.
     conn: Arc<ArcSwapOption<Connection>>,
     primary_peer: Arc<Mutex<Option<SocketAddr>>>,
+    // Lock-free "why is this leg not connected" reason. `None` while
+    // connected; `Some(cause)` while the rx-pump is (re)dialing after a
+    // failure/drop — e.g. "handshake timed out". Read by the sender to emit
+    // a `PathReconnecting` event so operators see the specific cause.
+    link_reason: Arc<ArcSwapOption<String>>,
     rx: Mutex<Option<mpsc::Receiver<PathDatagram>>>,
     cancel: CancellationToken,
     _task: tokio::task::JoinHandle<()>,
@@ -206,9 +211,11 @@ impl QuicPath {
         let cancel = CancellationToken::new();
         let shared_conn: Arc<ArcSwapOption<Connection>> = Arc::new(ArcSwapOption::from(None));
         let shared_peer = Arc::new(Mutex::new(primary_peer));
+        let shared_reason: Arc<ArcSwapOption<String>> = Arc::new(ArcSwapOption::from(None));
         let cancel_child = cancel.clone();
         let task_conn = shared_conn.clone();
         let task_peer = shared_peer.clone();
+        let task_reason = shared_reason.clone();
         let task_ep = endpoint.clone();
         let task_name = name.clone();
         let task = tokio::spawn(async move {
@@ -245,12 +252,14 @@ impl QuicPath {
                                 let peer = new_conn.remote_address();
                                 *task_peer.lock().await = Some(peer);
                                 task_conn.store(Some(Arc::new(new_conn.clone())));
+                                task_reason.store(None); // connected — clear the down reason
                                 log::info!("quic path '{task_name}' connected ({peer})");
                                 current = Some(new_conn);
                                 backoff = Duration::ZERO;
                                 continue;
                             }
                             Err(e) => {
+                                task_reason.store(Some(Arc::new(e.clone())));
                                 backoff = next_backoff(backoff);
                                 log::warn!(
                                     "quic path '{task_name}' (re)connect failed: {e}; retry in {backoff:?}"
@@ -276,6 +285,7 @@ impl QuicPath {
                             // loop when the remote is hard-down; the bond
                             // keepalive marks the leg dead within ~1s meanwhile.
                             task_conn.store(None);
+                            task_reason.store(Some(Arc::new(format!("connection ended: {e}"))));
                             current = None;
                             backoff = Duration::from_millis(250);
                             log::info!(
@@ -293,10 +303,19 @@ impl QuicPath {
             endpoint,
             conn: shared_conn,
             primary_peer: shared_peer,
+            link_reason: shared_reason,
             rx: Mutex::new(Some(rx)),
             cancel,
             _task: task,
         }
+    }
+
+    /// The most recent link-down/failure cause while this path is not
+    /// connected (e.g. "handshake timed out"), or `None` when connected.
+    /// Read by the sender to emit a `PathReconnecting` event so operators
+    /// see *why* a leg won't come up.
+    pub fn reconnect_reason(&self) -> Option<String> {
+        self.link_reason.load().as_ref().map(|s| s.to_string())
     }
 
     pub fn id(&self) -> PathId {

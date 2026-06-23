@@ -16,8 +16,8 @@ use tokio::net::UdpSocket;
 use tokio::time::timeout;
 
 use bonding_transport::{
-    BondSocket, BondSocketConfig, PacketHints, PathConfig, PathTransport, QuicRole,
-    QuicTlsMode, WeightedRttScheduler,
+    BondSocket, BondSocketConfig, PacketHints, PathConfig, PathEventKind, PathTransport,
+    QuicRole, QuicTlsMode, WeightedRttScheduler,
 };
 
 async fn free_port() -> u16 {
@@ -389,9 +389,30 @@ async fn quic_client_late_join_does_not_block_build() {
         "client build blocked on a down leg: {build_elapsed:?} (should be instant)"
     );
 
-    // Server still down — bring it up ~1.5s later. The leg should be
-    // re-dialing in the background the whole time.
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    // Subscribe BEFORE the down period so we catch the self-redial events.
+    let mut events = sender.subscribe_events();
+
+    // Keep the server down long enough for the first dial to fail (bounded at
+    // 6s) so the leg records its cause and a liveness tick surfaces it. A leg
+    // that was already up and *drops* records the cause immediately; a
+    // down-at-start leg only knows the cause once the first handshake times
+    // out, which is the slower path we deliberately exercise here.
+    tokio::time::sleep(Duration::from_millis(8000)).await;
+
+    // PR2: the background re-dial must surface a PathReconnecting event
+    // carrying the SPECIFIC cause, so an operator sees WHY the leg is down.
+    let mut saw_reconnecting_cause: Option<String> = None;
+    while let Ok(ev) = events.try_recv() {
+        if let PathEventKind::PathReconnecting { reason } = ev.kind {
+            saw_reconnecting_cause = Some(reason);
+        }
+    }
+    let cause = saw_reconnecting_cause
+        .expect("self-redial must emit PathReconnecting while the server is down");
+    assert!(
+        !cause.is_empty(),
+        "PathReconnecting must carry a non-empty cause"
+    );
 
     let rx_cfg = BondSocketConfig {
         flow_id: 21,
@@ -416,7 +437,7 @@ async fn quic_client_late_join_does_not_block_build() {
     let receiver = BondSocket::receiver(rx_cfg).await.unwrap();
 
     // Let the client's background dial find the now-up server and join.
-    tokio::time::sleep(Duration::from_millis(2500)).await;
+    tokio::time::sleep(Duration::from_millis(4000)).await;
 
     // The leg has joined the live bond — traffic now flows end to end.
     const N: u32 = 50;
