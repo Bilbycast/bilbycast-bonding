@@ -135,6 +135,10 @@ pub struct PathStats {
     /// Socket rebuilds performed on this path (interface churn /
     /// persistent send errors). UDP paths only — stays 0 elsewhere.
     pub rebuilds: AtomicU64,
+    /// Packets recovered by THIS leg's per-leg FEC (XOR or Reed-Solomon).
+    /// 0 when the leg has no per-leg FEC. Lets the operator see each leg's
+    /// proactive recovery separately from the aggregate `gaps_recovered`.
+    pub fec_recovered: AtomicU64,
 }
 
 impl PathStats {
@@ -162,6 +166,7 @@ impl PathStats {
             dead: self.dead.load(Ordering::Relaxed) != 0,
             pin_mechanism: self.pin_mechanism.load(Ordering::Relaxed),
             rebuilds: self.rebuilds.load(Ordering::Relaxed),
+            fec_recovered: self.fec_recovered.load(Ordering::Relaxed),
         }
     }
 }
@@ -188,6 +193,8 @@ pub struct PathStatsSnapshot {
     pub pin_mechanism: u64,
     /// Socket rebuilds performed on this path (UDP paths only).
     pub rebuilds: u64,
+    /// Packets recovered by this leg's per-leg FEC (0 without per-leg FEC).
+    pub fec_recovered: u64,
 }
 
 impl PathStatsSnapshot {

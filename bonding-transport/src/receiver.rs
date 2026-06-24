@@ -542,6 +542,13 @@ async fn receiver_loop(
                         let o = reassembly.insert(rseq, rpayload, path_id, fnow);
                         if o.recovered {
                             conn_stats.gaps_recovered.fetch_add(1, Ordering::Relaxed);
+                            // Per-leg FEC recovery — credit THIS leg so the
+                            // operator sees each leg's proactive recovery.
+                            if per_leg_mode {
+                                if let Some(ps) = path_idx.and_then(|i| path_stats.get(i)) {
+                                    ps.fec_recovered.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
                             pending_nacks.remove(&rseq);
                             if let Some(age) = o.recovered_age {
                                 if age > hold_window_max {
@@ -721,6 +728,11 @@ async fn receiver_loop(
                         let o = reassembly.insert(rseq, rpayload, path_id, fnow);
                         if o.recovered {
                             conn_stats.gaps_recovered.fetch_add(1, Ordering::Relaxed);
+                            if per_leg_mode {
+                                if let Some(ps) = path_idx.and_then(|i| path_stats.get(i)) {
+                                    ps.fec_recovered.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
                             pending_nacks.remove(&rseq);
                             if let Some(age) = o.recovered_age {
                                 if age > hold_window_max {
