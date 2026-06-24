@@ -90,6 +90,19 @@ impl Priority {
             _ => Priority::Normal,
         }
     }
+
+    /// Importance rank for redundancy thresholds: `Low < Normal < High <
+    /// Critical`. Distinct from the wire discriminant (`Low = 3`), which is
+    /// an enum tag, not an ordering.
+    #[inline]
+    pub fn rank(self) -> u8 {
+        match self {
+            Priority::Low => 0,
+            Priority::Normal => 1,
+            Priority::High => 2,
+            Priority::Critical => 3,
+        }
+    }
 }
 
 impl Default for Priority {

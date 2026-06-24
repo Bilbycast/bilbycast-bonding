@@ -69,6 +69,64 @@ impl PathSelection {
     }
 }
 
+/// How aggressively to replicate packets across legs for reliability.
+/// Replication trades bandwidth for loss-resilience: a packet sent on N
+/// legs survives as long as **any one** of them delivers it — the strongest
+/// recovery available, at the cost of N× the bandwidth for the replicated
+/// traffic. Orthogonal to FEC + ARQ (those recover *after* a loss; this
+/// avoids the loss in the first place for the packets that matter).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedundancyMode {
+    /// No extra replication. The scheduler's own keyframe handling still
+    /// applies (Critical/IDR packets duplicate across the 2 best legs).
+    /// Default — no added bandwidth.
+    Off,
+    /// Replicate **every** packet across the N best legs.
+    All,
+    /// Replicate packets whose priority is **at or above** this threshold
+    /// (by [`Priority::rank`]). E.g. `AtOrAbove(High)` replicates High +
+    /// Critical and leaves Normal/Low single.
+    AtOrAbove(Priority),
+}
+
+/// Redundancy policy: a [`RedundancyMode`] plus how many legs to spread the
+/// replicas across.
+#[derive(Debug, Clone, Copy)]
+pub struct RedundancyPolicy {
+    pub mode: RedundancyMode,
+    /// Number of legs to replicate across (the N best). Clamped at runtime
+    /// to `[2, live_path_count]`.
+    pub replicas: usize,
+}
+
+impl Default for RedundancyPolicy {
+    fn default() -> Self {
+        Self {
+            mode: RedundancyMode::Off,
+            replicas: 2,
+        }
+    }
+}
+
+impl RedundancyPolicy {
+    /// Whether a packet of this priority should be replicated under this
+    /// policy. Independent of the always-on Critical/IDR duplication.
+    #[inline]
+    pub fn triggers(&self, priority: Priority) -> bool {
+        match self.mode {
+            RedundancyMode::Off => false,
+            RedundancyMode::All => true,
+            RedundancyMode::AtOrAbove(t) => priority.rank() >= t.rank(),
+        }
+    }
+
+    /// Effective replica count, clamped to `[2, live]`.
+    #[inline]
+    pub fn replicas_clamped(&self, live: usize) -> usize {
+        self.replicas.max(2).min(live.max(1))
+    }
+}
+
 /// Scheduler trait. Implementors own mutable per-scheduler state and
 /// are driven by the bonding transport sender task.
 pub trait BondScheduler: Send {
@@ -77,6 +135,10 @@ pub trait BondScheduler: Send {
 
     /// Called once per outbound packet.
     fn schedule(&mut self, hints: &PacketHints) -> PathSelection;
+
+    /// Configure redundant replication. Default: no-op (a scheduler that
+    /// doesn't support it ignores the policy; Critical-dup still applies).
+    fn set_redundancy(&mut self, _policy: RedundancyPolicy) {}
 
     /// Called when a path's health snapshot changes (≤ 1 Hz).
     ///
@@ -113,6 +175,7 @@ pub struct RoundRobinScheduler {
     paths: Vec<PathId>,
     dead: Vec<bool>,
     cursor: usize,
+    redundancy: RedundancyPolicy,
 }
 
 impl RoundRobinScheduler {
@@ -122,6 +185,7 @@ impl RoundRobinScheduler {
             paths,
             dead: vec![false; n],
             cursor: 0,
+            redundancy: RedundancyPolicy::default(),
         }
     }
 
@@ -139,12 +203,12 @@ impl RoundRobinScheduler {
         None
     }
 
-    fn lowest_two_alive(&self) -> Vec<PathId> {
+    fn lowest_n_alive(&self, n: usize) -> Vec<PathId> {
         self.paths
             .iter()
             .enumerate()
             .filter_map(|(i, p)| if !self.dead[i] { Some(*p) } else { None })
-            .take(2)
+            .take(n.max(1))
             .collect()
     }
 }
@@ -155,8 +219,18 @@ impl BondScheduler for RoundRobinScheduler {
     }
 
     fn schedule(&mut self, hints: &PacketHints) -> PathSelection {
+        // Explicit redundancy: replicate across the N best alive legs.
+        if self.redundancy.triggers(hints.priority) {
+            let live = self.dead.iter().filter(|d| !**d).count();
+            let dup = self.lowest_n_alive(self.redundancy.replicas_clamped(live));
+            return match dup.len() {
+                0 => PathSelection::Drop,
+                1 => PathSelection::Single(dup[0]),
+                _ => PathSelection::Duplicate(dup),
+            };
+        }
         if hints.priority == Priority::Critical {
-            let dup = self.lowest_two_alive();
+            let dup = self.lowest_n_alive(2);
             if dup.is_empty() {
                 return PathSelection::Drop;
             }
@@ -169,6 +243,10 @@ impl BondScheduler for RoundRobinScheduler {
             Some(p) => PathSelection::Single(p),
             None => PathSelection::Drop,
         }
+    }
+
+    fn set_redundancy(&mut self, policy: RedundancyPolicy) {
+        self.redundancy = policy;
     }
 
     fn on_path_dead(&mut self, path_id: PathId) {
@@ -207,6 +285,7 @@ pub struct WeightedRttScheduler {
     /// Maximum weight (tuned for a 4-path bond — 1 000 lets a path
     /// with 5 ms RTT dominate a 500 ms path ~100:1).
     max_weight: u32,
+    redundancy: RedundancyPolicy,
 }
 
 impl WeightedRttScheduler {
@@ -219,6 +298,7 @@ impl WeightedRttScheduler {
             tokens: vec![0i64; n],
             min_weight: 1,
             max_weight: 1_000,
+            redundancy: RedundancyPolicy::default(),
         }
     }
 
@@ -272,6 +352,17 @@ impl BondScheduler for WeightedRttScheduler {
             return PathSelection::Drop;
         }
 
+        // Explicit redundancy: replicate across the N lowest-RTT alive legs.
+        if self.redundancy.triggers(hints.priority) {
+            let live = self.dead.iter().filter(|d| !**d).count();
+            let dup = self.lowest_rtt_alive(self.redundancy.replicas_clamped(live));
+            return match dup.len() {
+                0 => PathSelection::Drop,
+                1 => PathSelection::Single(dup[0]),
+                _ => PathSelection::Duplicate(dup),
+            };
+        }
+
         if hints.priority == Priority::Critical {
             let dup = self.lowest_rtt_alive(2);
             if dup.is_empty() {
@@ -301,6 +392,10 @@ impl BondScheduler for WeightedRttScheduler {
         };
         self.tokens[idx] -= sum;
         PathSelection::Single(self.paths[idx])
+    }
+
+    fn set_redundancy(&mut self, policy: RedundancyPolicy) {
+        self.redundancy = policy;
     }
 
     fn on_path_update(&mut self, path_id: PathId, health: &PathHealth) {
@@ -380,6 +475,55 @@ mod tests {
         match s.schedule(&hints) {
             PathSelection::Duplicate(paths) => assert_eq!(paths, vec![0, 1]),
             other => panic!("expected Duplicate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn redundancy_policy_triggers_by_priority() {
+        let p = RedundancyPolicy {
+            mode: RedundancyMode::AtOrAbove(Priority::High),
+            replicas: 3,
+        };
+        assert!(!p.triggers(Priority::Low));
+        assert!(!p.triggers(Priority::Normal));
+        assert!(p.triggers(Priority::High));
+        assert!(p.triggers(Priority::Critical));
+        let all = RedundancyPolicy { mode: RedundancyMode::All, replicas: 2 };
+        assert!(all.triggers(Priority::Normal) && all.triggers(Priority::Low));
+        let off = RedundancyPolicy::default();
+        assert!(!off.triggers(Priority::Critical), "off never triggers extra dup");
+        assert_eq!(off.replicas_clamped(3), 2, "clamps up to a 2-leg minimum");
+        assert_eq!(all.replicas_clamped(1), 1, "clamps down to live count");
+    }
+
+    #[test]
+    fn redundancy_all_replicates_normal_packets() {
+        // Off → a Normal packet goes single.
+        let mut s = RoundRobinScheduler::new(vec![0, 1, 2]);
+        let normal = PacketHints { priority: Priority::Normal, ..Default::default() };
+        assert!(matches!(s.schedule(&normal), PathSelection::Single(_)));
+
+        // All across 3 → the same Normal packet replicates across 3 legs.
+        s.set_redundancy(RedundancyPolicy { mode: RedundancyMode::All, replicas: 3 });
+        match s.schedule(&normal) {
+            PathSelection::Duplicate(paths) => assert_eq!(paths, vec![0, 1, 2]),
+            other => panic!("expected Duplicate across 3, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn redundancy_threshold_leaves_normal_single_dups_high() {
+        let mut s = WeightedRttScheduler::new(vec![0, 1, 2]);
+        s.set_redundancy(RedundancyPolicy {
+            mode: RedundancyMode::AtOrAbove(Priority::High),
+            replicas: 2,
+        });
+        let normal = PacketHints { priority: Priority::Normal, ..Default::default() };
+        let high = PacketHints { priority: Priority::High, ..Default::default() };
+        assert!(matches!(s.schedule(&normal), PathSelection::Single(_)), "Normal stays single");
+        match s.schedule(&high) {
+            PathSelection::Duplicate(p) => assert_eq!(p.len(), 2),
+            other => panic!("expected High to duplicate, got {other:?}"),
         }
     }
 

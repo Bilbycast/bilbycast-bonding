@@ -60,8 +60,8 @@ pub use bonding_protocol::{
         fec::{FecDecoder, FecEncoder, FecParams, FecRepair},
         path_health::PathHealth,
         scheduler::{
-            BondScheduler, PacketHints, PathId, PathSelection, RoundRobinScheduler,
-            WeightedRttScheduler,
+            BondScheduler, PacketHints, PathId, PathSelection, RedundancyMode,
+            RedundancyPolicy, RoundRobinScheduler, WeightedRttScheduler,
         },
     },
     stats::{BondConnStats, BondConnStatsSnapshot, PathStats, PathStatsSnapshot},

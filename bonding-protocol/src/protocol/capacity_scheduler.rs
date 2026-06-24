@@ -66,7 +66,9 @@ use std::time::{Duration, Instant};
 use crate::packet::Priority;
 
 use super::path_health::PathHealth;
-use super::scheduler::{BondScheduler, PacketHints, PathId, PathSelection};
+use super::scheduler::{
+    BondScheduler, PacketHints, PathId, PathSelection, RedundancyPolicy,
+};
 
 /// Approximate per-packet wire overhead (bond header) charged against a
 /// path's token bucket in addition to the payload size. Keeps the
@@ -330,6 +332,8 @@ pub struct CapacityAwareScheduler {
     /// [`Self::capacity_handles`] so the edge can publish it as telemetry
     /// after the scheduler is moved into the sender task.
     capacity_pub: Vec<Arc<AtomicU64>>,
+    /// Operator redundancy policy (replicate across N best legs).
+    redundancy: RedundancyPolicy,
 }
 
 impl CapacityAwareScheduler {
@@ -371,6 +375,7 @@ impl CapacityAwareScheduler {
             sched_serial: 0,
             oversubscribed_drops: 0,
             capacity_pub,
+            redundancy: RedundancyPolicy::default(),
         }
     }
 
@@ -453,6 +458,25 @@ impl CapacityAwareScheduler {
         best
     }
 
+    /// The `n` best alive legs by score (best-first), for explicit
+    /// redundancy. Not afford-gated — replication is a deliberate bandwidth
+    /// spend — but the caller still debits each leg's token bucket so the
+    /// controller sees the added load.
+    fn best_n_alive(&self, n: usize) -> Vec<usize> {
+        let burst = self.cfg.burst_secs;
+        let mut scored: Vec<(usize, f64)> = self
+            .paths
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.alive)
+            .map(|(i, p)| (i, p.score(burst, p.effective_delay_thresh(&self.cfg))))
+            .collect();
+        scored.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        scored.into_iter().take(n.max(1)).map(|(i, _)| i).collect()
+    }
+
     /// Path with the most tokens (least debt) among alive, for the
     /// over-subscription fallback. Same rotating-cursor tie-break as
     /// [`Self::best`].
@@ -494,6 +518,28 @@ impl CapacityAwareScheduler {
         self.sched_serial = self.sched_serial.wrapping_add(1);
 
         let need = self.need_bytes(hints);
+
+        // Explicit redundancy: replicate across the N best alive legs. Takes
+        // precedence over the always-on Critical/IDR dup below.
+        if self.redundancy.triggers(hints.priority) {
+            let live = self.paths.iter().filter(|p| p.alive).count();
+            let idxs = self.best_n_alive(self.redundancy.replicas_clamped(live));
+            if idxs.is_empty() {
+                self.oversubscribed_drops += 1;
+                return PathSelection::Drop;
+            }
+            let mut ids = Vec::with_capacity(idxs.len());
+            for &i in &idxs {
+                self.paths[i].tokens -= need;
+                self.paths[i].picked_since_update = true;
+                ids.push(self.paths[i].id);
+            }
+            return if ids.len() == 1 {
+                PathSelection::Single(ids[0])
+            } else {
+                PathSelection::Duplicate(ids)
+            };
+        }
 
         if hints.priority == Priority::Critical {
             // Duplicate across the two best paths for keyframe-grade
@@ -574,6 +620,10 @@ impl BondScheduler for CapacityAwareScheduler {
         // to tick on a fixed cadence — the dt-based refill is idempotent
         // with on_tick.
         self.schedule_at(hints, Instant::now())
+    }
+
+    fn set_redundancy(&mut self, policy: RedundancyPolicy) {
+        self.redundancy = policy;
     }
 
     fn on_path_update(&mut self, path_id: PathId, health: &PathHealth) {
@@ -741,6 +791,28 @@ mod tests {
     }
 
     /// A clean path with a measured delivered rate probes its capacity
+    /// Redundancy `All` replicates a Normal packet across the N best legs on
+    /// the production (capacity-aware) scheduler.
+    #[test]
+    fn capacity_redundancy_all_replicates() {
+        let mut s = CapacityAwareScheduler::new(vec![0, 1, 2]);
+        let normal = PacketHints { priority: Priority::Normal, ..Default::default() };
+        assert!(matches!(s.schedule(&normal), PathSelection::Single(_)), "off → single");
+        s.set_redundancy(RedundancyPolicy {
+            mode: crate::protocol::scheduler::RedundancyMode::All,
+            replicas: 3,
+        });
+        match s.schedule(&normal) {
+            PathSelection::Duplicate(ids) => {
+                assert_eq!(ids.len(), 3, "replicates across all 3 legs");
+                let mut sorted = ids.clone();
+                sorted.sort();
+                assert_eq!(sorted, vec![0, 1, 2], "distinct legs");
+            }
+            other => panic!("expected Duplicate, got {other:?}"),
+        }
+    }
+
     /// estimate upward over successive health samples.
     #[test]
     fn clean_path_probes_capacity_up() {
