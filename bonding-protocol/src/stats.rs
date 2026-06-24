@@ -139,6 +139,22 @@ pub struct PathStats {
     /// 0 when the leg has no per-leg FEC. Lets the operator see each leg's
     /// proactive recovery separately from the aggregate `gaps_recovered`.
     pub fec_recovered: AtomicU64,
+    /// Wire bytes of proactive **FEC repair** datagrams emitted on this
+    /// leg (combined or per-leg FEC), including each repair's bond header
+    /// and the per-leg AEAD envelope when encryption is on. Deliberately
+    /// kept OUT of `bytes_sent`: the congestion controller differences
+    /// media/retx bytes only, and folding FEC in would read as loss
+    /// (sent > delivered) and trigger false backoff. Surfaced purely as
+    /// redundancy-overhead telemetry — 0 when FEC is off.
+    pub fec_bytes_sent: AtomicU64,
+    /// Total wire bytes actually put on this leg in the send direction:
+    /// media + retransmits + duplicates + FEC repair, each including its
+    /// bond header and (on an encrypted UDP leg) the 29-byte AEAD
+    /// envelope. The honest per-leg wire load — `bytes_sent` plus the
+    /// FEC + encryption overhead the media counter omits. Excludes only
+    /// the OS-level UDP/QUIC/IP framing below the bond. Sender-side only
+    /// (stays 0 on a receive-only leg).
+    pub wire_bytes_sent: AtomicU64,
 }
 
 impl PathStats {
@@ -167,6 +183,8 @@ impl PathStats {
             pin_mechanism: self.pin_mechanism.load(Ordering::Relaxed),
             rebuilds: self.rebuilds.load(Ordering::Relaxed),
             fec_recovered: self.fec_recovered.load(Ordering::Relaxed),
+            fec_bytes_sent: self.fec_bytes_sent.load(Ordering::Relaxed),
+            wire_bytes_sent: self.wire_bytes_sent.load(Ordering::Relaxed),
         }
     }
 }
@@ -195,6 +213,10 @@ pub struct PathStatsSnapshot {
     pub rebuilds: u64,
     /// Packets recovered by this leg's per-leg FEC (0 without per-leg FEC).
     pub fec_recovered: u64,
+    /// Wire bytes of FEC repair datagrams emitted on this leg (0 without FEC).
+    pub fec_bytes_sent: u64,
+    /// Total wire bytes (media + retx + dup + FEC + AEAD envelope) on this leg.
+    pub wire_bytes_sent: u64,
 }
 
 impl PathStatsSnapshot {

@@ -356,7 +356,7 @@ where
                                         rep.serialize(&mut fec_payload);
                                         send_fec_frame(
                                             flow_id, seq, pid, idx, &fec_payload,
-                                            &mut fec_frame, &paths,
+                                            &mut fec_frame, &paths, &path_stats,
                                         )
                                         .await;
                                     }
@@ -366,7 +366,7 @@ where
                                         rep.serialize(&mut fec_payload);
                                         send_fec_frame(
                                             flow_id, seq, pid, idx, &fec_payload,
-                                            &mut fec_frame, &paths,
+                                            &mut fec_frame, &paths, &path_stats,
                                         )
                                         .await;
                                     }
@@ -404,6 +404,17 @@ where
                                             Some(peer) => path.send_to(&fec_frame, peer).await,
                                             None => path.send(&fec_frame).await,
                                         };
+                                        // Surface the repair as redundancy
+                                        // overhead: fec_bytes_sent (separate from
+                                        // the media counter / controller) and the
+                                        // leg's true-wire total.
+                                        if let Some(ps) = path_stats.get(pos) {
+                                            let wire = (fec_frame.len()
+                                                + path.wire_overhead_per_datagram())
+                                                as u64;
+                                            ps.fec_bytes_sent.fetch_add(wire, Ordering::Relaxed);
+                                            ps.wire_bytes_sent.fetch_add(wire, Ordering::Relaxed);
+                                        }
                                     }
                                 }
                             }
@@ -559,6 +570,15 @@ where
                                                 ps.retransmits_sent.fetch_add(1, Ordering::Relaxed);
                                                 ps.bytes_sent
                                                     .fetch_add(retx.len() as u64, Ordering::Relaxed);
+                                                // Retransmits ride the media counter
+                                                // (recovery, not pure overhead) but still
+                                                // add to the leg's true wire total.
+                                                ps.wire_bytes_sent.fetch_add(
+                                                    (retx.len()
+                                                        + path.wire_overhead_per_datagram())
+                                                        as u64,
+                                                    Ordering::Relaxed,
+                                                );
                                             }
                                             conn_stats
                                                 .packets_retransmitted
@@ -677,6 +697,7 @@ where
 /// Send one per-leg FEC repair on a specific leg. FEC bytes are NOT counted
 /// in the per-path media byte counter (that would read as loss to the
 /// congestion controller and trigger false backoff).
+#[allow(clippy::too_many_arguments)]
 async fn send_fec_frame(
     flow_id: u32,
     seq: u32,
@@ -685,6 +706,7 @@ async fn send_fec_frame(
     payload: &[u8],
     frame: &mut BytesMut,
     paths: &[Path],
+    path_stats: &[Arc<PathStats>],
 ) {
     let mut header = BondHeader::new(flow_id, seq, pid, Priority::Normal);
     header.set_fec();
@@ -694,6 +716,13 @@ async fn send_fec_frame(
             Some(peer) => path.send_to(frame, peer).await,
             None => path.send(frame).await,
         };
+        // Redundancy-overhead telemetry only — never folded into the
+        // media `bytes_sent` counter the controller differences.
+        if let Some(ps) = path_stats.get(idx) {
+            let wire = (frame.len() + path.wire_overhead_per_datagram()) as u64;
+            ps.fec_bytes_sent.fetch_add(wire, Ordering::Relaxed);
+            ps.wire_bytes_sent.fetch_add(wire, Ordering::Relaxed);
+        }
     }
 }
 
@@ -746,6 +775,12 @@ async fn send_on_path(
                 ps.packets_sent.fetch_add(1, Ordering::Relaxed);
                 ps.bytes_sent
                     .fetch_add(frame_scratch.len() as u64, Ordering::Relaxed);
+                // True wire bytes: the media frame plus the AEAD envelope
+                // an encrypted leg adds after the media counter is taken.
+                ps.wire_bytes_sent.fetch_add(
+                    (frame_scratch.len() + path.wire_overhead_per_datagram()) as u64,
+                    Ordering::Relaxed,
+                );
             }
             path_sent_counter[idx] = path_sent_counter[idx].wrapping_add(1);
             false

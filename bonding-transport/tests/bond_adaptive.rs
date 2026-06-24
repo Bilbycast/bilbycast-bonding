@@ -234,6 +234,26 @@ async fn fec_recovers_sparse_loss_without_arq() {
         "with 1 recoverable loss/block + FEC, nothing should be lost (recovered={}, lost={}, delivered={})",
         s.gaps_recovered, s.gaps_lost, s.packets_delivered
     );
+
+    // FEC bandwidth telemetry: the repairs the receiver just used to
+    // recover must register on the sender's new per-leg FEC + wire
+    // counters — and must NOT have polluted the media `bytes_sent`
+    // counter the congestion controller differences (folding FEC in
+    // would read as loss > delivered and trip false backoff).
+    let mut fec_bytes = 0u64;
+    let mut media_bytes = 0u64;
+    let mut wire_bytes = 0u64;
+    for pid in sender.path_ids() {
+        let ps = sender.path_stats(*pid).unwrap().snapshot();
+        fec_bytes += ps.fec_bytes_sent;
+        media_bytes += ps.bytes_sent;
+        wire_bytes += ps.wire_bytes_sent;
+    }
+    assert!(fec_bytes > 0, "combined FEC must record repair wire bytes, got 0");
+    assert!(
+        wire_bytes >= media_bytes + fec_bytes,
+        "true wire bytes ({wire_bytes}) must cover media ({media_bytes}) + FEC ({fec_bytes})"
+    );
 }
 
 /// UDP relay that drops a single BURST of `burst` consecutive media
@@ -363,6 +383,19 @@ async fn per_leg_fec_recovers_leg_burst_without_arq() {
         s.gaps_lost, 0,
         "a burst within `columns` is fully recoverable per-leg (recovered={}, lost={}, delivered={})",
         s.gaps_recovered, s.gaps_lost, s.packets_delivered
+    );
+
+    // Per-leg FEC rides the SAME leg it protects (leg 0 here), so leg 0's
+    // FEC + wire counters must move while its media counter stays clean.
+    let ps = sender.path_stats(0).unwrap().snapshot();
+    assert!(
+        ps.fec_bytes_sent > 0,
+        "per-leg FEC must record repair wire bytes on leg 0, got 0"
+    );
+    assert!(
+        ps.wire_bytes_sent >= ps.bytes_sent + ps.fec_bytes_sent,
+        "leg 0 wire bytes ({}) must cover media ({}) + FEC ({})",
+        ps.wire_bytes_sent, ps.bytes_sent, ps.fec_bytes_sent
     );
 }
 

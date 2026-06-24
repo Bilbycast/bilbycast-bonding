@@ -127,6 +127,22 @@ impl Path {
         }
     }
 
+    /// Per-datagram wire overhead this path adds below the bond frame
+    /// (the AEAD envelope on an encrypted UDP leg). The sender folds this
+    /// into the true-wire-bytes counter. QUIC carries its own TLS framing
+    /// below the datagram API (not visible / counted here) and RIST is not
+    /// an aggregation leg — both report 0.
+    #[inline]
+    pub fn wire_overhead_per_datagram(&self) -> usize {
+        match self {
+            Path::Udp(p) => p.wire_overhead_per_datagram(),
+            #[cfg(feature = "path-rist")]
+            Path::Rist(_) => 0,
+            #[cfg(feature = "path-quic")]
+            Path::Quic(_) => 0,
+        }
+    }
+
     pub fn take_rx(&mut self) -> Option<mpsc::Receiver<PathDatagram>> {
         match self {
             Path::Udp(p) => p.take_rx(),

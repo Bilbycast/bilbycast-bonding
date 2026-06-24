@@ -562,6 +562,21 @@ impl UdpPath {
             .map_err(PathError::Send)
     }
 
+    /// Per-datagram wire overhead this path adds below the bond frame.
+    /// On an encrypted UDP leg every datagram is wrapped in the 29-byte
+    /// `BondCrypto` AEAD envelope after the byte counter is taken, so the
+    /// sender folds this into its true-wire-bytes accounting. 0 when the
+    /// leg is unencrypted. (OS-level UDP/IP headers are below this and not
+    /// counted — no app-layer bitrate in the stack counts them.)
+    #[inline]
+    pub fn wire_overhead_per_datagram(&self) -> usize {
+        if self.crypto.is_some() {
+            crate::crypto::ENVELOPE_OVERHEAD
+        } else {
+            0
+        }
+    }
+
     pub fn take_rx(&mut self) -> Option<mpsc::Receiver<PathDatagram>> {
         self.rx.get_mut().take()
     }
