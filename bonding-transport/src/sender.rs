@@ -192,8 +192,8 @@ where
         .map(|p| {
             per_path_fec.get(&p.id()).map(|kind| match kind {
                 PerLegFecKind::Xor(prm) => LegEnc::Xor(PerLegFecEncoder::new(*prm)),
-                PerLegFecKind::ReedSolomon { data, parity } => {
-                    LegEnc::Rs(PerLegRsEncoder::new(*data, *parity))
+                PerLegFecKind::ReedSolomon { data, parity, parity_max } => {
+                    LegEnc::Rs(PerLegRsEncoder::new_adaptive(*data, *parity, *parity_max))
                 }
             })
         })
@@ -505,6 +505,13 @@ where
                                         queue_depth: 0,
                                     };
                                     scheduler.on_path_update(path_id, &health);
+                                    // Adaptive per-leg RS: scale this leg's
+                                    // parity with its measured loss.
+                                    if let Some(Some(LegEnc::Rs(enc))) =
+                                        per_leg_encoders.get_mut(idx)
+                                    {
+                                        enc.set_loss(loss_rate);
+                                    }
                                     // Liveness: a fresh ack revives this
                                     // path if it was dead. Also tell the
                                     // scheduler so weights restore.

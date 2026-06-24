@@ -270,22 +270,52 @@ fn unpad_shard(shard: &[u8]) -> Option<Bytes> {
     Some(Bytes::copy_from_slice(&shard[2..2 + len]))
 }
 
+/// Per-leg loss fraction (0..1) at/above which an adaptive RS encoder uses
+/// its maximum parity. Below it, parity interpolates from the minimum.
+const ADAPT_FULL_LOSS: f32 = 0.10;
+
 /// Per-leg RS sender-side encoder. Feed every packet sent on this leg; emits
-/// `m` repairs once a `k`-packet block fills.
+/// `m` repairs once a `k`-packet block fills. When `m_max > m_min`, `m` is
+/// **adaptive** — it scales with the leg's recent loss via [`Self::set_loss`].
 pub struct PerLegRsEncoder {
     k: usize,
-    m: usize,
+    m_min: usize,
+    m_max: usize,
+    m_cur: usize,
     block: Vec<(u32, Bytes)>,
 }
 
 impl PerLegRsEncoder {
-    /// `data` = k (≥ 1), `parity` = m (≥ 1), `k + m ≤ 256`.
+    /// Fixed-parity RS: `data` = k (≥ 1), `parity` = m (≥ 1), `k + m ≤ 256`.
     pub fn new(data: u16, parity: u16) -> Self {
+        Self::new_adaptive(data, parity, parity)
+    }
+
+    /// Adaptive RS: parity scales in `[parity_min, parity_max]` with the leg's
+    /// recent loss (see [`Self::set_loss`]). `parity_max == parity_min` is the
+    /// fixed case.
+    pub fn new_adaptive(data: u16, parity_min: u16, parity_max: u16) -> Self {
+        let lo = parity_min.max(1) as usize;
+        let hi = (parity_max.max(parity_min)).max(1) as usize;
         Self {
             k: (data.max(1)) as usize,
-            m: (parity.max(1)) as usize,
+            m_min: lo,
+            m_max: hi,
+            m_cur: lo,
             block: Vec::with_capacity(data as usize),
         }
+    }
+
+    /// Update the parity strength from the leg's recent loss fraction. No-op
+    /// for a fixed encoder. Higher loss → more parity (more recoverable
+    /// losses per block), bounded by the operator's `[min, max]` envelope.
+    pub fn set_loss(&mut self, loss: f32) {
+        if self.m_max <= self.m_min {
+            return;
+        }
+        let frac = (loss.max(0.0) / ADAPT_FULL_LOSS).min(1.0);
+        let span = (self.m_max - self.m_min) as f32;
+        self.m_cur = self.m_min + (span * frac).round() as usize;
     }
 
     pub fn push(&mut self, bond_seq: u32, payload: &Bytes) -> Vec<PerLegRsRepair> {
@@ -295,17 +325,18 @@ impl PerLegRsEncoder {
         }
         let group = std::mem::take(&mut self.block);
         self.block = Vec::with_capacity(self.k);
+        let m = self.m_cur.clamp(self.m_min, self.m_max);
         let max_payload = group.iter().map(|(_, p)| p.len()).max().unwrap_or(0);
         let shard_len = 2 + max_payload;
         let data: Vec<Vec<u8>> = group.iter().map(|(_, p)| pad_shard(p, shard_len)).collect();
-        let parity = rs_encode(self.k, self.m, &data, shard_len);
+        let parity = rs_encode(self.k, m, &data, shard_len);
         let seqs: Vec<u32> = group.iter().map(|(s, _)| *s).collect();
         parity
             .into_iter()
             .enumerate()
             .map(|(idx, par)| PerLegRsRepair {
                 data_shards: self.k as u16,
-                parity_shards: self.m as u16,
+                parity_shards: m as u16,
                 parity_index: idx as u16,
                 shard_len: shard_len as u16,
                 seqs: seqs.clone(),
@@ -541,6 +572,43 @@ mod tests {
         let mut buf = BytesMut::new();
         r.serialize(&mut buf);
         assert_eq!(PerLegRsRepair::parse(&buf).unwrap(), r);
+    }
+
+    #[test]
+    fn adaptive_rs_scales_parity_with_loss() {
+        // parity envelope [2, 6]; at 0 loss use min, at ≥10% loss use max.
+        let mut enc = PerLegRsEncoder::new_adaptive(8, 2, 6);
+        let pkts: Vec<Bytes> = (0..8).map(|i| Bytes::from(vec![i as u8; 20])).collect();
+        // No loss yet → 2 parity.
+        let mut reps = Vec::new();
+        for (i, p) in pkts.iter().enumerate() {
+            reps.extend(enc.push(1000 + i as u32, p));
+        }
+        assert_eq!(reps.len(), 2, "min parity at zero loss");
+        // Heavy loss → climbs to max parity.
+        enc.set_loss(0.20);
+        let mut reps2 = Vec::new();
+        for (i, p) in pkts.iter().enumerate() {
+            reps2.extend(enc.push(2000 + i as u32, p));
+        }
+        assert_eq!(reps2.len(), 6, "max parity under heavy loss");
+        // The decoder (sized for the max) recovers the larger block too.
+        let mut dec = PerLegRsDecoder::new(8, 6);
+        for (i, p) in pkts.iter().enumerate() {
+            if (2..7).contains(&i) {
+                continue; // drop 5 — within max parity 6
+            }
+            dec.push_source(2000 + i as u32, p);
+        }
+        let mut recovered = std::collections::HashMap::new();
+        for r in reps2 {
+            for (s, pl) in dec.push_repair(r) {
+                recovered.insert(s, pl);
+            }
+        }
+        for i in 2..7 {
+            assert_eq!(recovered.get(&(2000 + i as u32)), Some(&pkts[i]), "seq {i} recovered");
+        }
     }
 
     #[test]

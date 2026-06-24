@@ -184,8 +184,9 @@ async fn receiver_loop(
         .map(|p| {
             per_path_fec.get(&p.id()).map(|kind| match kind {
                 PerLegFecKind::Xor(prm) => LegDec::Xor(PerLegFecDecoder::new(*prm)),
-                PerLegFecKind::ReedSolomon { data, parity } => {
-                    LegDec::Rs(PerLegRsDecoder::new(*data, *parity))
+                PerLegFecKind::ReedSolomon { data, parity, parity_max } => {
+                    // Size the decoder for the largest block it may see.
+                    LegDec::Rs(PerLegRsDecoder::new(*data, (*parity).max(*parity_max)))
                 }
             })
         })

@@ -88,8 +88,14 @@ pub enum PerLegFecKind {
     Xor(FecParams),
     /// Reed-Solomon — recovers up to `parity` losses among each
     /// `data + parity` block. Stronger for a chronically-lossy leg, at
-    /// `parity/data` overhead. `data + parity ≤ 256`.
-    ReedSolomon { data: u16, parity: u16 },
+    /// `parity/data` overhead. `data + parity ≤ 256`. When `parity_max >
+    /// parity` the parity is **adaptive** — it scales between
+    /// `[parity, parity_max]` with the leg's recent loss; equal = fixed.
+    ReedSolomon {
+        data: u16,
+        parity: u16,
+        parity_max: u16,
+    },
 }
 
 /// A single path definition.

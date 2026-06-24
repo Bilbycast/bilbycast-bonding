@@ -378,7 +378,7 @@ async fn per_leg_rs_recovers_loss_without_arq() {
     let _r = spawn_fec_drop_relay(relay, rx, 5).await;
 
     let mut per_path_fec = std::collections::HashMap::new();
-    per_path_fec.insert(0u8, PerLegFecKind::ReedSolomon { data: 8, parity: 4 });
+    per_path_fec.insert(0u8, PerLegFecKind::ReedSolomon { data: 8, parity: 4, parity_max: 4 });
 
     let receiver = BondSocket::receiver(BondSocketConfig {
         flow_id: 88,
