@@ -152,7 +152,19 @@ pub struct KeepaliveBody {
     /// reassembly state — otherwise a restarted sender's seqs drop as
     /// stale forever. 0 on a v1/v2 peer.
     pub session_epoch: u32,
+    /// Sender→receiver mode flags (v4 extension). Bit
+    /// [`KA_FLAG_ALIGN_SUPPRESS`]: this bond is in a *ride-fastest*
+    /// (duplicate-all redundancy) mode, so the receiver MUST NOT
+    /// time-align legs — holding the fast copy to align a slow duplicate
+    /// defeats the whole point. The sender owns the redundancy policy;
+    /// the receiver applies alignment; so the intent has to ride the
+    /// keepalive. 0 on a v1/v2/v3 peer (→ align as normal).
+    pub mode_flags: u8,
 }
+
+/// [`KeepaliveBody::mode_flags`] bit: suppress receiver-side per-leg
+/// equalization (ride-fastest / duplicate-all redundancy).
+pub const KA_FLAG_ALIGN_SUPPRESS: u8 = 0x01;
 
 impl KeepaliveBody {
     /// Base (v1) wire size; the v2 byte-counter is appended after this
@@ -162,6 +174,8 @@ impl KeepaliveBody {
     pub const SIZE_V2: usize = 28;
     /// Full v3 wire size (v2 + `session_epoch`).
     pub const SIZE_V3: usize = 32;
+    /// v4 wire size (v3 + `mode_flags`).
+    pub const SIZE_V4: usize = 33;
 
     pub fn write_to(&self, out: &mut BytesMut) {
         out.put_u64(self.stamp_us);
@@ -169,6 +183,7 @@ impl KeepaliveBody {
         out.put_u32(self.highest_bond_seq_sent);
         out.put_u64(self.bytes_sent_on_path);
         out.put_u32(self.session_epoch);
+        out.put_u8(self.mode_flags);
     }
 
     pub fn parse(buf: &[u8]) -> Result<Self> {
@@ -182,16 +197,25 @@ impl KeepaliveBody {
         let stamp_us = r.get_u64();
         let packets_sent_on_path = r.get_u64();
         let highest_bond_seq_sent = r.get_u32();
-        // v2/v3 extensions — present iff the peer wrote them.
+        // v2/v3/v4 extensions — present iff the peer wrote them.
         let bytes_sent_on_path = if r.remaining() >= 8 { r.get_u64() } else { 0 };
         let session_epoch = if r.remaining() >= 4 { r.get_u32() } else { 0 };
+        let mode_flags = if r.remaining() >= 1 { r.get_u8() } else { 0 };
         Ok(Self {
             stamp_us,
             packets_sent_on_path,
             highest_bond_seq_sent,
             bytes_sent_on_path,
             session_epoch,
+            mode_flags,
         })
+    }
+
+    /// True when the sender signalled ride-fastest (duplicate-all) — the
+    /// receiver suppresses per-leg equalization.
+    #[inline]
+    pub fn align_suppressed(&self) -> bool {
+        self.mode_flags & KA_FLAG_ALIGN_SUPPRESS != 0
     }
 }
 
@@ -217,16 +241,41 @@ pub struct KeepaliveAckBody {
     /// so a sender can observe adoption. 0 until adopted / on a v1/v2
     /// peer.
     pub session_epoch: u32,
+    /// Receiver-measured **relative one-way delay** for this path, in
+    /// microseconds (v4 extension, per-leg equalization). This is the
+    /// leg's windowed-min OWD *minus the fastest eligible leg's* — i.e.
+    /// how much later this leg's packets land than the quickest leg, the
+    /// equalization the sender must account for. `u32::MAX` is a sentinel
+    /// for "un-equalizable / not measured". 0 on a v1/v2/v3 peer (the
+    /// sender then falls back to its local jitter heuristic).
+    pub relative_owd_us: u32,
+    /// The **receiver's** advertised bond data-header version (v5
+    /// extension, per-leg equalization rollout safety). The receiver
+    /// sets this to [`crate::packet::PROTOCOL_VERSION_V2`] only when it
+    /// both speaks v2 *and* has equalization enabled — i.e. "you may
+    /// send me v2 (16-byte, send-stamped) data headers on this leg".
+    /// A sender MUST NOT emit v2 data headers until it has seen a
+    /// keepalive-ack reporting `>= PROTOCOL_VERSION_V2` on that leg;
+    /// otherwise a genuinely-old (pre-v2) receiver hits
+    /// `BondError::UnsupportedVersion` and silently drops every media
+    /// packet. Defaults to [`crate::packet::PROTOCOL_VERSION`] (1) on a
+    /// v1/v2/v3/v4 peer that never wrote the field — keeping the bond on
+    /// v1 headers, which every build can parse.
+    pub recv_protocol_version: u16,
 }
 
 impl KeepaliveAckBody {
-    /// Base (v1) wire size; v2/v3 fields are appended and parsed
+    /// Base (v1) wire size; v2/v3/v4 fields are appended and parsed
     /// defensively.
     pub const SIZE: usize = 24;
     /// v2 wire size (base + bytes + jitter).
     pub const SIZE_V2: usize = 36;
-    /// Full v3 wire size (v2 + `session_epoch`).
+    /// v3 wire size (v2 + `session_epoch`).
     pub const SIZE_V3: usize = 40;
+    /// v4 wire size (v3 + `relative_owd_us`).
+    pub const SIZE_V4: usize = 44;
+    /// v5 wire size (v4 + `recv_protocol_version`).
+    pub const SIZE_V5: usize = 46;
 
     pub fn write_to(&self, out: &mut BytesMut) {
         out.put_u64(self.stamp_us);
@@ -235,6 +284,8 @@ impl KeepaliveAckBody {
         out.put_u64(self.bytes_received_on_path);
         out.put_u32(self.jitter_us);
         out.put_u32(self.session_epoch);
+        out.put_u32(self.relative_owd_us);
+        out.put_u16(self.recv_protocol_version);
     }
 
     pub fn parse(buf: &[u8]) -> Result<Self> {
@@ -248,10 +299,19 @@ impl KeepaliveAckBody {
         let stamp_us = r.get_u64();
         let packets_sent_on_path = r.get_u64();
         let packets_received_on_path = r.get_u64();
-        // v2/v3 extensions — present iff the peer wrote them.
+        // v2/v3/v4 extensions — present iff the peer wrote them.
         let bytes_received_on_path = if r.remaining() >= 8 { r.get_u64() } else { 0 };
         let jitter_us = if r.remaining() >= 4 { r.get_u32() } else { 0 };
         let session_epoch = if r.remaining() >= 4 { r.get_u32() } else { 0 };
+        let relative_owd_us = if r.remaining() >= 4 { r.get_u32() } else { 0 };
+        // v5: a peer that never wrote this field is pre-equalization (or
+        // equalization-disabled) — default it to v1 so the sender keeps
+        // emitting v1 data headers and never bricks an old receiver.
+        let recv_protocol_version = if r.remaining() >= 2 {
+            r.get_u16()
+        } else {
+            crate::packet::PROTOCOL_VERSION as u16
+        };
         Ok(Self {
             stamp_us,
             packets_sent_on_path,
@@ -259,6 +319,8 @@ impl KeepaliveAckBody {
             bytes_received_on_path,
             jitter_us,
             session_epoch,
+            relative_owd_us,
+            recv_protocol_version,
         })
     }
 }
@@ -346,12 +408,12 @@ impl CtrlPacket {
         out.clear();
         match self {
             CtrlPacket::Keepalive { header, body } => {
-                out.reserve(CtrlHeader::SIZE + KeepaliveBody::SIZE_V3);
+                out.reserve(CtrlHeader::SIZE + KeepaliveBody::SIZE_V4);
                 header.write_to(out);
                 body.write_to(out);
             }
             CtrlPacket::KeepaliveAck { header, body } => {
-                out.reserve(CtrlHeader::SIZE + KeepaliveAckBody::SIZE_V3);
+                out.reserve(CtrlHeader::SIZE + KeepaliveAckBody::SIZE_V5);
                 header.write_to(out);
                 body.write_to(out);
             }
@@ -408,12 +470,13 @@ mod tests {
             highest_bond_seq_sent: 12_345_678,
             bytes_sent_on_path: 13_160_000,
             session_epoch: 0x5e55_10e9,
+            mode_flags: KA_FLAG_ALIGN_SUPPRESS,
         };
         let pkt = CtrlPacket::Keepalive { header, body };
 
         let mut buf = BytesMut::new();
         pkt.serialize(&mut buf);
-        assert_eq!(buf.len(), CtrlHeader::SIZE + KeepaliveBody::SIZE_V3);
+        assert_eq!(buf.len(), CtrlHeader::SIZE + KeepaliveBody::SIZE_V4);
         assert_eq!(buf[0], CTRL_MAGIC);
 
         let parsed = CtrlPacket::parse(&buf).unwrap();
@@ -431,6 +494,8 @@ mod tests {
             bytes_received_on_path: 1_311_400,
             jitter_us: 1234,
             session_epoch: 0xfeed_f00d,
+            relative_owd_us: 173_000,
+            recv_protocol_version: crate::packet::PROTOCOL_VERSION_V2 as u16,
         };
         let pkt = CtrlPacket::KeepaliveAck { header, body };
         let mut buf = BytesMut::new();
@@ -451,6 +516,7 @@ mod tests {
             highest_bond_seq_sent: 3,
             bytes_sent_on_path: 4,
             session_epoch: 5,
+            mode_flags: KA_FLAG_ALIGN_SUPPRESS,
         };
         let mut buf = BytesMut::new();
         ka.write_to(&mut buf);
@@ -458,12 +524,18 @@ mod tests {
         assert_eq!(v1.bytes_sent_on_path, 0);
         assert_eq!(v1.session_epoch, 0);
         assert_eq!(v1.packets_sent_on_path, 2);
+        assert_eq!(v1.mode_flags, 0);
         let v2 = KeepaliveBody::parse(&buf[..KeepaliveBody::SIZE_V2]).unwrap();
         assert_eq!(v2.bytes_sent_on_path, 4);
         assert_eq!(v2.session_epoch, 0);
-        let v3 = KeepaliveBody::parse(&buf).unwrap();
+        assert_eq!(v2.mode_flags, 0);
+        let v3 = KeepaliveBody::parse(&buf[..KeepaliveBody::SIZE_V3]).unwrap();
         assert_eq!(v3.bytes_sent_on_path, 4);
         assert_eq!(v3.session_epoch, 5);
+        assert_eq!(v3.mode_flags, 0, "v3 peer doesn't carry the v4 mode_flags");
+        let v4 = KeepaliveBody::parse(&buf).unwrap();
+        assert_eq!(v4.session_epoch, 5);
+        assert!(v4.align_suppressed());
 
         let ack = KeepaliveAckBody {
             stamp_us: 9,
@@ -472,6 +544,8 @@ mod tests {
             bytes_received_on_path: 12,
             jitter_us: 13,
             session_epoch: 14,
+            relative_owd_us: 15,
+            recv_protocol_version: crate::packet::PROTOCOL_VERSION_V2 as u16,
         };
         let mut abuf = BytesMut::new();
         ack.write_to(&mut abuf);
@@ -479,14 +553,37 @@ mod tests {
         assert_eq!(a1.bytes_received_on_path, 0);
         assert_eq!(a1.jitter_us, 0);
         assert_eq!(a1.session_epoch, 0);
+        assert_eq!(a1.relative_owd_us, 0);
         assert_eq!(a1.packets_received_on_path, 11);
+        // A pre-v5 peer never wrote recv_protocol_version → defaults to v1,
+        // so a sender keeps emitting v1 data headers and never bricks it.
+        assert_eq!(a1.recv_protocol_version, crate::packet::PROTOCOL_VERSION as u16);
         let a2 = KeepaliveAckBody::parse(&abuf[..KeepaliveAckBody::SIZE_V2]).unwrap();
         assert_eq!(a2.bytes_received_on_path, 12);
         assert_eq!(a2.jitter_us, 13);
         assert_eq!(a2.session_epoch, 0);
-        let a3 = KeepaliveAckBody::parse(&abuf).unwrap();
+        assert_eq!(a2.relative_owd_us, 0);
+        assert_eq!(a2.recv_protocol_version, crate::packet::PROTOCOL_VERSION as u16);
+        let a3 = KeepaliveAckBody::parse(&abuf[..KeepaliveAckBody::SIZE_V3]).unwrap();
         assert_eq!(a3.jitter_us, 13);
         assert_eq!(a3.session_epoch, 14);
+        assert_eq!(a3.relative_owd_us, 0, "v3 peer doesn't carry the v4 field");
+        assert_eq!(a3.recv_protocol_version, crate::packet::PROTOCOL_VERSION as u16);
+        let a4 = KeepaliveAckBody::parse(&abuf[..KeepaliveAckBody::SIZE_V4]).unwrap();
+        assert_eq!(a4.session_epoch, 14);
+        assert_eq!(a4.relative_owd_us, 15);
+        assert_eq!(
+            a4.recv_protocol_version,
+            crate::packet::PROTOCOL_VERSION as u16,
+            "v4 peer doesn't carry the v5 field"
+        );
+        let a5 = KeepaliveAckBody::parse(&abuf).unwrap();
+        assert_eq!(a5.session_epoch, 14);
+        assert_eq!(a5.relative_owd_us, 15);
+        assert_eq!(
+            a5.recv_protocol_version,
+            crate::packet::PROTOCOL_VERSION_V2 as u16
+        );
     }
 
     #[test]

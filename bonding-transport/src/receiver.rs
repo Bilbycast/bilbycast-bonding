@@ -53,6 +53,17 @@ use crate::path::{Path, PathDatagram};
 const STALE_FLOOD_WINDOW: Duration = Duration::from_secs(3);
 const STALE_FLOOD_MIN_PACKETS: u64 = 100;
 
+/// Per-leg hold: a recovery whose filling leg has smoothed interarrival
+/// jitter above this is NOT allowed to ratchet the adaptive hold servo's
+/// `hold_window_max`. A catastrophically-jittery leg (a bufferbloated modem
+/// at 300 ms+) otherwise drags the whole flow's reorder budget — and hence
+/// its delivery latency — up toward `hold_max_ms`, taxing the healthy legs
+/// for a leg that, after sender-side jitter demotion, carries only
+/// redundancy/FEC copies whose late loss is harmless. Mirrors the sender's
+/// `CongestionConfig::jitter_demote_us` default so both ends agree on what
+/// "too jittery to gate latency on" means.
+const HOLD_JITTER_EXCLUDE_US: u64 = 150_000;
+
 pub(crate) struct ReceiverHandle {
     pub rx: mpsc::Receiver<Bytes>,
 }
@@ -74,6 +85,7 @@ pub(crate) fn spawn_receiver(
     max_nack_retries: u32,
     fec: Option<FecParams>,
     per_path_fec: std::collections::HashMap<PathId, PerLegFecKind>,
+    equalization: crate::config::EqualizationMode,
 ) -> (ReceiverHandle, JoinHandle<()>) {
     let (app_tx, app_rx) = mpsc::channel::<Bytes>(1024);
 
@@ -124,6 +136,7 @@ pub(crate) fn spawn_receiver(
             max_nack_retries,
             fec,
             per_path_fec,
+            equalization,
         )
         .await
         {
@@ -147,6 +160,135 @@ struct PendingNack {
     last_sent_at: Option<Instant>,
 }
 
+/// Window over which a leg's minimum one-way-delay sample is held before
+/// it can be re-baselined (BBR RTprop style). A permanent OWD shift (5G
+/// handover, Starlink reroute, slow clock-rate skew) ages out instead of
+/// latching a stale floor. Mirrors the scheduler's `rtt_min_window`.
+const OWD_MIN_WINDOW: Duration = Duration::from_secs(10);
+/// Stamped samples a leg needs before its measured OWD is trusted for
+/// equalization. Until then the leg's offset is 0 (no equalization), so a
+/// freshly-joined leg never injects a bogus spread.
+const OWD_COLD_START_SAMPLES: u32 = 16;
+/// A leg that hasn't delivered a stamped data packet within this window is
+/// excluded from the equalization target — so when the slowest (target) leg
+/// dies, fast legs stop over-holding for it within one window (the dead-leg
+/// recompute) instead of waiting on the slower keepalive liveness timer.
+const EQ_LEG_STALE: Duration = Duration::from_millis(800);
+/// In `Auto` mode, alignment engages only when the measured inter-leg OWD
+/// **skew** (slowest eligible leg − fastest) exceeds this floor — below it the
+/// jitter hold already absorbs the spread and time-aligning would only add
+/// latency for no aggregation benefit, so a homogeneous bond stays a no-op.
+/// Hysteresis: engage above the floor, disengage below half. **This value is
+/// the live-tunable knob** — it must be validated against real cellular +
+/// Starlink jitter (too low → engages on noise; too high → a genuinely skewed
+/// bond never aligns). `On` mode ignores it; `Off` never measures.
+const SKEW_FLOOR_US: u32 = 20_000;
+/// Grace window after the first stamp during which the loss_deadline covers the
+/// full equalization budget — long enough for every alive leg to warm
+/// (`OWD_COLD_START_SAMPLES`) and the engage decision to settle, so a high-skew
+/// leg's gaps survive cold-start. After it, a bond that never engaged (low
+/// skew) drops its loss_deadline back to the adaptive jitter-hold.
+const COLD_START_GRACE: Duration = Duration::from_secs(3);
+
+/// Per-leg relative one-way-delay estimator (receiver side). Built from the
+/// v2 header `send_stamp_us`: `raw = arrival_us − send_stamp_us` carries the
+/// true OWD plus a constant (sender-epoch − receiver-epoch) offset that
+/// cancels when two legs' minima are differenced. Only the windowed MIN is
+/// kept; everything above the floor is jitter and discarded.
+#[derive(Debug, Clone, Copy)]
+struct LegDelay {
+    /// Windowed-min raw sample, wrapping u32 microseconds (`owd + const`).
+    owd_min: u32,
+    /// When `owd_min` was last (re)adopted — drives `OWD_MIN_WINDOW` aging.
+    owd_min_at: Instant,
+    /// When the last stamped data packet was observed — drives the dead-leg
+    /// staleness exclusion (`EQ_LEG_STALE`).
+    last_at: Instant,
+    /// Stamped samples seen (cold-start gate).
+    samples: u32,
+}
+
+impl LegDelay {
+    fn new(now: Instant) -> Self {
+        Self { owd_min: 0, owd_min_at: now, last_at: now, samples: 0 }
+    }
+    /// Feed a raw sample; windowed-min with wrap-safe comparison + aging.
+    fn observe(&mut self, raw: u32, now: Instant) {
+        if self.samples == 0
+            || (raw.wrapping_sub(self.owd_min) as i32) < 0
+            || now.saturating_duration_since(self.owd_min_at) > OWD_MIN_WINDOW
+        {
+            self.owd_min = raw;
+            self.owd_min_at = now;
+        }
+        self.last_at = now;
+        self.samples = self.samples.saturating_add(1);
+    }
+    /// Has this leg produced enough stamped samples to trust its OWD?
+    #[inline]
+    fn warm(&self) -> bool {
+        self.samples >= OWD_COLD_START_SAMPLES
+    }
+    /// Warm AND not stale — eligible to participate in / define the
+    /// equalization target.
+    #[inline]
+    fn eq_eligible(&self, now: Instant) -> bool {
+        self.warm() && now.saturating_duration_since(self.last_at) < EQ_LEG_STALE
+    }
+}
+
+/// Reset the receiver-local equalization mirror on a session reset (sender
+/// restart). The sender's `send_stamp` origin (process boot) just reset, so
+/// every `leg_owd` baseline was measured against the OLD sender epoch and is
+/// now stale — and the windowed-min would hold it for up to `OWD_MIN_WINDOW`,
+/// feeding bogus inter-leg skew into the recompute. `reassembly.reset()` already
+/// clears the buffer's `equalize` table; this clears the source of truth that
+/// re-drives it, so the next session re-measures from scratch and the
+/// cold-start grace re-arms for the new instance.
+#[allow(clippy::too_many_arguments)]
+fn reset_equalization_state(
+    leg_owd: &mut [LegDelay],
+    rx_epoch: Instant,
+    eq_active: &mut bool,
+    eq_engaged: &mut bool,
+    eq_active_since: &mut Option<Instant>,
+    peer_align_suppress: &mut bool,
+) {
+    for l in leg_owd.iter_mut() {
+        *l = LegDelay::new(rx_epoch);
+    }
+    *eq_active = false;
+    *eq_engaged = false;
+    *eq_active_since = None;
+    *peer_align_suppress = false;
+}
+
+/// Relative OWD (µs) of leg `idx` vs the fastest WARM leg — how much later
+/// this leg's packets land. `u32::MAX` = un-measured (cold-start / no
+/// stamps / index out of range). Wrap-safe via `wrapping_sub`-as-`i32`.
+fn leg_relative_owd_us(legs: &[LegDelay], idx: Option<usize>, now: Instant) -> u32 {
+    let Some(i) = idx else { return u32::MAX };
+    let Some(leg) = legs.get(i) else { return u32::MAX };
+    if !leg.eq_eligible(now) {
+        return u32::MAX;
+    }
+    let min = legs
+        .iter()
+        .filter(|l| l.eq_eligible(now))
+        .map(|l| l.owd_min)
+        .fold(None, |acc: Option<u32>, v| {
+            Some(match acc {
+                None => v,
+                Some(m) if (v.wrapping_sub(m) as i32) < 0 => v,
+                Some(m) => m,
+            })
+        });
+    match min {
+        Some(m) => (leg.owd_min.wrapping_sub(m) as i32).max(0) as u32,
+        None => u32::MAX,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn receiver_loop(
     flow_id: u32,
@@ -166,8 +308,26 @@ async fn receiver_loop(
     max_nack_retries: u32,
     fec: Option<FecParams>,
     per_path_fec: std::collections::HashMap<PathId, PerLegFecKind>,
+    equalization: crate::config::EqualizationMode,
 ) -> anyhow::Result<()> {
+    use crate::config::EqualizationMode;
     let mut reassembly = ReassemblyBuffer::new(hold_time);
+    // Advertise v2-data-header capability to the sender only when THIS receiver
+    // measures (Auto/On). The sender gates its 16-byte send-stamped v2 headers
+    // on seeing this — so an equalization-off (or genuinely-old) receiver keeps
+    // the bond on v1 headers it can parse, never bricked by unparseable v2.
+    let advertised_version: u16 = if equalization.measures() {
+        bonding_protocol::packet::PROTOCOL_VERSION_V2 as u16
+    } else {
+        bonding_protocol::packet::PROTOCOL_VERSION as u16
+    };
+    // Sender-signalled ride-fastest (duplicate-all): suppress alignment in Auto
+    // mode (On overrides). Learned from the keepalive `mode_flags`; updated on
+    // every keepalive so a redundancy-mode change propagates within one tick.
+    let mut peer_align_suppress = false;
+    // Rate-limit for the header-parse-drop warning (an UnsupportedVersion
+    // blackout would otherwise be invisible — see header_parse_drops).
+    let mut last_parse_drop_warn: Option<Instant> = None;
     // Proactive FEC decoder (opt-in). Recovers a sparse loss from the
     // column's XOR repair with no NACK round-trip; recovered packets are
     // inserted into the reassembly buffer like a late path arrival.
@@ -206,6 +366,36 @@ async fn receiver_loop(
     conn_stats
         .current_hold_ms
         .store(hold_cur.as_millis() as u64, Ordering::Relaxed);
+
+    // ── Per-leg equalization state (L2/L3, see docs/per-leg-equalization.md).
+    // Auto-activates when a v2 sender starts stamping data packets; with no
+    // stamps `leg_owd` stays cold, `eq_active` false, and the reassembly's
+    // equalize table stays zero → byte-for-byte the pre-equalization path.
+    // `rx_epoch` is a receiver-local monotonic origin; only inter-leg
+    // DIFFERENCES of (arrival − send_stamp) are physically meaningful, so the
+    // unknown sender/receiver epoch offset cancels.
+    let rx_epoch = Instant::now();
+    let mut leg_owd: Vec<LegDelay> = vec![LegDelay::new(rx_epoch); paths.len()];
+    // `eq_active` = ≥1 stamped packet seen (attempt recompute). `eq_engaged`
+    // = the recompute has actually applied per-leg offsets (legs warm). The
+    // servo runs until `eq_engaged` — so during cold-start (stamps seen but
+    // legs not yet warm) the global hold still grows to cover the spread and
+    // nothing is lost across the cold-start → equalized transition.
+    let mut eq_active = false;
+    let mut eq_engaged = false;
+    // When the first stamp arrived. During the cold-start grace after this, the
+    // loss_deadline covers the full budget so a high-skew leg's gaps aren't
+    // declared lost before the legs warm + alignment engages (the servo can't
+    // bootstrap that — a gap declared lost is never seen as a long recovery, so
+    // the hold never grows). After the grace, a confirmed low-skew bond that
+    // never engaged drops its loss_deadline back to the servo'd jitter-hold.
+    let mut eq_active_since: Option<Instant> = None;
+    // The equalization latency budget = the operator's hold ceiling when set,
+    // else the static hold. loss_deadline is pinned to it while equalizing so
+    // a NACK/FEC round-trip on the slowest aligned leg still lands before a
+    // gap ages out.
+    let eq_budget = hold_max.unwrap_or(hold_time).max(hold_time);
+    let mut eq_last_recompute = Instant::now();
 
     // Session epoch adoption (sender-restart detection). 0 = none seen
     // yet (fresh receiver, or a v1/v2 peer that doesn't send epochs).
@@ -323,6 +513,9 @@ async fn receiver_loop(
                     // pending_nacks, both owned by this loop.
                     match CtrlPacket::parse(&dg.data) {
                         Ok(CtrlPacket::Keepalive { header, body }) if header.flow_id == flow_id => {
+                            // Ride-fastest (duplicate-all) signal from the
+                            // sender — suppresses alignment in Auto mode.
+                            peer_align_suppress = body.align_suppressed();
                             // Session-epoch handling. A restarted sender
                             // re-anchors bond_seq near 0; an anchored
                             // reassembly buffer would reject its every
@@ -375,6 +568,14 @@ async fn receiver_loop(
                                         // seq space; the next data packet
                                         // re-anchors fresh.
                                         reassembly.reset();
+                                        reset_equalization_state(
+                                            &mut leg_owd,
+                                            rx_epoch,
+                                            &mut eq_active,
+                                            &mut eq_engaged,
+                                            &mut eq_active_since,
+                                            &mut peer_align_suppress,
+                                        );
                                         pending_nacks.clear();
                                         retx_rtt = None;
                                         stale_run_start = None;
@@ -438,6 +639,13 @@ async fn receiver_loop(
                             let sent_on_path = body.packets_sent_on_path;
                             let ack_header =
                                 CtrlHeader::new(CtrlType::KeepaliveAck, path_id, flow_id);
+                            // Per-leg relative OWD (v4) — how much later this
+                            // leg's packets land than the fastest eligible leg.
+                            // u32::MAX = un-measured (cold-start / v1 sender,
+                            // no send-timestamps). The sender uses it for the
+                            // equalization-budget demote (L4).
+                            let relative_owd_us =
+                                leg_relative_owd_us(&leg_owd, path_idx, Instant::now());
                             let ack_body = KeepaliveAckBody {
                                 stamp_us: body.stamp_us,
                                 packets_sent_on_path: sent_on_path,
@@ -445,6 +653,8 @@ async fn receiver_loop(
                                 bytes_received_on_path,
                                 jitter_us,
                                 session_epoch: current_epoch,
+                                relative_owd_us,
+                                recv_protocol_version: advertised_version,
                             };
                             let ack = CtrlPacket::KeepaliveAck {
                                 header: ack_header,
@@ -490,7 +700,32 @@ async fn receiver_loop(
                 // Data packet
                 let (header, consumed) = match BondHeader::parse(&dg.data) {
                     Ok(v) => v,
-                    Err(_) => continue,
+                    Err(e) => {
+                        // A non-zero, growing header_parse_drops on an
+                        // otherwise-alive leg is a version-mismatch blackout
+                        // (e.g. a v2 send-stamped header reaching a build that
+                        // can't parse it), not line noise. Count it always;
+                        // warn (rate-limited) loudly on UnsupportedVersion,
+                        // which uniquely signals a peer-version problem.
+                        conn_stats.header_parse_drops.fetch_add(1, Ordering::Relaxed);
+                        if matches!(e, bonding_protocol::error::BondError::UnsupportedVersion(_)) {
+                            let now = Instant::now();
+                            let due = last_parse_drop_warn
+                                .map(|t| now.saturating_duration_since(t) >= Duration::from_secs(5))
+                                .unwrap_or(true);
+                            if due {
+                                last_parse_drop_warn = Some(now);
+                                log::warn!(
+                                    "bond receiver flow {flow_id}: dropping data packets with \
+                                     unparseable header ({e}) — likely a peer emitting a newer \
+                                     bond data-header version this build can't parse (total \
+                                     header_parse_drops={})",
+                                    conn_stats.header_parse_drops.load(Ordering::Relaxed)
+                                );
+                            }
+                        }
+                        continue;
+                    }
                 };
                 if header.flow_id != flow_id {
                     continue;
@@ -551,7 +786,11 @@ async fn receiver_loop(
                             }
                             pending_nacks.remove(&rseq);
                             if let Some(age) = o.recovered_age {
-                                if age > hold_window_max {
+                                // Per-leg hold: a catastrophically-jittery leg
+                                // must not ratchet the global reorder budget.
+                                let leg_jitter =
+                                    path_jitter.get(&path_id).map(|e| e.2 as u64).unwrap_or(0);
+                                if leg_jitter <= HOLD_JITTER_EXCLUDE_US && age > hold_window_max {
                                     hold_window_max = age;
                                 }
                             }
@@ -580,7 +819,12 @@ async fn receiver_loop(
                 // absolute deviation of the inter-packet gap from its
                 // running mean. A bursty/jittery link reports higher and
                 // the capacity scheduler deweights it.
-                {
+                // Smoothed interarrival jitter for THIS leg, captured into
+                // scope so the hold servo below can ignore a recovery that
+                // came via a catastrophically-jittery leg (per-leg hold: one
+                // bad leg must not ratchet the global reorder budget — and
+                // hence the latency — for the healthy legs).
+                let cur_jitter_us = {
                     let arrival = Instant::now();
                     let jitter_us = {
                         let e = path_jitter.entry(path_id).or_insert((arrival, 0.0, 0.0));
@@ -598,6 +842,27 @@ async fn receiver_loop(
                     if let Some(idx) = path_idx {
                         if let Some(ps) = path_stats_for(idx) {
                             ps.jitter_us.store(jitter_us, Ordering::Relaxed);
+                        }
+                    }
+                    jitter_us
+                };
+
+                // Per-leg OWD measurement (L2): a v2 sender stamps each data
+                // packet with its monotonic emit time. raw = arrival − stamp
+                // (wrapping u32 µs) = true OWD + a constant epoch offset that
+                // cancels in the inter-leg difference. Only FRESH data packets
+                // (not retransmits, whose latency is the NACK loop, not the
+                // path OWD) feed the estimator.
+                if let (Some(stamp), Some(idx)) = (header.send_stamp_us, path_idx) {
+                    if !header.is_retransmit() {
+                        let arrival_us = rx_now.saturating_duration_since(rx_epoch).as_micros() as u32;
+                        let raw = arrival_us.wrapping_sub(stamp);
+                        if let Some(leg) = leg_owd.get_mut(idx) {
+                            leg.observe(raw, rx_now);
+                            eq_active = true;
+                            if eq_active_since.is_none() {
+                                eq_active_since = Some(rx_now);
+                            }
                         }
                     }
                 }
@@ -621,7 +886,7 @@ async fn receiver_loop(
                     reassembly.insert(header.bond_seq, payload.clone(), path_id, Instant::now());
                 if outcome.stale {
                     conn_stats
-                        .reassembly_overflow
+                        .late_stale_drops
                         .fetch_add(1, Ordering::Relaxed);
                     // Stale-flood watchdog (see the constants' doc):
                     // an unbroken all-stale run this deep means the
@@ -641,6 +906,14 @@ async fn receiver_loop(
                         pending_epoch = 0;
                         pending_epoch_count = 0;
                         reassembly.reset();
+                        reset_equalization_state(
+                            &mut leg_owd,
+                            rx_epoch,
+                            &mut eq_active,
+                            &mut eq_engaged,
+                            &mut eq_active_since,
+                            &mut peer_align_suppress,
+                        );
                         pending_nacks.clear();
                         retx_rtt = None;
                         if let Some(dec) = fec_decoder.as_mut() {
@@ -685,7 +958,10 @@ async fn receiver_loop(
                     conn_stats.gaps_recovered.fetch_add(1, Ordering::Relaxed);
                     pending_nacks.remove(&header.bond_seq);
                     if let Some(age) = outcome.recovered_age {
-                        if age > hold_window_max {
+                        // Per-leg hold: a catastrophically-jittery leg's slow
+                        // recovery must not ratchet the global reorder budget
+                        // (and hence the healthy legs' delivery latency).
+                        if cur_jitter_us <= HOLD_JITTER_EXCLUDE_US && age > hold_window_max {
                             hold_window_max = age;
                         }
                     }
@@ -735,7 +1011,8 @@ async fn receiver_loop(
                             }
                             pending_nacks.remove(&rseq);
                             if let Some(age) = o.recovered_age {
-                                if age > hold_window_max {
+                                // Per-leg hold (see HOLD_JITTER_EXCLUDE_US).
+                                if cur_jitter_us <= HOLD_JITTER_EXCLUDE_US && age > hold_window_max {
                                     hold_window_max = age;
                                 }
                             }
@@ -769,6 +1046,109 @@ async fn receiver_loop(
             _ = pump.tick() => {
                 let now = Instant::now();
                 drain_reassembly(&mut reassembly, &app_tx, &conn_stats, &mut drain_scratch, now, &mut pending_nacks, true);
+
+                // Per-leg equalization recompute (~5 Hz; L3). Align every
+                // eligible (warm + fresh) leg to the SLOWEST eligible one so
+                // all legs deliver time-aligned — the jitter-hold then only
+                // covers residual jitter. A silent/dead leg drops out of
+                // `eq_eligible` within EQ_LEG_STALE, immediately shrinking the
+                // others' offsets (the dead-leg recompute). loss_deadline is
+                // pinned to the budget so a NACK/FEC round-trip on the slowest
+                // aligned leg still lands before a gap ages out. Inert until a
+                // v2 sender's stamps warm the estimator.
+                if eq_active && now.saturating_duration_since(eq_last_recompute)
+                    >= Duration::from_millis(200)
+                {
+                    eq_last_recompute = now;
+                    // Slowest + fastest eligible leg owd_min (wrap-safe).
+                    let mut max_owd: Option<u32> = None;
+                    let mut min_owd: Option<u32> = None;
+                    for l in leg_owd.iter().filter(|l| l.eq_eligible(now)) {
+                        let v = l.owd_min;
+                        max_owd = Some(match max_owd {
+                            None => v,
+                            Some(m) if (v.wrapping_sub(m) as i32) > 0 => v,
+                            Some(m) => m,
+                        });
+                        min_owd = Some(match min_owd {
+                            None => v,
+                            Some(m) if (v.wrapping_sub(m) as i32) < 0 => v,
+                            Some(m) => m,
+                        });
+                    }
+                    // Refresh per-leg relative-OWD telemetry every recompute so
+                    // an operator sees the measured spread whether or not
+                    // alignment engages (e.g. to see skew building toward the
+                    // floor on Auto, or staying below it on a homogeneous bond).
+                    for (idx, _) in leg_owd.iter().enumerate() {
+                        if let Some(ps) = path_stats.get(idx) {
+                            let rel = leg_relative_owd_us(&leg_owd, Some(idx), now);
+                            ps.relative_owd_us.store(
+                                if rel == u32::MAX { 0 } else { rel as u64 },
+                                Ordering::Relaxed,
+                            );
+                        }
+                    }
+                    if let (Some(max_owd), Some(min_owd)) = (max_owd, min_owd) {
+                        // The inter-leg skew the equalizer would align out.
+                        let skew_us = (max_owd.wrapping_sub(min_owd) as i32).max(0) as u32;
+                        // Engage decision. `On` force-engages (and overrides the
+                        // sender's ride-fastest suppression). `Auto` engages only
+                        // when the skew is worth the latency AND the sender isn't
+                        // ride-fastest. Hysteresis (engage above the floor,
+                        // disengage below half) stops a near-floor skew flapping.
+                        let force = matches!(equalization, EqualizationMode::On);
+                        let suppressed = peer_align_suppress && !force;
+                        let skew_threshold =
+                            if eq_engaged { SKEW_FLOOR_US / 2 } else { SKEW_FLOOR_US };
+                        let should_engage = !suppressed && (force || skew_us > skew_threshold);
+                        if should_engage {
+                            let budget_us = eq_budget.as_micros().min(u32::MAX as u128) as u32;
+                            for (idx, leg) in leg_owd.iter().enumerate() {
+                                let offset_us = if leg.eq_eligible(now) {
+                                    ((max_owd.wrapping_sub(leg.owd_min) as i32).max(0) as u32)
+                                        .min(budget_us)
+                                } else {
+                                    0
+                                };
+                                if let Some(p) = paths.get(idx) {
+                                    reassembly.set_equalization(
+                                        p.id(),
+                                        Duration::from_micros(offset_us as u64),
+                                    );
+                                }
+                            }
+                            // jitter_hold pinned to the static floor while
+                            // equalizing: the per-leg offsets already cover the
+                            // inter-leg spread, so the in-order hold only needs
+                            // to cover residual jitter, and the equalized leg's
+                            // late fill no longer ratchets the global hold up.
+                            reassembly.set_hold_time(hold_floor);
+                            // Equalization now drives the hold — the adaptive
+                            // servo stands down. loss_deadline is owned by the
+                            // single rule at the end of the pump tick.
+                            eq_engaged = true;
+                        } else if eq_engaged {
+                            // Was aligning; skew dropped below the floor or the
+                            // sender went ride-fastest → stand down: clear the
+                            // per-leg offsets so the adaptive hold servo (gated on
+                            // !eq_engaged) takes back over for residual jitter.
+                            reassembly.clear_equalization();
+                            eq_engaged = false;
+                        }
+                    } else if eq_engaged {
+                        // No eligible legs at all (every leg fresh-data-stale —
+                        // e.g. a brief total-uplink stall). Without this, the
+                        // engage/disengage block above is skipped entirely:
+                        // eq_engaged would latch ON forever, the stale per-leg
+                        // offsets would persist (the fast leg returning first
+                        // carries a dead leg's offset → a latency spike), the
+                        // servo would stay gated off, and loss_deadline would
+                        // stay pinned at the full budget. Stand down.
+                        reassembly.clear_equalization();
+                        eq_engaged = false;
+                    }
+                }
 
                 // Any NACKs due? Retry cadence is RTT-aware — re-asking
                 // before a retransmit could possibly arrive only buys
@@ -811,7 +1191,11 @@ async fn receiver_loop(
                 // Adaptive hold-time (opt-in): ~1 Hz, retarget toward the
                 // realized recovery latency (×1.5) within [floor, max],
                 // decaying toward the floor when nothing needed recovery
-                // so latency drops back as the links calm.
+                // so latency drops back as the links calm. Suspended only
+                // once equalization is ENGAGED (offsets applied) — during
+                // cold-start it still runs so the global hold covers the
+                // spread until the per-leg offsets take over.
+                if !eq_engaged {
                 if let Some(hmax) = hold_autogrow {
                     if now.saturating_duration_since(hold_last_adjust) >= Duration::from_secs(1) {
                         let target = if hold_window_max > Duration::ZERO {
@@ -830,6 +1214,27 @@ async fn receiver_loop(
                         hold_last_adjust = now;
                     }
                 }
+                }
+
+                // loss_deadline rule (single owner). Cover the equalization
+                // budget while alignment is ENGAGED (the aligned slowest leg +
+                // a NACK/FEC round-trip), AND during the cold-start grace after
+                // the first stamp (so a high-skew leg's gaps survive while the
+                // legs warm and the engage decision settles — the servo can't
+                // bootstrap that). Otherwise — a confirmed low-skew bond that
+                // measured but never engaged, or a non-equalized bond — track
+                // the servo'd jitter-hold so a clean bond keeps a SMALL gap-to-
+                // Lost deadline instead of being pinned to the full budget. This
+                // is the fix for the eq_active-pins-budget-on-first-stamp bug.
+                let in_cold_start_grace = eq_active_since
+                    .map(|t| now.saturating_duration_since(t) < COLD_START_GRACE)
+                    .unwrap_or(false);
+                let target_loss = if eq_engaged || in_cold_start_grace {
+                    eq_budget
+                } else {
+                    reassembly.hold_time()
+                };
+                reassembly.set_loss_deadline(target_loss);
             }
         }
     }

@@ -162,6 +162,15 @@ pub trait BondScheduler: Send {
 
     /// Called when a previously-dead path is revived.
     fn on_path_alive(&mut self, _path_id: PathId) {}
+
+    /// Debit a specific path's congestion budget by `bytes` of wire payload
+    /// WITHOUT selecting it. Used to charge out-of-band traffic that the
+    /// scheduler did not route — notably per-leg FEC parity, which rides a
+    /// fixed leg directly — against that leg's token bucket, so the
+    /// controller accounts for it as offered load instead of over-committing
+    /// fresh media on top of invisible parity. Default impl is a no-op for
+    /// schedulers without a per-path capacity budget.
+    fn charge_path(&mut self, _path_id: PathId, _bytes: usize) {}
 }
 
 // ── Built-in: RoundRobinScheduler ───────────────────────────────────────────

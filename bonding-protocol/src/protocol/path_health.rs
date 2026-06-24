@@ -22,4 +22,12 @@ pub struct PathHealth {
     /// Send queue depth, packets. Useful for detecting a stalled path
     /// before RTT catches up.
     pub queue_depth: u32,
+    /// Receiver-measured relative one-way delay for this leg, microseconds
+    /// (how much later this leg's packets land than the fastest eligible
+    /// leg) — echoed from the v4 keepalive-ack for per-leg equalization.
+    /// `u32::MAX` = un-measured (cold-start, a v1/v2/v3 receiver, or
+    /// equalization off); the scheduler then leaves the budget-demote
+    /// inactive and falls back to its local jitter heuristic. (`Default`
+    /// gives 0 — "fastest leg" — which likewise never trips the demote.)
+    pub relative_owd_us: u32,
 }

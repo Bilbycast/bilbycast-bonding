@@ -54,6 +54,19 @@
 //!   Jitter is only re-measured at the receiver while data flows, so a
 //!   starved leg's stale sample decays every control round — a bad
 //!   reading deweights the leg but can never pin it out of the bond.
+//! - **Jitter demote-to-exclusion**: the ×0.5 deweight floor is not enough
+//!   for a *catastrophically* jittery leg (a bufferbloated retail modem at
+//!   300 ms+): every unique-media seq routed onto it head-of-line-blocks
+//!   the in-order reassembly of the whole flow. When a leg's smoothed
+//!   jitter stays above [`CongestionConfig::jitter_demote_us`] for
+//!   [`JITTER_DEMOTE_ROUNDS`] *fresh* control rounds it is marked
+//!   `media_eligible = false` and excluded from carrying **unique** media
+//!   (`best` / `pick_single`) — but it is still used for **redundancy**
+//!   replication and per-leg FEC, where a late-arriving copy is harmless
+//!   insurance rather than a stall point. It re-admits with hysteresis once
+//!   fresh jitter drops below half the threshold. The last eligible leg is
+//!   never demoted (a bond of all-jittery legs still carries media on the
+//!   least-bad). Opt-out with `jitter_demote_us = 0`.
 //!
 //! No async, no locks — same constraints as the rest of `bonding-protocol`.
 //! [`std::time::Instant`] is the only time source (already used by the
@@ -144,7 +157,31 @@ pub struct CongestionConfig {
     /// so existing fixed-threshold deployments are unchanged. Default
     /// `false`.
     pub delay_inflation_auto: bool,
+    /// Smoothed interarrival jitter (microseconds) above which a leg is
+    /// demoted from carrying **unique** media after [`JITTER_DEMOTE_ROUNDS`]
+    /// fresh control rounds — it keeps carrying redundancy/FEC copies but
+    /// can no longer head-of-line-block the in-order reassembly. Re-admits
+    /// once fresh jitter falls below half this value. `0` disables demotion
+    /// (jitter still deweights quality via [`PathCc::quality`]). Default
+    /// 150 000 µs (150 ms): well above a healthy terrestrial/satellite leg
+    /// (single-digit ms) and a clean cellular leg (tens of ms), but below a
+    /// bufferbloated modem's 300 ms+.
+    pub jitter_demote_us: u64,
+    /// Equalization latency budget, microseconds. When the receiver feeds
+    /// back a leg's relative one-way delay (per-leg equalization), a leg
+    /// whose delay exceeds this is demoted from carrying UNIQUE media —
+    /// aligning the whole flow to it would blow the latency budget — while
+    /// still carrying redundancy/FEC. `0` disables the budget-demote (the
+    /// jitter heuristic still applies). Default 1 000 000 µs (1 s).
+    pub max_bonding_latency_us: u64,
 }
+
+/// Fresh control rounds a leg must stay above (for demote) or below half
+/// (for re-admit) [`CongestionConfig::jitter_demote_us`] before its
+/// `media_eligible` flag flips. ~3 rounds ≈ 0.6 s at the 5 Hz keepalive-ack
+/// cadence — long enough to ignore a one-off jitter spike, short enough to
+/// react within a second.
+const JITTER_DEMOTE_ROUNDS: u32 = 3;
 
 /// Auto delay-threshold = baseline RTT × this fraction. 0.7 places a
 /// ~360 ms cellular baseline at ~250 ms (the value such links need
@@ -169,6 +206,8 @@ impl Default for CongestionConfig {
             burst_secs: 0.25,
             rtt_ewma: 0.2,
             delay_inflation_auto: false,
+            jitter_demote_us: 150_000,
+            max_bonding_latency_us: 1_000_000,
         }
     }
 }
@@ -209,6 +248,16 @@ struct PathCc {
     /// last health update — distinguishes a starved leg (stale jitter)
     /// from one with a fresh measurement.
     picked_since_update: bool,
+    /// Whether this leg may carry **unique** media. Cleared when smoothed
+    /// jitter stays catastrophic (`> jitter_demote_us`) for
+    /// [`JITTER_DEMOTE_ROUNDS`] fresh rounds; restored with hysteresis when
+    /// fresh jitter falls below half the threshold. A demoted leg still
+    /// carries redundancy/FEC copies (see [`CapacityAwareScheduler::best_n_alive`]).
+    media_eligible: bool,
+    /// Consecutive fresh rounds above `jitter_demote_us` (toward demote).
+    demote_streak: u32,
+    /// Consecutive fresh rounds below `jitter_demote_us / 2` (toward re-admit).
+    admit_streak: u32,
     /// Scheduler `sched_serial` at this path's last health update; if it
     /// hasn't advanced, the bond was idle and nothing was starved.
     last_update_serial: u64,
@@ -234,6 +283,9 @@ impl PathCc {
             loss: 0.0,
             jitter_us: 0,
             picked_since_update: false,
+            media_eligible: true,
+            demote_streak: 0,
+            admit_streak: 0,
             last_update_serial: 0,
             delivery_bps: 0.0,
         }
@@ -426,11 +478,27 @@ impl CapacityAwareScheduler {
         }
     }
 
+    /// Whether any alive leg may still carry unique media. When false
+    /// (every alive leg is jitter-demoted), demotion is suspended so the
+    /// bond still carries media on the least-bad leg rather than dropping.
+    #[inline]
+    fn any_media_eligible(&self) -> bool {
+        self.paths.iter().any(|p| p.alive && p.media_eligible)
+    }
+
     /// Best-scoring alive path, optionally requiring it can afford
     /// `need` bytes and optionally excluding one id. Scans from the
     /// rotating cursor with strict `>` so genuinely better scores still
     /// win but exact ties round-robin instead of pinning to index 0.
-    fn best(&self, need: f64, require_afford: bool, exclude: Option<PathId>) -> Option<usize> {
+    /// When `media_only` is set, jitter-demoted legs are skipped so unique
+    /// media never head-of-line-blocks on a catastrophically jittery leg.
+    fn best(
+        &self,
+        need: f64,
+        require_afford: bool,
+        exclude: Option<PathId>,
+        media_only: bool,
+    ) -> Option<usize> {
         let len = self.paths.len();
         if len == 0 {
             return None;
@@ -442,6 +510,9 @@ impl CapacityAwareScheduler {
             let i = (self.rr_cursor + k) % len;
             let p = &self.paths[i];
             if !p.alive || Some(p.id) == exclude {
+                continue;
+            }
+            if media_only && !p.media_eligible {
                 continue;
             }
             if require_afford && p.tokens < need {
@@ -458,29 +529,44 @@ impl CapacityAwareScheduler {
         best
     }
 
-    /// The `n` best alive legs by score (best-first), for explicit
-    /// redundancy. Not afford-gated — replication is a deliberate bandwidth
-    /// spend — but the caller still debits each leg's token bucket so the
-    /// controller sees the added load.
+    /// The `n` best alive **media-eligible** legs by score (best-first),
+    /// for explicit redundancy, PLUS every alive jitter-demoted leg. Not
+    /// afford-gated — replication is a deliberate bandwidth spend — but the
+    /// caller still debits each leg's token bucket so the controller sees
+    /// the added load. Demoted legs are always appended (never the unique
+    /// carrier, but their whole remaining job is redundancy/FEC insurance,
+    /// and carrying duplicates keeps their jitter measurable so they can
+    /// re-admit when the radio recovers). Falls back to the best `n` of all
+    /// alive legs when none are eligible.
     fn best_n_alive(&self, n: usize) -> Vec<usize> {
         let burst = self.cfg.burst_secs;
         let mut scored: Vec<(usize, f64)> = self
             .paths
             .iter()
             .enumerate()
-            .filter(|(_, p)| p.alive)
+            .filter(|(_, p)| p.alive && p.media_eligible)
             .map(|(i, p)| (i, p.score(burst, p.effective_delay_thresh(&self.cfg))))
             .collect();
         scored.sort_by(|a, b| {
             b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
         });
-        scored.into_iter().take(n.max(1)).map(|(i, _)| i).collect()
+        let mut out: Vec<usize> = scored.into_iter().take(n.max(1)).map(|(i, _)| i).collect();
+        // Always also replicate onto alive demoted legs (insurance + keeps
+        // their jitter measurable for re-admit).
+        for (i, p) in self.paths.iter().enumerate() {
+            if p.alive && !p.media_eligible && !out.contains(&i) {
+                out.push(i);
+            }
+        }
+        out
     }
 
     /// Path with the most tokens (least debt) among alive, for the
     /// over-subscription fallback. Same rotating-cursor tie-break as
-    /// [`Self::best`].
-    fn least_debt(&self, exclude: Option<PathId>) -> Option<usize> {
+    /// [`Self::best`]. `media_only` skips jitter-demoted legs so an
+    /// over-subscription overflow still never lands unique media on a
+    /// catastrophically jittery leg.
+    fn least_debt(&self, exclude: Option<PathId>, media_only: bool) -> Option<usize> {
         let len = self.paths.len();
         if len == 0 {
             return None;
@@ -491,6 +577,9 @@ impl CapacityAwareScheduler {
             let i = (self.rr_cursor + k) % len;
             let p = &self.paths[i];
             if !p.alive || Some(p.id) == exclude {
+                continue;
+            }
+            if media_only && !p.media_eligible {
                 continue;
             }
             if p.tokens > best_tokens {
@@ -545,15 +634,20 @@ impl CapacityAwareScheduler {
             // Duplicate across the two best paths for keyframe-grade
             // resilience — but stay budget-aware: only spend the second
             // copy if a second path can actually afford it, so we never
-            // worsen congestion to duplicate.
-            let primary = self.best(need, true, None).or_else(|| self.least_debt(None));
+            // worsen congestion to duplicate. The primary copy must ride a
+            // media-eligible leg (unless every leg is demoted) so a keyframe
+            // doesn't head-of-line-block on a jittery leg.
+            let media_only = self.any_media_eligible();
+            let primary = self
+                .best(need, true, None, media_only)
+                .or_else(|| self.least_debt(None, media_only));
             let Some(pi) = primary else {
                 self.oversubscribed_drops += 1;
                 return PathSelection::Drop;
             };
             let pid = self.paths[pi].id;
-            // Second copy: best *affordable* other path only.
-            let secondary = self.best(need, true, Some(pid));
+            // Second copy: best *affordable* other media-eligible path.
+            let secondary = self.best(need, true, Some(pid), media_only);
             self.paths[pi].tokens -= need;
             self.paths[pi].picked_since_update = true;
             if let Some(si) = secondary {
@@ -572,10 +666,15 @@ impl CapacityAwareScheduler {
     /// and return the selection. Handles spill (best affordable) and
     /// bounded over-subscription (overflow the least-debt link, or Drop).
     fn pick_single(&mut self, need: f64, priority: Priority) -> PathSelection {
+        // Restrict unique-media selection to media-eligible legs so a
+        // jitter-demoted leg never head-of-line-blocks the in-order flow —
+        // unless every alive leg is demoted, in which case carry on the
+        // least-bad rather than drop.
+        let media_only = self.any_media_eligible();
         // 1. Prefer the best path that can afford the packet outright —
         //    this is the spill mechanism: a saturated link has no tokens
         //    so the next best with headroom wins.
-        if let Some(i) = self.best(need, true, None) {
+        if let Some(i) = self.best(need, true, None, media_only) {
             self.paths[i].tokens -= need;
             self.paths[i].picked_since_update = true;
             return PathSelection::Single(self.paths[i].id);
@@ -588,7 +687,7 @@ impl CapacityAwareScheduler {
         // 3. Overflow the least-loaded link, but only into bounded debt
         //    so a sustained over-subscription can't build unbounded
         //    bufferbloat — past −burst we drop and flag it.
-        if let Some(i) = self.least_debt(None) {
+        if let Some(i) = self.least_debt(None, media_only) {
             let burst = self.paths[i].burst_bytes(self.cfg.burst_secs);
             if self.paths[i].tokens > -burst {
                 self.paths[i].tokens -= need;
@@ -675,6 +774,46 @@ impl BondScheduler for CapacityAwareScheduler {
             p.delivery_bps = health.throughput_bps as f64;
         }
 
+        // Demote-to-exclusion: a leg loses `media_eligible` (excluded from
+        // carrying UNIQUE media, kept for redundancy/FEC) on EITHER axis —
+        // (a) catastrophic jitter, or (b) un-equalizable, i.e. its
+        // receiver-measured relative one-way delay exceeds the latency budget
+        // so aligning the flow to it would blow `max_bonding_latency_us`.
+        // Clause (b) is the authoritative budget signal once equalization is
+        // running (the receiver feeds `relative_owd_us` back over the v4
+        // keepalive-ack); clause (a) is the local fallback when no OWD has
+        // been measured (u32::MAX). Only FRESH samples move the streaks — a
+        // starved leg's decayed jitter must never auto-flip the flag — and a
+        // demoted leg keeps carrying redundancy/FEC so it stays measured and
+        // can re-admit once it's clean on BOTH axes.
+        if !starved {
+            let owd_measured = health.relative_owd_us != u32::MAX;
+            let owd_us = health.relative_owd_us as u64;
+            let jittery = cfg.jitter_demote_us > 0 && p.jitter_us > cfg.jitter_demote_us;
+            let un_equalizable =
+                cfg.max_bonding_latency_us > 0 && owd_measured && owd_us > cfg.max_bonding_latency_us;
+            // Re-admit needs BOTH axes clean (hysteresis at half the threshold).
+            let jitter_clear =
+                cfg.jitter_demote_us == 0 || p.jitter_us < cfg.jitter_demote_us / 2;
+            let owd_clear = cfg.max_bonding_latency_us == 0
+                || !owd_measured
+                || owd_us < cfg.max_bonding_latency_us / 2;
+            if jittery || un_equalizable {
+                p.admit_streak = 0;
+                p.demote_streak = p.demote_streak.saturating_add(1);
+                if p.demote_streak >= JITTER_DEMOTE_ROUNDS {
+                    p.media_eligible = false;
+                }
+            } else if jitter_clear && owd_clear {
+                p.demote_streak = 0;
+                p.admit_streak = p.admit_streak.saturating_add(1);
+                if p.admit_streak >= JITTER_DEMOTE_ROUNDS {
+                    p.media_eligible = true;
+                }
+            }
+            // Hysteresis band: hold the flag and streaks.
+        }
+
         // Capacity control step.
         let inflation = (p.rtt - p.rtt_min).max(0.0);
         let delay_thresh = p.effective_delay_thresh(&cfg);
@@ -723,14 +862,36 @@ impl BondScheduler for CapacityAwareScheduler {
             // holds — on an undersubscribed bond, delivery measures the
             // leg's share, and pinning the estimate at probe_cap_mult ×
             // that share would turn an instant failover into seconds of
-            // sender-side shedding. The min_rate floor stays
-            // authoritative so a leg can always re-prove itself.
-            p.capacity_bps = p
-                .capacity_bps
-                .min(p.delivery_bps * cfg.probe_cap_mult)
-                .max(cfg.min_rate_bps as f64);
+            // sender-side shedding.
+            //
+            p.capacity_bps = p.capacity_bps.min(p.delivery_bps * cfg.probe_cap_mult);
+            // The min_rate floor stays authoritative for a leg that still
+            // carries UNIQUE media — it is protective: removing it lets a
+            // transient low delivery sample collapse capacity below the
+            // offered rate and drop media (the same failure mode as setting
+            // min_rate too low collapsing a whole bond). But for a
+            // jitter-DEMOTED leg the floor is dropped so its estimate tracks
+            // reality: such a leg carries only redundancy/FEC copies, and
+            // flooring it up to e.g. 800 kbps when it only delivers 130 kbps
+            // just over-commits wasted parity onto a known-bad leg (the
+            // original "min_rate pins trm500 at ~6×" defect, now scoped to
+            // exactly the leg it should apply to).
+            if p.media_eligible {
+                p.capacity_bps = p.capacity_bps.max(cfg.min_rate_bps as f64);
+            }
         }
         self.publish(i);
+    }
+
+    fn charge_path(&mut self, path_id: PathId, bytes: usize) {
+        if let Some(i) = self.idx(path_id) {
+            // Same accounting as a scheduled packet: debit the bucket (into
+            // bounded debt) and mark the leg active so its jitter sample is
+            // treated as fresh — a demoted leg carrying only FEC stays
+            // measurable and can re-admit.
+            self.paths[i].tokens -= (bytes + TOKEN_OVERHEAD_BYTES) as f64;
+            self.paths[i].picked_since_update = true;
+        }
     }
 
     fn on_tick(&mut self, now: Instant) {
@@ -759,6 +920,11 @@ impl BondScheduler for CapacityAwareScheduler {
             p.loss = 0.0;
             p.jitter_us = 0;
             p.picked_since_update = false;
+            // A revived leg starts media-eligible; it re-earns demotion
+            // only on fresh catastrophic jitter.
+            p.media_eligible = true;
+            p.demote_streak = 0;
+            p.admit_streak = 0;
             p.tokens = 0.0;
             self.publish(i);
         }
@@ -780,7 +946,15 @@ mod tests {
             loss_rate: loss,
             throughput_bps: delivery_bps,
             queue_depth: 0,
+            // u32::MAX = OWD un-measured → budget-demote inactive in these
+            // unit tests (they drive the jitter axis).
+            relative_owd_us: u32::MAX,
         }
+    }
+
+    /// Like `health` but with an explicit relative-OWD (for the budget-demote).
+    fn health_owd(rtt_ms: u64, loss: f32, delivery_bps: u64, relative_owd_us: u32) -> PathHealth {
+        PathHealth { relative_owd_us, ..health(rtt_ms, loss, delivery_bps) }
     }
 
     fn hints(size: usize) -> PacketHints {
@@ -1097,14 +1271,16 @@ mod tests {
         assert!(counts[1] * 10 >= total * 3, "leg 1 should carry >=30%: {counts:?}");
     }
 
-    /// High interarrival jitter deweights a path's quality: the clean
-    /// leg of an otherwise-identical pair carries the strict majority.
+    /// Moderate interarrival jitter (above the 20 ms deweight knee but
+    /// below the 150 ms demote threshold) softly deweights a path's
+    /// quality: the clean leg of an otherwise-identical pair carries the
+    /// strict majority while the jittery leg still carries some.
     #[test]
     fn jitter_deweights_path() {
         let mut s = CapacityAwareScheduler::new(vec![0, 1]);
         for _ in 0..100 {
             s.on_path_update(0, &health(20, 0.0, 20_000_000));
-            s.on_path_update(1, &health_j(20, 0.0, 20_000_000, 200_000));
+            s.on_path_update(1, &health_j(20, 0.0, 20_000_000, 80_000));
         }
         let base = Instant::now() + Duration::from_secs(1);
         let interval = Duration::from_millis(1);
@@ -1122,43 +1298,172 @@ mod tests {
         );
     }
 
-    /// A starved leg's stale jitter sample decays across control rounds
-    /// so the leg re-earns traffic — the receiver can only re-measure
-    /// jitter on a leg that carries data, so without decay one bad
-    /// sample would pin the leg out of the bond forever.
+    /// A catastrophically jittery leg (> jitter_demote_us, sustained) is
+    /// demoted from carrying UNIQUE media entirely — not just deweighted —
+    /// so it can never head-of-line-block the in-order flow.
     #[test]
-    fn stale_jitter_decays_on_starved_path() {
+    fn jitter_demote_excludes_unique_media() {
         let mut s = CapacityAwareScheduler::new(vec![0, 1]);
-        for _ in 0..50 {
-            s.on_path_update(0, &health_j(20, 0.0, 20_000_000, 200_000));
-            s.on_path_update(1, &health(20, 0.0, 20_000_000));
+        // Leg 1 at 300 ms jitter (a bufferbloated modem) for enough fresh
+        // rounds to demote. No scheduling between rounds, so serial stays 0
+        // and every sample is fresh.
+        for _ in 0..(JITTER_DEMOTE_ROUNDS + 2) {
+            s.on_path_update(0, &health(20, 0.0, 20_000_000));
+            s.on_path_update(1, &health_j(20, 0.0, 20_000_000, 300_000));
         }
-        // Deweighted leg 0 starves while leg 1 carries everything.
+        // With redundancy off, the demoted leg carries nothing at all.
         let base = Instant::now() + Duration::from_secs(1);
-        let mut t = base;
-        for _ in 0..100 {
-            t += Duration::from_millis(1);
-            assert!(matches!(s.schedule_at(&hints(1316), t), PathSelection::Single(1)));
-        }
-        // Health rounds keep echoing the frozen 200 ms sample (no data
-        // on leg 0 → no fresh measurement). The decay must let leg 0
-        // win selections again within a few rounds.
         let mut counts = [0u64; 2];
-        for _ in 0..10 {
-            s.on_path_update(0, &health_j(20, 0.0, 20_000_000, 200_000));
-            s.on_path_update(1, &health(20, 0.0, 20_000_000));
-            for _ in 0..5 {
-                t += Duration::from_millis(1);
-                match s.schedule_at(&hints(1316), t) {
-                    PathSelection::Single(p) => counts[p as usize] += 1,
-                    PathSelection::Duplicate(v) => counts[v[0] as usize] += 1,
-                    PathSelection::Drop => {}
-                }
+        let mut t = base;
+        for _ in 0..500 {
+            t += Duration::from_millis(1);
+            if let PathSelection::Single(p) = s.schedule_at(&hints(1316), t) {
+                counts[p as usize] += 1;
             }
         }
+        assert_eq!(counts[1], 0, "demoted leg must carry zero unique media: {counts:?}");
+        assert!(counts[0] > 0, "the eligible leg carries the flow: {counts:?}");
+    }
+
+    /// Budget-demote: a leg whose receiver-measured relative one-way delay
+    /// exceeds `max_bonding_latency_us` is excluded from unique media even
+    /// with perfect jitter — aligning the flow to it would blow the latency
+    /// budget. It re-admits when the OWD recovers below half the budget.
+    #[test]
+    fn budget_demote_excludes_un_equalizable_leg() {
+        let cfg = CongestionConfig { max_bonding_latency_us: 500_000, ..Default::default() };
+        let priors = vec![
+            PathPrior { id: 0, weight_hint: 1, ceiling_bps: None },
+            PathPrior { id: 1, weight_hint: 1, ceiling_bps: None },
+        ];
+        let mut s = CapacityAwareScheduler::with_paths(priors, cfg);
+        // Leg 1 is clean-jitter but 700 ms relative OWD (> 500 ms budget).
+        for _ in 0..(JITTER_DEMOTE_ROUNDS + 2) {
+            s.on_path_update(0, &health_owd(20, 0.0, 10_000_000, 0));
+            s.on_path_update(1, &health_owd(20, 0.0, 10_000_000, 700_000));
+        }
+        let base = Instant::now() + Duration::from_secs(1);
+        let mut counts = [0u64; 2];
+        let mut t = base;
+        for _ in 0..500 {
+            t += Duration::from_millis(1);
+            if let PathSelection::Single(p) = s.schedule_at(&hints(1316), t) {
+                counts[p as usize] += 1;
+            }
+        }
+        assert_eq!(counts[1], 0, "un-equalizable leg carries no unique media: {counts:?}");
+        assert!(counts[0] > 0, "the in-budget leg carries the flow: {counts:?}");
+
+        // OWD recovers to 100 ms (< 250 ms half-budget) → re-admits.
+        for _ in 0..(JITTER_DEMOTE_ROUNDS + 2) {
+            s.on_path_update(0, &health_owd(20, 0.0, 10_000_000, 0));
+            s.on_path_update(1, &health_owd(20, 0.0, 10_000_000, 100_000));
+        }
+        let mut t2 = Instant::now() + Duration::from_secs(2);
+        let mut readmitted = 0u64;
+        for _ in 0..1000 {
+            t2 += Duration::from_millis(1);
+            if let PathSelection::Single(1) = s.schedule_at(&hints(1316), t2) {
+                readmitted += 1;
+            }
+        }
+        assert!(readmitted > 0, "leg re-admits once OWD is back within budget");
+    }
+
+    /// A demoted leg re-admits once fresh jitter recovers below half the
+    /// threshold for the hysteresis streak — the radio improving brings the
+    /// leg back into aggregation.
+    #[test]
+    fn jitter_readmit_on_recovery() {
+        let mut s = CapacityAwareScheduler::new(vec![0, 1]);
+        for _ in 0..(JITTER_DEMOTE_ROUNDS + 2) {
+            s.on_path_update(0, &health(20, 0.0, 20_000_000));
+            s.on_path_update(1, &health_j(20, 0.0, 20_000_000, 300_000));
+        }
+        // Radio recovers: fresh LOW jitter for the re-admit streak (still no
+        // scheduling between rounds, so samples stay fresh).
+        for _ in 0..(JITTER_DEMOTE_ROUNDS + 2) {
+            s.on_path_update(0, &health(20, 0.0, 20_000_000));
+            s.on_path_update(1, &health_j(20, 0.0, 20_000_000, 5_000));
+        }
+        // Leg 1 carries unique media again.
+        let base = Instant::now() + Duration::from_secs(1);
+        let mut counts = [0u64; 2];
+        let mut t = base;
+        for _ in 0..1000 {
+            t += Duration::from_millis(1);
+            if let PathSelection::Single(p) = s.schedule_at(&hints(1316), t) {
+                counts[p as usize] += 1;
+            }
+        }
+        assert!(counts[1] > 0, "re-admitted leg should carry media again: {counts:?}");
+    }
+
+    /// The last eligible leg is never demoted: a bond where every leg is
+    /// jittery still carries media (on the least-bad) rather than dropping.
+    #[test]
+    fn never_demotes_the_last_eligible_leg() {
+        let mut s = CapacityAwareScheduler::new(vec![0, 1]);
+        // Both legs catastrophically jittery.
+        for _ in 0..(JITTER_DEMOTE_ROUNDS + 4) {
+            s.on_path_update(0, &health_j(20, 0.0, 10_000_000, 300_000));
+            s.on_path_update(1, &health_j(20, 0.0, 10_000_000, 300_000));
+        }
+        // Both flags may be false, but any_media_eligible() short-circuits
+        // demotion at selection time, so media still flows.
+        let base = Instant::now() + Duration::from_secs(1);
+        let mut total = 0u64;
+        let mut t = base;
+        for _ in 0..500 {
+            t += Duration::from_millis(1);
+            if matches!(s.schedule_at(&hints(1316), t), PathSelection::Single(_)) {
+                total += 1;
+            }
+        }
+        assert!(total > 0, "an all-jittery bond must still carry media, not blackout");
+    }
+
+    /// E-fix: a jitter-DEMOTED leg delivering far below the min_rate floor
+    /// has its capacity tracked to its delivered rate × probe_cap_mult, NOT
+    /// floored back up to min_rate — otherwise it is over-committed wasted
+    /// parity it cannot carry. A media-eligible leg, by contrast, keeps the
+    /// protective floor (see `eligible_weak_leg_keeps_min_rate_floor`).
+    #[test]
+    fn demoted_weak_leg_not_floored_above_evidence() {
+        // min_rate 800 kbps; leg is catastrophically jittery (→ demoted)
+        // and only ever delivers 130 kbps.
+        let cfg = CongestionConfig { min_rate_bps: 800_000, ..CongestionConfig::default() };
+        let priors = vec![PathPrior { id: 0, weight_hint: 1, ceiling_bps: None }];
+        let mut s = CapacityAwareScheduler::with_paths(priors, cfg);
+        for _ in 0..50 {
+            // No scheduling → no demand pressure → evidence bound applies.
+            s.on_path_update(0, &health_j(20, 0.0, 130_000, 300_000));
+        }
+        let cap = s.capacity_bps(0).unwrap();
+        let bound = (130_000.0 * CongestionConfig::default().probe_cap_mult) as u64;
         assert!(
-            counts[0] > 0,
-            "starved leg should recover once the stale deweight decays: {counts:?}"
+            cap <= bound,
+            "demoted weak leg must track its evidence bound, not the floor: cap={cap} bound={bound}"
+        );
+    }
+
+    /// A media-eligible weak leg KEEPS the protective min_rate floor —
+    /// removing it would let a transient low delivery sample collapse the
+    /// estimate below the offered rate and drop media (a real low-rate-flow
+    /// regression caught by the per-leg-RS e2e test).
+    #[test]
+    fn eligible_weak_leg_keeps_min_rate_floor() {
+        let cfg = CongestionConfig { min_rate_bps: 800_000, ..CongestionConfig::default() };
+        let priors = vec![PathPrior { id: 0, weight_hint: 1, ceiling_bps: None }];
+        let mut s = CapacityAwareScheduler::with_paths(priors, cfg);
+        for _ in 0..50 {
+            // Low jitter → stays eligible → floor protects.
+            s.on_path_update(0, &health(20, 0.0, 130_000));
+        }
+        assert!(
+            s.capacity_bps(0).unwrap() >= 800_000,
+            "eligible leg must keep the protective min_rate floor: {}",
+            s.capacity_bps(0).unwrap()
         );
     }
 

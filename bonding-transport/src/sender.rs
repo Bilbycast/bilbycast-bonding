@@ -85,6 +85,8 @@ pub(crate) fn spawn_sender<S>(
     retransmit_capacity: usize,
     fec: Option<FecParams>,
     per_path_fec: std::collections::HashMap<PathId, PerLegFecKind>,
+    equalization: crate::config::EqualizationMode,
+    align_suppress: bool,
     events_tx: broadcast::Sender<PathEvent>,
     cancel: CancellationToken,
 ) -> (SenderHandle, JoinHandle<()>)
@@ -134,6 +136,8 @@ where
             retransmit_capacity,
             fec,
             per_path_fec,
+            equalization,
+            align_suppress,
             events_tx,
             rx,
             ctrl_rx,
@@ -162,6 +166,8 @@ async fn sender_loop<S>(
     retransmit_capacity: usize,
     fec: Option<FecParams>,
     per_path_fec: std::collections::HashMap<PathId, PerLegFecKind>,
+    equalization: crate::config::EqualizationMode,
+    align_suppress: bool,
     events_tx: broadcast::Sender<PathEvent>,
     mut app_rx: mpsc::Receiver<OutboundMessage>,
     mut ctrl_rx: mpsc::Receiver<(PathId, PathDatagram)>,
@@ -288,6 +294,14 @@ where
                 // never-sent seq makes the receiver NACK a packet that
                 // never existed (up to max_nack_retries), then count it
                 // lost after a full hold-time.
+                // One emit-timestamp per message (shared by all copies of a
+                // duplicate so each leg measures its own OWD against the same
+                // send instant). `None` unless equalization measures (Auto/On)
+                // → v1 header, no wire change. send_on_path additionally gates
+                // the actual stamp on the per-leg receiver having advertised v2.
+                let send_stamp = equalization
+                    .measures()
+                    .then(|| Instant::now().elapsed_since_boot_us() as u32);
                 let sent_seq = match selection {
                     PathSelection::Drop => {
                         conn_stats.packets_dropped_no_path.fetch_add(1, Ordering::Relaxed);
@@ -298,7 +312,7 @@ where
                         next_seq = next_seq.wrapping_add(1);
                         let rebuilt = send_on_path(
                             flow_id, seq, path_id, msg.hints.priority, msg.hints.marker, false,
-                            &msg.data, &paths, &path_stats, &mut frame_scratch,
+                            send_stamp, &msg.data, &paths, &path_stats, &mut frame_scratch,
                             &conn_stats, &mut path_sent_counter,
                         ).await;
                         if rebuilt {
@@ -317,7 +331,7 @@ where
                             let duplicated = !first;
                             let rebuilt = send_on_path(
                                 flow_id, seq, *pid, msg.hints.priority, msg.hints.marker, duplicated,
-                                &msg.data, &paths, &path_stats, &mut frame_scratch,
+                                send_stamp, &msg.data, &paths, &path_stats, &mut frame_scratch,
                                 &conn_stats, &mut path_sent_counter,
                             ).await;
                             if rebuilt {
@@ -359,6 +373,11 @@ where
                                             &mut fec_frame, &paths, &path_stats,
                                         )
                                         .await;
+                                        // Charge the parity against the leg it
+                                        // rides so the controller sees it as
+                                        // offered load (else it over-commits
+                                        // media on top of invisible FEC).
+                                        scheduler.charge_path(pid, fec_payload.len());
                                     }
                                 }
                                 Some(LegEnc::Rs(enc)) => {
@@ -369,6 +388,7 @@ where
                                             &mut fec_frame, &paths, &path_stats,
                                         )
                                         .await;
+                                        scheduler.charge_path(pid, fec_payload.len());
                                     }
                                 }
                                 None => {}
@@ -502,6 +522,15 @@ where
                                         ps.throughput_bps.store(delivery_bps, Ordering::Relaxed);
                                         ps.jitter_us
                                             .store(body.jitter_us as u64, Ordering::Relaxed);
+                                        // v5 negotiation: record the receiver's
+                                        // advertised data-header version for this
+                                        // leg. send_on_path gates v2 (send-stamped)
+                                        // headers on this being >= v2, so we never
+                                        // brick a pre-v2 / equalization-off receiver.
+                                        ps.peer_protocol_version.store(
+                                            body.recv_protocol_version as u64,
+                                            Ordering::Relaxed,
+                                        );
                                         ps.keepalives_received.fetch_add(1, Ordering::Relaxed);
                                     }
 
@@ -514,6 +543,12 @@ where
                                         throughput_bps: delivery_bps,
                                         jitter_us: body.jitter_us as u64,
                                         queue_depth: 0,
+                                        // v4 keepalive-ack: this leg's
+                                        // receiver-measured relative one-way
+                                        // delay, for the equalization
+                                        // budget-demote (u32::MAX on an older
+                                        // peer → demote stays jitter-only).
+                                        relative_owd_us: body.relative_owd_us,
                                     };
                                     scheduler.on_path_update(path_id, &health);
                                     // Adaptive per-leg RS: scale this leg's
@@ -660,6 +695,14 @@ where
                             .map(|ps| ps.bytes_sent.load(Ordering::Relaxed))
                             .unwrap_or(0),
                         session_epoch,
+                        // Ride-fastest (duplicate-all) → tell the receiver to
+                        // suppress per-leg alignment. Computed at spawn from the
+                        // redundancy policy.
+                        mode_flags: if align_suppress {
+                            bonding_protocol::control::KA_FLAG_ALIGN_SUPPRESS
+                        } else {
+                            0
+                        },
                     };
                     let pkt = CtrlPacket::Keepalive { header, body };
                     pkt.serialize(&mut ctrl_scratch);
@@ -732,6 +775,7 @@ async fn send_fec_frame(
 /// buffer can `.freeze()` it. Returns `true` when the send error run
 /// just triggered a socket rebuild (caller emits the event).
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 async fn send_on_path(
     flow_id: u32,
     bond_seq: u32,
@@ -739,6 +783,7 @@ async fn send_on_path(
     priority: Priority,
     marker: bool,
     duplicated: bool,
+    send_stamp_us: Option<u32>,
     payload: &[u8],
     paths: &[Path],
     path_stats: &[Arc<PathStats>],
@@ -746,6 +791,9 @@ async fn send_on_path(
     conn_stats: &Arc<BondConnStats>,
     path_sent_counter: &mut [u64],
 ) -> bool {
+    let Some(idx) = paths.iter().position(|p| p.id() == path_id) else {
+        return false;
+    };
     let mut header = BondHeader::new(flow_id, bond_seq, path_id, priority);
     if marker {
         header.set_marker();
@@ -753,11 +801,26 @@ async fn send_on_path(
     if duplicated {
         header.set_duplicated();
     }
+    // Per-leg equalization: a v2 header carries the sender's monotonic emit
+    // time so the receiver can derive this leg's relative one-way delay.
+    // GATE on negotiation — only stamp (emit v2) once this leg's receiver has
+    // advertised v2 capability in a keepalive-ack. A pre-v2 / equalization-off
+    // receiver advertises v1 (or nothing → defaults to v1), so we keep emitting
+    // 12-byte v1 headers it can parse and never silently blackhole its media.
+    if let Some(stamp) = send_stamp_us {
+        let peer_v2 = path_stats
+            .get(idx)
+            .map(|ps| {
+                ps.peer_protocol_version.load(Ordering::Relaxed)
+                    >= bonding_protocol::packet::PROTOCOL_VERSION_V2 as u64
+            })
+            .unwrap_or(false);
+        if peer_v2 {
+            header.set_send_stamp(stamp);
+        }
+    }
     write_packet(&header, payload, frame_scratch);
 
-    let Some(idx) = paths.iter().position(|p| p.id() == path_id) else {
-        return false;
-    };
     let path = &paths[idx];
     let peer = path.primary_peer();
     let send_result = match peer {

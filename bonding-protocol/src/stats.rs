@@ -48,10 +48,24 @@ pub struct BondConnStats {
     pub gaps_recovered: AtomicU64,
     pub gaps_lost: AtomicU64,
     pub duplicates_received: AtomicU64,
-    pub reassembly_overflow: AtomicU64,
+    /// Datagrams that arrived too late to use — `bond_seq` already
+    /// delivered or already aged out as lost (a slow-leg copy / retransmit
+    /// that lost the race), or so far ahead it would overwrite an in-flight
+    /// ring slot. NOT reassembly-ring exhaustion (the ring is fixed at 64 k
+    /// slots ≈ tens of seconds of headroom); a high value means a leg is
+    /// contributing copies too late to help, not that a buffer is too small.
+    /// (Formerly `reassembly_overflow`.)
+    pub late_stale_drops: AtomicU64,
     /// Sender restarts adopted by the receiver (a new session epoch on
     /// 2 consecutive control packets → reassembly re-anchor).
     pub session_resets: AtomicU64,
+    /// Inbound datagrams the receiver dropped because the bond header failed
+    /// to parse — most importantly an `UnsupportedVersion` (a peer emitting a
+    /// data-header version this build can't parse, e.g. a v2 send-stamped
+    /// header reaching a pre-equalization receiver). A non-zero, growing value
+    /// on an otherwise-alive leg means a version-mismatch blackout, not line
+    /// noise. Also covers truncated / wrong-magic datagrams.
+    pub header_parse_drops: AtomicU64,
     /// Receiver's current reassembly hold-time, milliseconds. Written
     /// by the hold servo on init and every retarget so exporters can
     /// watch the adaptive reorder/recovery budget breathe.
@@ -76,8 +90,9 @@ impl BondConnStats {
             gaps_recovered: self.gaps_recovered.load(Ordering::Relaxed),
             gaps_lost: self.gaps_lost.load(Ordering::Relaxed),
             duplicates_received: self.duplicates_received.load(Ordering::Relaxed),
-            reassembly_overflow: self.reassembly_overflow.load(Ordering::Relaxed),
+            late_stale_drops: self.late_stale_drops.load(Ordering::Relaxed),
             session_resets: self.session_resets.load(Ordering::Relaxed),
+            header_parse_drops: self.header_parse_drops.load(Ordering::Relaxed),
             current_hold_ms: self.current_hold_ms.load(Ordering::Relaxed),
         }
     }
@@ -97,8 +112,9 @@ pub struct BondConnStatsSnapshot {
     pub gaps_recovered: u64,
     pub gaps_lost: u64,
     pub duplicates_received: u64,
-    pub reassembly_overflow: u64,
+    pub late_stale_drops: u64,
     pub session_resets: u64,
+    pub header_parse_drops: u64,
     pub current_hold_ms: u64,
 }
 
@@ -119,6 +135,12 @@ pub struct PathStats {
     pub rtt_us: AtomicU64,
     /// Jitter (RFC 3550 A.8 style) in microseconds.
     pub jitter_us: AtomicU64,
+    /// Per-leg equalization: receiver-measured relative one-way delay in
+    /// microseconds — how much later this leg's packets land than the
+    /// fastest eligible leg. Written by the receiver while equalization is
+    /// engaged; `0` when equalization is off / un-measured / this leg is the
+    /// fastest. Lets an operator SEE the spread the equalizer is aligning.
+    pub relative_owd_us: AtomicU64,
     /// Last-observed loss rate scaled by 1 000 000 (ppm).
     pub loss_ppm: AtomicU64,
     /// Latest throughput sample, bits per second.
@@ -155,6 +177,13 @@ pub struct PathStats {
     /// the OS-level UDP/QUIC/IP framing below the bond. Sender-side only
     /// (stays 0 on a receive-only leg).
     pub wire_bytes_sent: AtomicU64,
+    /// The far receiver's advertised bond data-header version for this leg,
+    /// learned from the latest keepalive-ack `recv_protocol_version`. Sender
+    /// gates per-leg v2 (send-stamped, equalization) data headers on this
+    /// being `>= PROTOCOL_VERSION_V2` — `0` until the first ack lands, so a
+    /// pre-v2 / equalization-off receiver never sees an unparseable v2
+    /// datagram. Sender-side only.
+    pub peer_protocol_version: AtomicU64,
 }
 
 impl PathStats {
@@ -174,6 +203,7 @@ impl PathStats {
             retransmits_received: self.retransmits_received.load(Ordering::Relaxed),
             keepalives_sent: self.keepalives_sent.load(Ordering::Relaxed),
             keepalives_received: self.keepalives_received.load(Ordering::Relaxed),
+            relative_owd_us: self.relative_owd_us.load(Ordering::Relaxed),
             rtt_us: self.rtt_us.load(Ordering::Relaxed),
             jitter_us: self.jitter_us.load(Ordering::Relaxed),
             loss_ppm: self.loss_ppm.load(Ordering::Relaxed),
@@ -185,6 +215,7 @@ impl PathStats {
             fec_recovered: self.fec_recovered.load(Ordering::Relaxed),
             fec_bytes_sent: self.fec_bytes_sent.load(Ordering::Relaxed),
             wire_bytes_sent: self.wire_bytes_sent.load(Ordering::Relaxed),
+            peer_protocol_version: self.peer_protocol_version.load(Ordering::Relaxed),
         }
     }
 }
@@ -203,6 +234,8 @@ pub struct PathStatsSnapshot {
     pub keepalives_received: u64,
     pub rtt_us: u64,
     pub jitter_us: u64,
+    /// Per-leg equalization: receiver-measured relative one-way delay (µs).
+    pub relative_owd_us: u64,
     pub loss_ppm: u64,
     pub throughput_bps: u64,
     pub queue_depth: u64,
@@ -217,6 +250,10 @@ pub struct PathStatsSnapshot {
     pub fec_bytes_sent: u64,
     /// Total wire bytes (media + retx + dup + FEC + AEAD envelope) on this leg.
     pub wire_bytes_sent: u64,
+    /// The far receiver's advertised bond data-header version for this leg
+    /// (from the keepalive-ack). `0` until the first ack; `< 2` means the peer
+    /// is pre-equalization or has equalization off (drives the version alarm).
+    pub peer_protocol_version: u64,
 }
 
 impl PathStatsSnapshot {

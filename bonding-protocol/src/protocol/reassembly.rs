@@ -94,11 +94,26 @@ pub enum DrainItem {
 }
 
 /// Receiver-side reassembly buffer.
+///
+/// Two distinct time budgets (see `docs/per-leg-equalization.md`):
+/// - `jitter_hold` gates **in-order delivery** of a Filled head — after
+///   per-leg equalization it only needs to cover residual jitter.
+/// - `loss_deadline` gates **gap → Lost** — it must cover the slowest
+///   eligible leg's recovery round-trip (NACK/FEC), independent of (and
+///   `>=`) `jitter_hold`.
+/// Per-leg `equalize[path_id]` is the equalization delay (max-eligible-OWD
+/// − this-leg-OWD): a Filled packet on a fast leg is additionally held by
+/// its leg's offset so all legs deliver time-aligned to the slowest. The
+/// offset is looked up at DRAIN time (not frozen at insert) so a dead-leg
+/// downward recompute releases over-held packets immediately. Default
+/// `equalize = 0` everywhere → behaviour identical to a single global hold.
 pub struct ReassemblyBuffer {
     slots: Vec<Slot>,
     capacity: usize,
     mask: usize,
-    hold_time: Duration,
+    jitter_hold: Duration,
+    loss_deadline: Duration,
+    equalize: Box<[Duration; 256]>,
     base_seq: Option<u32>,
     highest_seq: Option<u32>,
 }
@@ -118,24 +133,79 @@ impl ReassemblyBuffer {
             slots: vec![empty; capacity],
             capacity,
             mask: capacity - 1,
-            hold_time,
+            // Default: loss_deadline == jitter_hold and zero equalization →
+            // byte-for-byte the pre-equalization single-hold behaviour.
+            jitter_hold: hold_time,
+            loss_deadline: hold_time,
+            equalize: Box::new([Duration::ZERO; 256]),
             base_seq: None,
             highest_seq: None,
         }
     }
 
+    /// The in-order delivery hold (a.k.a. jitter-hold). Named `hold_time`
+    /// for back-compat with the adaptive servo that drives it.
     #[inline]
     pub fn hold_time(&self) -> Duration {
-        self.hold_time
+        self.jitter_hold
     }
 
-    /// Adjust the in-order delivery hold-time at runtime (adaptive
-    /// reorder/recovery budget). Only the value used by *future* drains
-    /// changes; already-buffered packets keep their original arrival
-    /// stamps, so a shrink can't retroactively age a packet out.
+    /// Adjust the in-order delivery hold-time (`jitter_hold`) at runtime (the
+    /// adaptive reorder/recovery servo). Does NOT touch `loss_deadline` — the
+    /// caller owns that via [`Self::set_loss_deadline`] (it tracks the servo
+    /// in the non-equalized case and pins to the budget when equalizing).
+    /// Only the value used by *future* drains changes; already-buffered
+    /// packets keep their arrival stamps, so a shrink can't retroactively age
+    /// a packet out.
     #[inline]
     pub fn set_hold_time(&mut self, d: Duration) {
-        self.hold_time = d;
+        self.jitter_hold = d;
+    }
+
+    /// The gap → Lost deadline. Must be `>= hold_time`; the receiver sets it
+    /// to cover the slowest eligible leg's NACK/FEC recovery round-trip so
+    /// shrinking the jitter-hold post-equalization can't age a gap out
+    /// before a retransmit lands.
+    #[inline]
+    pub fn loss_deadline(&self) -> Duration {
+        self.loss_deadline
+    }
+
+    /// Set the gap → Lost deadline. Clamped to `>= jitter_hold` so a gap is
+    /// never declared lost before a Filled head at the same age would be
+    /// delivered (which would corrupt the in-order invariant).
+    #[inline]
+    pub fn set_loss_deadline(&mut self, d: Duration) {
+        self.loss_deadline = d.max(self.jitter_hold);
+    }
+
+    /// Set the per-leg equalization delay (max-eligible-OWD − this-leg-OWD).
+    /// Looked up at drain time so a later change (a dead-leg downward
+    /// recompute, or a freshly-measured OWD) takes effect on already-held
+    /// packets immediately. `path_id` indexes a fixed 256-entry table.
+    #[inline]
+    pub fn set_equalization(&mut self, path_id: u8, offset: Duration) {
+        self.equalize[path_id as usize] = offset;
+    }
+
+    /// Clear all per-leg equalization offsets (session reset / disable).
+    #[inline]
+    pub fn clear_equalization(&mut self) {
+        self.equalize.iter_mut().for_each(|e| *e = Duration::ZERO);
+    }
+
+    /// Total in-order hold for a Filled packet on `path_id`: this leg's
+    /// equalization delay (aligns a fast leg's arrival to the slowest leg's)
+    /// PLUS the jitter-hold (covers the slowest leg's residual jitter on top
+    /// of that alignment). Additive — a fast leg with a 170 ms offset and a
+    /// 20 ms jitter-hold is delivered at arrival+190 ms, the same wall-clock
+    /// instant the slowest leg's same-notional-time packet would be released.
+    /// The slowest (zero-offset) leg holds for jitter_hold alone. Saturating
+    /// so a pathological offset can't overflow `Duration`.
+    #[inline]
+    fn filled_hold(&self, path_id: u8) -> Duration {
+        self.jitter_hold
+            .saturating_add(self.equalize[path_id as usize])
     }
 
     #[inline]
@@ -183,6 +253,9 @@ impl ReassemblyBuffer {
         }
         self.base_seq = None;
         self.highest_seq = None;
+        // Flush per-leg equalization: a restarted sender's seq space and
+        // its leg delays are stale; the next session re-measures from scratch.
+        self.clear_equalization();
     }
 
     /// Insert an arriving packet. `now` is the monotonic arrival time;
@@ -356,8 +429,14 @@ impl ReassemblyBuffer {
                 continue;
             }
             match &slot.state {
-                SlotState::Filled { arrival, .. } => {
-                    if now.saturating_duration_since(*arrival) >= self.hold_time {
+                SlotState::Filled { arrival, path_id, .. } => {
+                    // In-order hold = jitter_hold + this leg's equalization
+                    // delay (inlined as disjoint-field reads; a `&self`
+                    // method call would conflict with the `&mut slot` borrow).
+                    let hold = self
+                        .jitter_hold
+                        .saturating_add(self.equalize[*path_id as usize]);
+                    if now.saturating_duration_since(*arrival) >= hold {
                         let (data, path_id) =
                             match std::mem::replace(&mut slot.state, SlotState::Empty) {
                                 SlotState::Filled { data, path_id, .. } => (data, path_id),
@@ -374,8 +453,12 @@ impl ReassemblyBuffer {
                     return;
                 }
                 SlotState::Gap { first_noticed } => {
+                    // Loss declaration uses the separate loss_deadline (>=
+                    // jitter_hold) so a NACK/FEC round-trip on the slowest
+                    // leg still lands before a gap ages out, even after the
+                    // jitter-hold is shrunk by equalization.
                     if declare_lost
-                        && now.saturating_duration_since(*first_noticed) >= self.hold_time
+                        && now.saturating_duration_since(*first_noticed) >= self.loss_deadline
                     {
                         slot.state = SlotState::Empty;
                         out.push(DrainItem::Lost { bond_seq: base });
@@ -443,8 +526,10 @@ impl ReassemblyBuffer {
             return Some(Instant::now());
         }
         match &slot.state {
-            SlotState::Filled { arrival, .. } => Some(*arrival + self.hold_time),
-            SlotState::Gap { first_noticed } => Some(*first_noticed + self.hold_time),
+            SlotState::Filled { arrival, path_id, .. } => {
+                Some(*arrival + self.filled_hold(*path_id))
+            }
+            SlotState::Gap { first_noticed } => Some(*first_noticed + self.loss_deadline),
             SlotState::Empty => None,
         }
     }
@@ -454,7 +539,8 @@ impl std::fmt::Debug for ReassemblyBuffer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ReassemblyBuffer")
             .field("capacity", &self.capacity)
-            .field("hold_time", &self.hold_time)
+            .field("jitter_hold", &self.jitter_hold)
+            .field("loss_deadline", &self.loss_deadline)
             .field("base_seq", &self.base_seq)
             .field("highest_seq", &self.highest_seq)
             .finish()
@@ -611,6 +697,82 @@ mod tests {
         assert!(drain(&mut buf, t0 + Duration::from_millis(60)).is_empty());
         let out = drain(&mut buf, t0 + Duration::from_millis(310));
         assert_eq!(delivered_only(&out), vec![(1, 0, 1)]);
+    }
+
+    #[test]
+    fn equalization_delays_a_fast_leg_by_its_offset() {
+        // jitter_hold 20ms; leg 0 (fast) gets a 100ms equalization offset,
+        // leg 1 (slowest) gets 0. A packet on leg 0 must hold for 120ms
+        // (offset+jitter), a packet on leg 1 for 20ms.
+        let mut buf = ReassemblyBuffer::new(Duration::from_millis(20));
+        buf.set_equalization(0, Duration::from_millis(100));
+        let t0 = Instant::now();
+        // Single packet on the fast leg (seq 0).
+        buf.insert(0, b(7), 0, t0);
+        assert!(drain(&mut buf, t0 + Duration::from_millis(110)).is_empty(),
+            "fast leg held for offset+jitter (120ms), not yet at 110ms");
+        let out = drain(&mut buf, t0 + Duration::from_millis(125));
+        assert_eq!(delivered_only(&out), vec![(0, 0, 7)], "released after 120ms");
+
+        // A fresh buffer: slowest leg (offset 0) releases at jitter_hold.
+        let mut buf2 = ReassemblyBuffer::new(Duration::from_millis(20));
+        buf2.set_equalization(0, Duration::from_millis(100));
+        buf2.insert(0, b(9), 1, t0); // leg 1, zero offset
+        let out2 = drain(&mut buf2, t0 + Duration::from_millis(25));
+        assert_eq!(delivered_only(&out2), vec![(0, 1, 9)], "slow leg holds for jitter only");
+    }
+
+    #[test]
+    fn loss_deadline_is_separate_from_jitter_hold() {
+        // jitter_hold 20ms, loss_deadline 200ms. A gap must survive past the
+        // jitter-hold (so a slow-leg NACK can still land) and only age to
+        // Lost at the loss_deadline.
+        let mut buf = ReassemblyBuffer::new(Duration::from_millis(20));
+        buf.set_loss_deadline(Duration::from_millis(200));
+        let t0 = Instant::now();
+        buf.insert(10, b(1), 0, t0);
+        buf.insert(12, b(3), 0, t0); // gap at 11
+        // 10 delivers after jitter_hold; 11 is still a gap (not lost) at 120ms.
+        let out = drain(&mut buf, t0 + Duration::from_millis(120));
+        assert_eq!(delivered_only(&out), vec![(10, 0, 1)], "10 out, 11 not yet lost");
+        // A late fill of 11 at 150ms (< loss_deadline) still recovers.
+        let late = buf.insert(11, b(2), 1, t0 + Duration::from_millis(150));
+        assert!(late.recovered, "gap survived past jitter_hold to allow recovery");
+        let out2 = drain(&mut buf, t0 + Duration::from_millis(170));
+        assert_eq!(delivered_only(&out2), vec![(11, 1, 2), (12, 0, 3)]);
+    }
+
+    #[test]
+    fn loss_deadline_floored_to_jitter_hold() {
+        let mut buf = ReassemblyBuffer::new(Duration::from_millis(100));
+        // Setting it below jitter_hold clamps up — a gap must never be
+        // declared lost before a Filled head at the same age would deliver.
+        buf.set_loss_deadline(Duration::from_millis(10));
+        assert_eq!(buf.loss_deadline(), Duration::from_millis(100));
+    }
+
+    #[test]
+    fn reset_clears_equalization() {
+        let mut buf = ReassemblyBuffer::new(Duration::from_millis(20));
+        buf.set_equalization(0, Duration::from_millis(100));
+        buf.reset();
+        // After reset, leg 0 has no offset — releases at jitter_hold again.
+        let t0 = Instant::now();
+        buf.insert(5, b(1), 0, t0);
+        let out = drain(&mut buf, t0 + Duration::from_millis(25));
+        assert_eq!(delivered_only(&out), vec![(5, 0, 1)], "offset flushed by reset");
+    }
+
+    #[test]
+    fn equalization_default_zero_matches_global_hold() {
+        // With no equalization set, every leg holds for exactly jitter_hold —
+        // byte-for-byte the pre-equalization behaviour.
+        let mut buf = ReassemblyBuffer::new(Duration::from_millis(50));
+        let t0 = Instant::now();
+        buf.insert(1, b(1), 7, t0);
+        assert!(drain(&mut buf, t0 + Duration::from_millis(40)).is_empty());
+        let out = drain(&mut buf, t0 + Duration::from_millis(60));
+        assert_eq!(delivered_only(&out), vec![(1, 7, 1)]);
     }
 
     #[test]

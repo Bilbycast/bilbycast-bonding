@@ -57,8 +57,53 @@ pub struct BondSocketConfig {
     /// and the combined [`Self::fec`] is ignored. Both ends must list the
     /// same algorithm + geometry for a leg. ARQ stays combined + cross-leg.
     pub per_path_fec: std::collections::HashMap<PathId, PerLegFecKind>,
+    /// Per-leg latency/jitter **equalization** mode (see
+    /// `docs/per-leg-equalization.md`). Controls whether the SENDER stamps
+    /// each data packet with a v2 (16-byte) header send-timestamp and whether
+    /// the RECEIVER time-aligns legs so heterogeneous high-latency/jitter legs
+    /// AGGREGATE their bandwidth instead of head-of-line-blocking. See
+    /// [`EqualizationMode`]. `Off` by default → v1 headers, byte-for-byte the
+    /// pre-equalization path.
+    pub equalization: EqualizationMode,
+    /// Sender-only: this bond replicates ALL traffic across legs (ride-fastest
+    /// / duplicate-all redundancy), so the receiver must NOT time-align legs
+    /// (holding the fast copy to align a slow duplicate defeats the point).
+    /// Signalled to the receiver on the keepalive; ignored on a receiver
+    /// socket. Default `false`. `EqualizationMode::On` overrides it.
+    pub align_suppress: bool,
     /// Paths registered on this socket.
     pub paths: Vec<PathConfig>,
+}
+
+/// Per-leg equalization mode for a bonded socket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EqualizationMode {
+    /// Never stamp, never measure, never align — byte-for-byte the legacy
+    /// aggregate-but-never-align path. The latency-critical escape hatch:
+    /// a slow leg's reorder is recovered by ARQ/FEC rather than absorbed by
+    /// alignment latency.
+    #[default]
+    Off,
+    /// Stamp + measure one-way delay ALWAYS; engage alignment only when the
+    /// measured inter-leg skew exceeds a non-trivial floor, fits the latency
+    /// budget, and the sender isn't signalling ride-fastest. A homogeneous
+    /// bond therefore measures ~zero skew and stays a no-op; a heterogeneous
+    /// bond (cellular + Starlink) aligns itself. The self-configuring default
+    /// for the aggregation use case.
+    Auto,
+    /// Force-engage alignment whenever any leg is warm — overrides the
+    /// ride-fastest suppression (for a time-aligned downstream consumer of a
+    /// duplicate-all bond).
+    On,
+}
+
+impl EqualizationMode {
+    /// Whether this mode stamps v2 headers / advertises v2 capability /
+    /// measures OWD. `Off` does none of it.
+    #[inline]
+    pub fn measures(&self) -> bool {
+        !matches!(self, EqualizationMode::Off)
+    }
 }
 
 impl Default for BondSocketConfig {
@@ -75,6 +120,8 @@ impl Default for BondSocketConfig {
             encryption_key: None,
             fec: None,
             per_path_fec: std::collections::HashMap::new(),
+            equalization: EqualizationMode::Off,
+            align_suppress: false,
             paths: Vec::new(),
         }
     }

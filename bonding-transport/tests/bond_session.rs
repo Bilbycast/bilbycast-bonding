@@ -211,6 +211,7 @@ async fn single_spurious_epoch_keepalive_does_not_reset() {
             highest_bond_seq_sent: 0,
             bytes_sent_on_path: 0,
             session_epoch: 0x7e57_e90c,
+            mode_flags: 0,
         },
     };
     let mut buf = BytesMut::new();
@@ -485,6 +486,7 @@ async fn stale_epoch_keepalives_after_reset_are_quarantined() {
             highest_bond_seq_sent: 50_000,
             bytes_sent_on_path: 0,
             session_epoch: old_epoch,
+            mode_flags: 0,
         },
     };
     let mut buf = BytesMut::new();

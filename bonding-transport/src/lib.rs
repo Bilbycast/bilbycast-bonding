@@ -66,7 +66,9 @@ pub use bonding_protocol::{
     },
     stats::{BondConnStats, BondConnStatsSnapshot, PathStats, PathStatsSnapshot},
 };
-pub use config::{BondSocketConfig, PathConfig, PathTransport, PerLegFecKind};
+pub use config::{
+    BondSocketConfig, EqualizationMode, PathConfig, PathTransport, PerLegFecKind,
+};
 pub use crypto::{BondCrypto, BondCryptoError};
 #[cfg(feature = "path-quic")]
 pub use config::{QuicRole, QuicTlsMode};
