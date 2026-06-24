@@ -196,6 +196,56 @@ recovers *proactively* with no round-trip, so it shrinks how often the hold has
 to wait on a cross-leg retransmit — but the hold still needs to cover the worst
 leg's delivery latency for the losses FEC can't catch.
 
+## Algorithm: XOR vs Reed-Solomon
+
+Each leg picks its own algorithm (`PerLegFecKind` / edge `path.fec.algorithm`):
+
+- **XOR** (default, SMPTE 2022-1 column model) — recovers **one loss per
+  column**. A burst of up to `columns` consecutive leg packets is recovered
+  because the interleave spreads it one-per-column; but **two losses in the
+  same column fall through to ARQ**. Cheap and ideal for a leg whose loss is
+  sparse or a single clean burst.
+- **Reed-Solomon** — recovers **up to `parity` losses among each `data +
+  parity` block**, *regardless of where they land*. The right code for a
+  chronically-lossy leg that drops several packets at once (a Starlink handoff,
+  a deep cellular fade). Costs a little more CPU and `parity/data` overhead.
+
+For RS, the geometry fields are reinterpreted: `columns` = **data shards (k)**,
+`rows` = **parity shards (m)**. So `8 × 4` RS is a 12-packet block recovering
+any 4 losses, at 50% overhead; `16 × 4` is a 20-packet block recovering any 4,
+at 25% overhead. The wire repair is self-describing (it carries `k`, `m`, its
+parity index, and the block's `bond_seq`s), so the receiver handles each block
+independently — and media packets stay byte-identical, exactly as for XOR.
+
+The codec is a hand-rolled GF(256) Cauchy-RS (`protocol/rs.rs`) — every square
+submatrix of a Cauchy matrix is invertible over GF(2⁸), so any `k` of the
+`k+m` shards reconstruct the originals.
+
+| Leg behaviour | Use | Example |
+|---------------|-----|---------|
+| Sparse loss, occasional single burst | **XOR** | `columns 8–16, rows 10` |
+| Several losses clustered in time (Starlink handoff, fade) | **Reed-Solomon** | `data 16, parity 4` |
+| Metered, want minimum overhead | **RS, wide block** | `data 32, parity 4` (≈12%) |
+
+### Adaptive RS parity
+
+RS can scale its parity **automatically with the leg's measured loss** —
+light protection when the leg is clean, ramping up as it degrades. Set
+`parity_max` above the `parity` floor (edge: `path.fec.parity_max`); the
+encoder then chooses `m` in `[parity, parity_max]` from the leg's recent
+windowed loss fraction (the same signal that drives the congestion
+controller), at/above `ADAPT_FULL_LOSS` (10%) using the ceiling.
+
+This means a Starlink leg spends almost no FEC overhead in clear sky and
+ramps protection the instant it starts dropping, with **no operator
+intervention** — bounded by the `[parity, parity_max]` envelope you set, so
+it can never over- or under-protect beyond your limits. The repair carries
+its `m`, so the receiver (sized for `parity_max`) decodes the varying block
+size transparently. `parity_max == parity` (or unset) = fixed parity.
+
+A good adaptive starting point for a swingy leg: `data 16, parity 2,
+parity_max 6` — ≈12% overhead clean, climbing to ≈37% under heavy loss.
+
 ## Interop & compatibility
 
 - **Both ends must list the same geometry for the same leg.** The encoder
