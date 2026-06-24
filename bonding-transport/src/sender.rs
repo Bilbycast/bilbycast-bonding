@@ -24,7 +24,7 @@ use bonding_protocol::control::{
 };
 use bonding_protocol::events::{PathDeadReason, PathEvent, PathEventKind, PathRebuildReason};
 use bonding_protocol::packet::{BondHeader, Priority, write_packet};
-use bonding_protocol::protocol::fec::{FecEncoder, FecParams};
+use bonding_protocol::protocol::fec::{FecEncoder, FecParams, PerLegFecEncoder};
 use bonding_protocol::protocol::path_health::PathHealth;
 use bonding_protocol::protocol::retransmit::RetransmitBuffer;
 use bonding_protocol::protocol::scheduler::{
@@ -75,6 +75,7 @@ pub(crate) fn spawn_sender<S>(
     keepalive_miss_threshold: u32,
     retransmit_capacity: usize,
     fec: Option<FecParams>,
+    per_path_fec: std::collections::HashMap<PathId, FecParams>,
     events_tx: broadcast::Sender<PathEvent>,
     cancel: CancellationToken,
 ) -> (SenderHandle, JoinHandle<()>)
@@ -123,6 +124,7 @@ where
             keepalive_miss_threshold,
             retransmit_capacity,
             fec,
+            per_path_fec,
             events_tx,
             rx,
             ctrl_rx,
@@ -150,6 +152,7 @@ async fn sender_loop<S>(
     keepalive_miss_threshold: u32,
     retransmit_capacity: usize,
     fec: Option<FecParams>,
+    per_path_fec: std::collections::HashMap<PathId, FecParams>,
     events_tx: broadcast::Sender<PathEvent>,
     mut app_rx: mpsc::Receiver<OutboundMessage>,
     mut ctrl_rx: mpsc::Receiver<(PathId, PathDatagram)>,
@@ -168,6 +171,17 @@ where
     let mut fec_encoder: Option<FecEncoder> = fec.map(FecEncoder::new);
     let mut fec_payload = BytesMut::with_capacity(1600);
     let mut fec_frame = BytesMut::with_capacity(1700);
+
+    // Per-leg FEC (mutually exclusive with combined `fec`): one encoder per
+    // FEC-enabled leg, index-aligned to `paths`. A non-empty map selects
+    // per-leg mode and the combined encoder is left idle. Each leg's encoder
+    // protects only the packets that leg carries, so a leg burst is
+    // recovered locally before it reaches the combined reassembler.
+    let per_leg_mode = !per_path_fec.is_empty();
+    let mut per_leg_encoders: Vec<Option<PerLegFecEncoder>> = paths
+        .iter()
+        .map(|p| per_path_fec.get(&p.id()).map(|prm| PerLegFecEncoder::new(*prm)))
+        .collect();
 
     let mut ka_interval = tokio::time::interval(keepalive_interval);
     // Track in-flight keepalive stamps per path for RTT computation.
@@ -244,6 +258,14 @@ where
                     size: msg.data.len(),
                     ..msg.hints
                 });
+                // Capture which leg(s) this packet rides so per-leg FEC can
+                // protect each leg's own stream (borrow ends before the
+                // by-value match below moves `selection`).
+                let sel_legs: Vec<PathId> = match &selection {
+                    PathSelection::Single(p) => vec![*p],
+                    PathSelection::Duplicate(v) => v.clone(),
+                    PathSelection::Drop => Vec::new(),
+                };
                 // bond_seq is assigned only AFTER a non-Drop selection.
                 // A dropped packet must consume no seq: the keepalive
                 // tip advertises `next_seq - 1`, and a consumed-but-
@@ -296,42 +318,68 @@ where
                     }
                 };
 
-                // Proactive FEC: feed each *sent* payload to the encoder
-                // (dropped packets consume no seq, so sent seqs stay
-                // contiguous and blocks aligned) and emit any completed
-                // XOR repair packets across paths. Repairs ride
-                // FEC-flagged datagrams and do not consume media
-                // bond_seq space.
-                if let (Some(seq), Some(enc)) = (sent_seq, fec_encoder.as_mut()) {
-                    for rep in enc.push(seq, &msg.data) {
-                        rep.serialize(&mut fec_payload);
-                        let sel = scheduler.schedule(&PacketHints {
-                            size: fec_payload.len(),
-                            ..Default::default()
-                        });
-                        let pid = match sel {
-                            PathSelection::Single(p) => Some(p),
-                            PathSelection::Duplicate(v) => v.first().copied(),
-                            PathSelection::Drop => None,
-                        };
-                        if let Some(pid) = pid {
-                            if let Some(pos) = path_index_by_id(pid) {
-                                let mut header =
-                                    BondHeader::new(flow_id, rep.base_seq, pid, Priority::Normal);
-                                header.set_fec();
-                                write_packet(&header, &fec_payload, &mut fec_frame);
-                                if let Some(path) = paths.get(pos) {
-                                    // FEC bytes are NOT counted in the
-                                    // per-path media byte counter — that
-                                    // would read as loss to the controller
-                                    // (sent > delivered) and trigger false
-                                    // backoff. The token-bucket deduction
-                                    // above already charges FEC bandwidth
-                                    // against capacity.
-                                    let _ = match path.primary_peer() {
-                                        Some(peer) => path.send_to(&fec_frame, peer).await,
-                                        None => path.send(&fec_frame).await,
-                                    };
+                // Proactive FEC. Per-leg mode protects each leg's own wire
+                // stream — a repair rides the SAME leg it protects, so a leg's
+                // FEC is self-contained and a leg burst recovers locally
+                // before it reaches the combined reassembler. Combined mode
+                // protects the global striped stream (legacy). Mutually
+                // exclusive; per-leg takes precedence. Repairs ride
+                // FEC-flagged datagrams and consume no media bond_seq.
+                if let Some(seq) = sent_seq {
+                    if per_leg_mode {
+                        for &pid in &sel_legs {
+                            let Some(idx) = path_index_by_id(pid) else { continue };
+                            let rep = match per_leg_encoders[idx].as_mut() {
+                                Some(enc) => enc.push(seq, &msg.data),
+                                None => None,
+                            };
+                            let Some(rep) = rep else { continue };
+                            rep.serialize(&mut fec_payload);
+                            // bond_seq is informational on a FEC datagram — the
+                            // receiver routes by the FEC flag and parses the
+                            // repair's own seq list; it never reassembles it.
+                            let mut header =
+                                BondHeader::new(flow_id, seq, pid, Priority::Normal);
+                            header.set_fec();
+                            write_packet(&header, &fec_payload, &mut fec_frame);
+                            if let Some(path) = paths.get(idx) {
+                                let _ = match path.primary_peer() {
+                                    Some(peer) => path.send_to(&fec_frame, peer).await,
+                                    None => path.send(&fec_frame).await,
+                                };
+                            }
+                        }
+                    } else if let Some(enc) = fec_encoder.as_mut() {
+                        for rep in enc.push(seq, &msg.data) {
+                            rep.serialize(&mut fec_payload);
+                            let sel = scheduler.schedule(&PacketHints {
+                                size: fec_payload.len(),
+                                ..Default::default()
+                            });
+                            let pid = match sel {
+                                PathSelection::Single(p) => Some(p),
+                                PathSelection::Duplicate(v) => v.first().copied(),
+                                PathSelection::Drop => None,
+                            };
+                            if let Some(pid) = pid {
+                                if let Some(pos) = path_index_by_id(pid) {
+                                    let mut header = BondHeader::new(
+                                        flow_id, rep.base_seq, pid, Priority::Normal,
+                                    );
+                                    header.set_fec();
+                                    write_packet(&header, &fec_payload, &mut fec_frame);
+                                    if let Some(path) = paths.get(pos) {
+                                        // FEC bytes are NOT counted in the
+                                        // per-path media byte counter — that
+                                        // would read as loss to the controller
+                                        // (sent > delivered) and trigger false
+                                        // backoff. The token-bucket deduction
+                                        // above already charges FEC bandwidth.
+                                        let _ = match path.primary_peer() {
+                                            Some(peer) => path.send_to(&fec_frame, peer).await,
+                                            None => path.send(&fec_frame).await,
+                                        };
+                                    }
                                 }
                             }
                         }

@@ -369,6 +369,297 @@ impl FecDecoder {
     }
 }
 
+// ── Per-leg FEC ────────────────────────────────────────────────────────────
+//
+// Combined FEC (above) protects the *global* bond sequence after the
+// scheduler has already striped packets across legs. A burst loss on one
+// leg (e.g. a Starlink satellite handoff) lands on the subset of bond_seqs
+// that travelled that leg — a dense, correlated pattern in the global
+// stream that readily puts 2+ losses in one column and falls through to
+// ARQ. And one shared FEC budget means the worst leg starves every leg's
+// protection.
+//
+// PER-LEG FEC fixes both: each leg runs its own encoder/decoder over only
+// the packets that leg carries, so a leg burst is consecutive *in that
+// leg's stream* → interleaved one-per-column → recovered locally, before it
+// ever enters the combined reassembler. Each leg's FEC budget is dedicated;
+// overhead goes where the loss is (heavy on Starlink, light on a clean ISP
+// leg). ARQ stays combined + cross-leg for whatever per-leg FEC misses.
+//
+// Unlike combined FEC, the media packets are **unchanged on the wire** — a
+// per-leg repair enumerates the exact `bond_seq`s it protects, so the
+// receiver needs no per-leg sequence on every datagram and the hot send
+// path (incl. retransmits / duplicates) is untouched. The receiver recovers
+// the missing payload by XOR against the other members it has cached, then
+// re-injects it into reassembly under its real `bond_seq`.
+
+/// A per-leg repair packet: the XOR of one interleave column's members,
+/// carrying the explicit `bond_seq`s it covers (the column's `rows`
+/// members). Rides a normal FEC-flagged bond datagram on its own leg.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PerLegRepair {
+    pub columns: u16,
+    pub rows: u16,
+    /// The `bond_seq`s this repair protects (one interleave column).
+    pub seqs: Vec<u32>,
+    /// XOR of the members' `source_block`s. Length `2 + max_member_len`.
+    pub block: Bytes,
+}
+
+impl PerLegRepair {
+    /// `[u16 columns][u16 rows][u16 count][count×u32 seq][u16 block_len][block]`
+    const FIXED_HDR: usize = 2 + 2 + 2;
+
+    pub fn serialize(&self, out: &mut BytesMut) {
+        out.clear();
+        out.reserve(Self::FIXED_HDR + self.seqs.len() * 4 + 2 + self.block.len());
+        out.put_u16(self.columns);
+        out.put_u16(self.rows);
+        out.put_u16(self.seqs.len() as u16);
+        for s in &self.seqs {
+            out.put_u32(*s);
+        }
+        out.put_u16(self.block.len() as u16);
+        out.put_slice(&self.block);
+    }
+
+    pub fn parse(buf: &[u8]) -> Option<Self> {
+        if buf.len() < Self::FIXED_HDR {
+            return None;
+        }
+        let mut r = &buf[..Self::FIXED_HDR];
+        let columns = r.get_u16();
+        let rows = r.get_u16();
+        let count = r.get_u16() as usize;
+        let mut off = Self::FIXED_HDR;
+        if buf.len() < off + count * 4 + 2 {
+            return None;
+        }
+        let mut seqs = Vec::with_capacity(count);
+        for _ in 0..count {
+            let mut s = &buf[off..off + 4];
+            seqs.push(s.get_u32());
+            off += 4;
+        }
+        let mut bl = &buf[off..off + 2];
+        let block_len = bl.get_u16() as usize;
+        off += 2;
+        if buf.len() < off + block_len {
+            return None;
+        }
+        Some(Self {
+            columns,
+            rows,
+            seqs,
+            block: Bytes::copy_from_slice(&buf[off..off + block_len]),
+        })
+    }
+}
+
+/// Per-leg sender-side encoder. Feed it every packet sent on *this leg*
+/// (originals, retransmits, duplicates alike — it protects the leg's wire
+/// stream). Round-robins packets into `columns` interleave columns; emits a
+/// repair when a column accumulates `rows` members.
+pub struct PerLegFecEncoder {
+    columns: u16,
+    rows: u16,
+    cols: Vec<Vec<(u32, Bytes)>>,
+    idx: u32,
+}
+
+impl PerLegFecEncoder {
+    pub fn new(params: FecParams) -> Self {
+        let l = params.columns.max(1) as usize;
+        Self {
+            columns: params.columns,
+            rows: params.rows,
+            cols: vec![Vec::with_capacity(params.rows as usize); l],
+            idx: 0,
+        }
+    }
+
+    /// Feed one packet carried on this leg. Returns a repair once a column
+    /// fills (usually `None`).
+    pub fn push(&mut self, bond_seq: u32, payload: &Bytes) -> Option<PerLegRepair> {
+        let c = (self.idx % self.columns.max(1) as u32) as usize;
+        self.idx = self.idx.wrapping_add(1);
+        self.cols[c].push((bond_seq, payload.clone()));
+        if self.cols[c].len() >= self.rows as usize {
+            let group = std::mem::take(&mut self.cols[c]);
+            self.cols[c] = Vec::with_capacity(self.rows as usize);
+            Some(build_per_leg_repair(self.columns, self.rows, &group))
+        } else {
+            None
+        }
+    }
+}
+
+fn build_per_leg_repair(columns: u16, rows: u16, group: &[(u32, Bytes)]) -> PerLegRepair {
+    let max_payload = group.iter().map(|(_, b)| b.len()).max().unwrap_or(0);
+    let block_len = 2 + max_payload;
+    let mut acc = vec![0u8; block_len];
+    let mut scratch = vec![0u8; block_len];
+    for (_, p) in group {
+        source_block(p, block_len, &mut scratch);
+        xor_into(&mut acc, &scratch);
+    }
+    PerLegRepair {
+        columns,
+        rows,
+        seqs: group.iter().map(|(s, _)| *s).collect(),
+        block: Bytes::from(acc),
+    }
+}
+
+/// Per-leg receiver-side decoder (one per FEC-enabled leg). Feed every
+/// media packet arriving on *this leg* to [`Self::push_source`] and every
+/// per-leg repair to [`Self::push_repair`]; both return any `(bond_seq,
+/// payload)` recovered, ready to insert into the combined reassembler.
+pub struct PerLegFecDecoder {
+    /// Recent member payloads seen on this leg, for XOR reconstruction.
+    seen: std::collections::HashMap<u32, Bytes>,
+    order: std::collections::VecDeque<u32>,
+    seen_cap: usize,
+    /// Repairs that had >1 missing member when received — retried as the
+    /// members trickle in. Bounded so a permanently-incomplete column
+    /// can't pin memory.
+    pending: std::collections::VecDeque<PerLegRepair>,
+    pending_cap: usize,
+    recovered: std::collections::HashSet<u32>,
+}
+
+impl PerLegFecDecoder {
+    pub fn new(params: FecParams) -> Self {
+        // Hold enough members to cover a column whose `rows` entries are
+        // spread `columns` apart in the leg stream, with margin for
+        // reordering across a few blocks.
+        let span = (params.columns as usize) * (params.rows as usize);
+        Self {
+            seen: std::collections::HashMap::new(),
+            order: std::collections::VecDeque::new(),
+            seen_cap: (span * 4).max(256),
+            pending: std::collections::VecDeque::new(),
+            pending_cap: 32,
+            recovered: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Session-reset: drop all cached state so a stale repair from the old
+    /// seq space can't recover wrong bytes into the re-anchored buffer.
+    pub fn reset(&mut self) {
+        self.seen.clear();
+        self.order.clear();
+        self.pending.clear();
+        self.recovered.clear();
+    }
+
+    fn remember(&mut self, seq: u32, payload: Bytes) {
+        if self.seen.insert(seq, payload).is_none() {
+            self.order.push_back(seq);
+            while self.order.len() > self.seen_cap {
+                if let Some(old) = self.order.pop_front() {
+                    self.seen.remove(&old);
+                    self.recovered.remove(&old);
+                }
+            }
+        }
+    }
+
+    /// Record a media packet seen on this leg. Returns any packet a pending
+    /// repair can now recover because this arrival left it with a single
+    /// hole.
+    pub fn push_source(&mut self, bond_seq: u32, payload: &Bytes) -> Vec<(u32, Bytes)> {
+        self.remember(bond_seq, payload.clone());
+        self.retry_pending()
+    }
+
+    /// Record a per-leg repair arriving on this leg. Returns the recovered
+    /// packet if exactly one member is missing, else stashes it for retry.
+    pub fn push_repair(&mut self, r: PerLegRepair) -> Vec<(u32, Bytes)> {
+        match self.try_recover(&r) {
+            Some((seq, payload)) => {
+                self.recovered.insert(seq);
+                self.remember(seq, payload.clone());
+                let mut out = vec![(seq, payload)];
+                out.extend(self.retry_pending());
+                out
+            }
+            None => {
+                if self.pending.len() >= self.pending_cap {
+                    self.pending.pop_front();
+                }
+                self.pending.push_back(r);
+                Vec::new()
+            }
+        }
+    }
+
+    /// Re-evaluate stashed repairs (a freshly-arrived member may have made
+    /// one recoverable). Cascades so a recovery that fills another repair's
+    /// last hole also resolves.
+    fn retry_pending(&mut self) -> Vec<(u32, Bytes)> {
+        let mut out = Vec::new();
+        loop {
+            let mut progressed = false;
+            let mut i = 0;
+            while i < self.pending.len() {
+                let r = self.pending[i].clone();
+                if let Some((seq, payload)) = self.try_recover(&r) {
+                    self.pending.remove(i);
+                    self.recovered.insert(seq);
+                    self.remember(seq, payload.clone());
+                    out.push((seq, payload));
+                    progressed = true;
+                } else if r.seqs.iter().all(|s| self.seen.contains_key(s)) {
+                    // Fully present (or already recovered) — nothing to do.
+                    self.pending.remove(i);
+                } else {
+                    i += 1;
+                }
+            }
+            if !progressed {
+                break;
+            }
+        }
+        out
+    }
+
+    fn try_recover(&self, r: &PerLegRepair) -> Option<(u32, Bytes)> {
+        let mut present: Vec<&Bytes> = Vec::with_capacity(r.seqs.len());
+        let mut missing: Option<u32> = None;
+        for &s in &r.seqs {
+            match self.seen.get(&s) {
+                Some(p) => present.push(p),
+                None => {
+                    if missing.is_some() {
+                        return None; // ≥2 missing — unrecoverable for now
+                    }
+                    missing = Some(s);
+                }
+            }
+        }
+        let miss = missing?;
+        if self.recovered.contains(&miss) {
+            return None;
+        }
+        let block_len = r.block.len();
+        if present.iter().any(|p| 2 + p.len() > block_len) {
+            return None;
+        }
+        let mut acc = r.block.to_vec();
+        let mut scratch = vec![0u8; block_len];
+        for p in &present {
+            source_block(p, block_len, &mut scratch);
+            xor_into(&mut acc, &scratch);
+        }
+        let len = ((acc[0] as usize) << 8) | acc[1] as usize;
+        if 2 + len > block_len {
+            return None;
+        }
+        Some((miss, Bytes::copy_from_slice(&acc[2..2 + len])))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -520,5 +811,140 @@ mod tests {
         assert!(FecParams { columns: 10, rows: 10 }.is_valid());
         assert!(!FecParams { columns: 10, rows: 1 }.is_valid()); // rows<2 useless
         assert!(!FecParams { columns: 100, rows: 100 }.is_valid()); // block too big
+    }
+
+    // ── Per-leg FEC ──────────────────────────────────────────────────────
+
+    /// Per-leg repair survives the wire round-trip including its seq list.
+    #[test]
+    fn per_leg_repair_wire_roundtrip() {
+        let r = PerLegRepair {
+            columns: 5,
+            rows: 4,
+            seqs: vec![7, 99, 100_000, 4_000_000_000],
+            block: Bytes::from(vec![9, 8, 7, 6, 5]),
+        };
+        let mut buf = BytesMut::new();
+        r.serialize(&mut buf);
+        assert_eq!(PerLegRepair::parse(&buf).unwrap(), r);
+    }
+
+    /// A single loss on a leg is recovered via its repair — and crucially
+    /// the leg's bond_seqs are NON-contiguous (the leg only carries a
+    /// subset of the global stream), which the combined encoder can't do.
+    #[test]
+    fn per_leg_recovers_single_loss_noncontiguous_seqs() {
+        let params = FecParams { columns: 3, rows: 3 };
+        let mut enc = PerLegFecEncoder::new(params);
+        let mut dec = PerLegFecDecoder::new(params);
+
+        // Global bond_seqs this leg happened to carry (every ~3rd seq).
+        let seqs = [2u32, 5, 8, 11, 14, 17, 20, 23, 26];
+        let payloads: Vec<Bytes> = (0..9).map(|i| pkt(i as u8 + 1, 40 + i)).collect();
+        let mut repairs = Vec::new();
+        for (i, &s) in seqs.iter().enumerate() {
+            if let Some(r) = enc.push(s, &payloads[i]) {
+                repairs.push(r);
+            }
+        }
+        assert_eq!(repairs.len(), 3, "one repair per column");
+
+        // Deliver every member except seqs[4] (=14), which lands in col 1.
+        for (i, &s) in seqs.iter().enumerate() {
+            if i == 4 {
+                continue;
+            }
+            assert!(dec.push_source(s, &payloads[i]).is_empty());
+        }
+        // The repair whose seq list contains 14 recovers it.
+        let r = repairs.iter().find(|r| r.seqs.contains(&14)).unwrap().clone();
+        let rec = dec.push_repair(r);
+        assert_eq!(rec, vec![(14u32, payloads[4].clone())]);
+    }
+
+    /// A burst of `columns` consecutive *leg* packets lost is fully
+    /// recovered — the per-leg interleave spreads it one-per-column. This
+    /// is the Starlink-handoff case the feature targets.
+    #[test]
+    fn per_leg_recovers_consecutive_leg_burst() {
+        let params = FecParams { columns: 4, rows: 3 };
+        let mut enc = PerLegFecEncoder::new(params);
+        let mut dec = PerLegFecDecoder::new(params);
+        // 12 packets on this leg, arbitrary growing bond_seqs.
+        let seqs: Vec<u32> = (0..12).map(|i| 1000 + i * 7).collect();
+        let payloads: Vec<Bytes> = (0..12).map(|i| pkt(i as u8 + 1, 50)).collect();
+        let mut repairs = Vec::new();
+        for (i, &s) in seqs.iter().enumerate() {
+            if let Some(r) = enc.push(s, &payloads[i]) {
+                repairs.push(r);
+            }
+        }
+        // Drop a burst of 4 consecutive leg packets (indices 4..8).
+        let dropped: Vec<u32> = (4..8).map(|i| seqs[i]).collect();
+        for (i, &s) in seqs.iter().enumerate() {
+            if (4..8).contains(&i) {
+                continue;
+            }
+            dec.push_source(s, &payloads[i]);
+        }
+        let mut recovered = std::collections::HashMap::new();
+        for r in repairs {
+            for (s, p) in dec.push_repair(r) {
+                recovered.insert(s, p);
+            }
+        }
+        for (i, s) in dropped.iter().enumerate() {
+            assert_eq!(
+                recovered.get(s),
+                Some(&payloads[4 + i]),
+                "burst seq {s} should recover"
+            );
+        }
+    }
+
+    /// A repair arriving BEFORE its last missing member is stashed and
+    /// fires when that member finally lands (out-of-order resilience).
+    #[test]
+    fn per_leg_repair_before_source_recovers_on_arrival() {
+        let params = FecParams { columns: 2, rows: 2 };
+        let mut enc = PerLegFecEncoder::new(params);
+        let mut dec = PerLegFecDecoder::new(params);
+        let seqs = [10u32, 11, 12, 13]; // col0: 10,12 ; col1: 11,13
+        let payloads: Vec<Bytes> = (0..4).map(|i| pkt(i as u8 + 1, 30)).collect();
+        let mut repairs = Vec::new();
+        for (i, &s) in seqs.iter().enumerate() {
+            if let Some(r) = enc.push(s, &payloads[i]) {
+                repairs.push(r);
+            }
+        }
+        // col0 repair covers {10,12}. Feed the repair first with NEITHER
+        // member present → stashed as pending (2 holes). Then member 10
+        // arrives, leaving 12 as the sole hole → the stashed repair fires.
+        let col0 = repairs.iter().find(|r| r.seqs.contains(&10)).unwrap().clone();
+        assert!(dec.push_repair(col0).is_empty(), "2 missing → stashed");
+        let rec = dec.push_source(10, &payloads[0]);
+        assert_eq!(rec, vec![(12u32, payloads[2].clone())], "arrival of 10 recovers 12");
+    }
+
+    /// reset() drops cached members + pending repairs so a stale repair
+    /// can't recover into a re-anchored session.
+    #[test]
+    fn per_leg_reset_clears_state() {
+        let params = FecParams { columns: 2, rows: 2 };
+        let mut enc = PerLegFecEncoder::new(params);
+        let mut dec = PerLegFecDecoder::new(params);
+        let seqs = [10u32, 11, 12, 13];
+        let payloads: Vec<Bytes> = (0..4).map(|i| pkt(i as u8 + 1, 30)).collect();
+        let mut repairs = Vec::new();
+        for (i, &s) in seqs.iter().enumerate() {
+            if let Some(r) = enc.push(s, &payloads[i]) {
+                repairs.push(r);
+            }
+        }
+        dec.push_source(10, &payloads[0]); // col0 member present
+        dec.reset();
+        let col0 = repairs.iter().find(|r| r.seqs.contains(&10)).unwrap().clone();
+        // Both members now unknown post-reset → unrecoverable.
+        assert!(dec.push_repair(col0).is_empty());
     }
 }

@@ -236,6 +236,136 @@ async fn fec_recovers_sparse_loss_without_arq() {
     );
 }
 
+/// UDP relay that drops a single BURST of `burst` consecutive media
+/// datagrams once `skip` media packets have passed — a leg outage / Starlink
+/// handoff. FEC repairs (FEC flag set) and control always pass through.
+async fn spawn_fec_burst_relay(
+    listen: SocketAddr,
+    target: SocketAddr,
+    skip: u32,
+    burst: u32,
+) -> RelayHandle {
+    use std::sync::Mutex;
+    let stop = Arc::new(AtomicBool::new(false));
+    let sock = Arc::new(UdpSocket::bind(listen).await.unwrap());
+    let client: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
+    let sock_c = sock.clone();
+    let stop_c = stop.clone();
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 2048];
+        let mut data_count: u32 = 0;
+        loop {
+            if stop_c.load(Ordering::Relaxed) {
+                break;
+            }
+            let r = timeout(Duration::from_millis(50), sock_c.recv_from(&mut buf)).await;
+            let Ok(Ok((len, from))) = r else { continue };
+            if from == target {
+                let to = *client.lock().unwrap();
+                if let Some(c) = to {
+                    let _ = sock_c.send_to(&buf[..len], c).await;
+                }
+                continue;
+            }
+            *client.lock().unwrap() = Some(from);
+            let is_media = len >= 2 && buf[0] == 0xBC && (buf[1] & 0x08) == 0;
+            if is_media {
+                data_count += 1;
+                if data_count > skip && data_count <= skip + burst {
+                    continue; // drop the burst — per-leg FEC must recover it
+                }
+            }
+            let _ = sock_c.send_to(&buf[..len], target).await;
+        }
+    });
+    RelayHandle { stop }
+}
+
+/// Per-leg FEC recovers a *consecutive burst* on a leg with ARQ disabled —
+/// the case combined FEC struggles with, since a single leg's burst
+/// clusters in the global striped stream and overruns one column. Per-leg
+/// interleave (`columns` ≥ burst) lands each dropped packet in its own
+/// column, all XOR-recoverable. `max_nack_retries: 0` so the ONLY recovery
+/// path is the per-leg repair riding the same leg.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn per_leg_fec_recovers_leg_burst_without_arq() {
+    let rx = format!("127.0.0.1:{}", free_port().await).parse().unwrap();
+    let relay: SocketAddr = format!("127.0.0.1:{}", free_port().await).parse().unwrap();
+    // After 40 media packets, drop a burst of 6 consecutive ones.
+    let _r = spawn_fec_burst_relay(relay, rx, 40, 6).await;
+
+    let params = FecParams { columns: 8, rows: 4 };
+    let mut per_path_fec = std::collections::HashMap::new();
+    per_path_fec.insert(0u8, params);
+
+    let receiver = BondSocket::receiver(BondSocketConfig {
+        flow_id: 77,
+        hold_time: Duration::from_millis(800),
+        keepalive_interval: Duration::from_millis(120),
+        max_nack_retries: 0, // ARQ OFF — recovery can only be per-leg FEC
+        nack_delay: Duration::from_secs(3600),
+        per_path_fec: per_path_fec.clone(),
+        paths: vec![PathConfig {
+            id: 0,
+            name: "starlink".into(),
+            weight_hint: 1,
+            transport: udp_recv(rx),
+        }],
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+
+    let sender = BondSocket::sender(
+        BondSocketConfig {
+            flow_id: 77,
+            keepalive_interval: Duration::from_millis(120),
+            max_nack_retries: 0,
+            per_path_fec,
+            paths: vec![PathConfig {
+                id: 0,
+                name: "starlink".into(),
+                weight_hint: 1,
+                transport: udp_send(relay),
+            }],
+            ..Default::default()
+        },
+        CapacityAwareScheduler::new(vec![0]),
+    )
+    .await
+    .unwrap();
+
+    sleep(Duration::from_millis(200)).await;
+    const N: u32 = 256;
+    for i in 0..N {
+        sender
+            .send(Bytes::from(format!("pl-{i:06}")), PacketHints::default())
+            .await
+            .unwrap();
+        sleep(Duration::from_millis(1)).await; // pace so repairs arrive within hold
+    }
+    let mut got = 0u32;
+    while got < N {
+        match timeout(Duration::from_secs(3), receiver.recv()).await {
+            Ok(Some(_)) => got += 1,
+            _ => break,
+        }
+    }
+    sleep(Duration::from_millis(200)).await;
+
+    let s = receiver.stats().snapshot();
+    assert!(
+        s.gaps_recovered >= 6,
+        "per-leg FEC should recover the 6-packet leg burst, got recovered={}",
+        s.gaps_recovered
+    );
+    assert_eq!(
+        s.gaps_lost, 0,
+        "a burst within `columns` is fully recoverable per-leg (recovered={}, lost={}, delivered={})",
+        s.gaps_recovered, s.gaps_lost, s.packets_delivered
+    );
+}
+
 /// Two-path encrypted bond delivers in order with the adaptive
 /// scheduler; both paths carry traffic and nothing is lost on a clean
 /// link. Proves crypto integrates with the capacity scheduler e2e.

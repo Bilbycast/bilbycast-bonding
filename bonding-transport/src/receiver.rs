@@ -24,7 +24,9 @@ use bonding_protocol::control::{
 };
 use bonding_protocol::events::{PathDeadReason, PathEvent, PathEventKind};
 use bonding_protocol::packet::BondHeader;
-use bonding_protocol::protocol::fec::{FecDecoder, FecParams, FecRepair};
+use bonding_protocol::protocol::fec::{
+    FecDecoder, FecParams, FecRepair, PerLegFecDecoder, PerLegRepair,
+};
 use bonding_protocol::protocol::reassembly::{DrainItem, ReassemblyBuffer};
 use bonding_protocol::protocol::scheduler::PathId;
 use bonding_protocol::stats::{BondConnStats, PathStats};
@@ -62,6 +64,7 @@ pub(crate) fn spawn_receiver(
     nack_delay: Duration,
     max_nack_retries: u32,
     fec: Option<FecParams>,
+    per_path_fec: std::collections::HashMap<PathId, FecParams>,
 ) -> (ReceiverHandle, JoinHandle<()>) {
     let (app_tx, app_rx) = mpsc::channel::<Bytes>(1024);
 
@@ -111,6 +114,7 @@ pub(crate) fn spawn_receiver(
             nack_delay,
             max_nack_retries,
             fec,
+            per_path_fec,
         )
         .await
         {
@@ -152,12 +156,24 @@ async fn receiver_loop(
     nack_delay: Duration,
     max_nack_retries: u32,
     fec: Option<FecParams>,
+    per_path_fec: std::collections::HashMap<PathId, FecParams>,
 ) -> anyhow::Result<()> {
     let mut reassembly = ReassemblyBuffer::new(hold_time);
     // Proactive FEC decoder (opt-in). Recovers a sparse loss from the
     // column's XOR repair with no NACK round-trip; recovered packets are
     // inserted into the reassembly buffer like a late path arrival.
     let mut fec_decoder: Option<FecDecoder> = fec.map(FecDecoder::new);
+
+    // Per-leg FEC decoders (mutually exclusive with combined `fec`): one per
+    // FEC-enabled leg, index-aligned to `paths`. A non-empty map selects
+    // per-leg mode; each leg's decoder recovers a loss on that leg from the
+    // repairs that rode the same leg, then re-injects the packet under its
+    // real bond_seq into the shared reassembler.
+    let per_leg_mode = !per_path_fec.is_empty();
+    let mut per_leg_decoders: Vec<Option<PerLegFecDecoder>> = paths
+        .iter()
+        .map(|p| per_path_fec.get(&p.id()).map(|prm| PerLegFecDecoder::new(*prm)))
+        .collect();
 
     // Adaptive hold-time servo (opt-in via hold_max > hold_time). Grows
     // the reorder/recovery budget toward the realized recovery latency
@@ -349,6 +365,9 @@ async fn receiver_loop(
                                         if let Some(dec) = fec_decoder.as_mut() {
                                             dec.reset();
                                         }
+                                        for d in per_leg_decoders.iter_mut().flatten() {
+                                            d.reset();
+                                        }
                                         conn_stats
                                             .session_resets
                                             .fetch_add(1, Ordering::Relaxed);
@@ -470,19 +489,34 @@ async fn receiver_loop(
                 // buffer (it carries no media bond_seq). Recovered packets
                 // are inserted as late path arrivals.
                 if header.is_fec() {
-                    if let Some(dec) = fec_decoder.as_mut() {
-                        if let Some(rep) = FecRepair::parse(&payload) {
-                            let fnow = Instant::now();
-                            for (rseq, rpayload) in dec.push_repair(rep) {
-                                let o = reassembly.insert(rseq, rpayload, path_id, fnow);
-                                if o.recovered {
-                                    conn_stats.gaps_recovered.fetch_add(1, Ordering::Relaxed);
-                                    pending_nacks.remove(&rseq);
-                                    if let Some(age) = o.recovered_age {
-                                        if age > hold_window_max {
-                                            hold_window_max = age;
-                                        }
-                                    }
+                    let fnow = Instant::now();
+                    // Per-leg repairs are parsed + decoded against THIS leg's
+                    // decoder (the repair rode the leg it protects); combined
+                    // repairs go to the single global decoder. Either way the
+                    // recovered packets carry their real bond_seq and insert
+                    // into the shared reassembler as late path arrivals.
+                    let recoveries: Vec<(u32, bytes::Bytes)> = if per_leg_mode {
+                        match (path_idx, PerLegRepair::parse(&payload)) {
+                            (Some(idx), Some(rep)) => match per_leg_decoders[idx].as_mut() {
+                                Some(dec) => dec.push_repair(rep),
+                                None => Vec::new(),
+                            },
+                            _ => Vec::new(),
+                        }
+                    } else {
+                        match (fec_decoder.as_mut(), FecRepair::parse(&payload)) {
+                            (Some(dec), Some(rep)) => dec.push_repair(rep),
+                            _ => Vec::new(),
+                        }
+                    };
+                    for (rseq, rpayload) in recoveries {
+                        let o = reassembly.insert(rseq, rpayload, path_id, fnow);
+                        if o.recovered {
+                            conn_stats.gaps_recovered.fetch_add(1, Ordering::Relaxed);
+                            pending_nacks.remove(&rseq);
+                            if let Some(age) = o.recovered_age {
+                                if age > hold_window_max {
+                                    hold_window_max = age;
                                 }
                             }
                         }
@@ -576,6 +610,9 @@ async fn receiver_loop(
                         if let Some(dec) = fec_decoder.as_mut() {
                             dec.reset();
                         }
+                        for d in per_leg_decoders.iter_mut().flatten() {
+                            d.reset();
+                        }
                         conn_stats.session_resets.fetch_add(1, Ordering::Relaxed);
                         stale_run_start = None;
                         stale_run_count = 0;
@@ -632,9 +669,25 @@ async fn receiver_loop(
 
                 // Feed the FEC decoder so a later repair (or a sibling
                 // source) can recover a loss in this column with no NACK.
-                if let Some(dec) = fec_decoder.as_mut() {
+                // Per-leg: feed THIS leg's decoder (it only protects this
+                // leg's packets); combined: feed the single global decoder.
+                let fec_recoveries: Vec<(u32, bytes::Bytes)> = if per_leg_mode {
+                    match path_idx {
+                        Some(idx) => match per_leg_decoders[idx].as_mut() {
+                            Some(dec) => dec.push_source(header.bond_seq, &payload),
+                            None => Vec::new(),
+                        },
+                        None => Vec::new(),
+                    }
+                } else {
+                    match fec_decoder.as_mut() {
+                        Some(dec) => dec.push_source(header.bond_seq, &payload),
+                        None => Vec::new(),
+                    }
+                };
+                if !fec_recoveries.is_empty() {
                     let fnow = Instant::now();
-                    for (rseq, rpayload) in dec.push_source(header.bond_seq, &payload) {
+                    for (rseq, rpayload) in fec_recoveries {
                         let o = reassembly.insert(rseq, rpayload, path_id, fnow);
                         if o.recovered {
                             conn_stats.gaps_recovered.fetch_add(1, Ordering::Relaxed);

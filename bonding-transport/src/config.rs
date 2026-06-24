@@ -42,10 +42,21 @@ pub struct BondSocketConfig {
     /// this bond is ChaCha20-Poly1305 sealed (both ends must share the
     /// key). QUIC paths are already TLS-encrypted and ignore this.
     pub encryption_key: Option<Vec<u8>>,
-    /// Optional proactive FEC geometry. `None` = off (default). When set,
-    /// the sender emits XOR repair packets and the receiver recovers
-    /// sparse loss without a NACK round-trip. Both ends must agree.
+    /// Optional **combined** proactive FEC geometry. `None` = off (default).
+    /// When set, the sender emits XOR repair packets over the *global* bond
+    /// sequence and the receiver recovers sparse loss without a NACK
+    /// round-trip. Both ends must agree. Mutually exclusive with
+    /// [`Self::per_path_fec`] (combined protects the striped stream; per-leg
+    /// protects each leg independently — you pick one model per bond).
     pub fec: Option<FecParams>,
+    /// Optional **per-leg** proactive FEC, keyed by `PathId`. When non-empty,
+    /// each listed leg runs its own FEC over only the packets it carries, so
+    /// a burst on one leg (e.g. a Starlink handoff) is recovered locally
+    /// before it pollutes the combined reassembler, and each leg's FEC
+    /// budget is dedicated. Activating this (non-empty) selects per-leg mode
+    /// and the combined [`Self::fec`] is ignored. Both ends must list the
+    /// same geometry for a leg. ARQ stays combined + cross-leg regardless.
+    pub per_path_fec: std::collections::HashMap<PathId, FecParams>,
     /// Paths registered on this socket.
     pub paths: Vec<PathConfig>,
 }
@@ -63,6 +74,7 @@ impl Default for BondSocketConfig {
             max_nack_retries: 8,
             encryption_key: None,
             fec: None,
+            per_path_fec: std::collections::HashMap::new(),
             paths: Vec::new(),
         }
     }

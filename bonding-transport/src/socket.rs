@@ -108,6 +108,7 @@ impl BondSocket {
             cfg.keepalive_miss_threshold,
             cfg.retransmit_capacity,
             cfg.fec,
+            cfg.per_path_fec.clone(),
             events_tx.clone(),
             cancel.clone(),
         );
@@ -156,6 +157,7 @@ impl BondSocket {
             cfg.nack_delay,
             cfg.max_nack_retries,
             cfg.fec,
+            cfg.per_path_fec.clone(),
         );
         let mut tasks = vec![task];
         if let Some(w) = spawn_interface_watcher(&udp_handles, events_tx.clone(), cancel.clone()) {
