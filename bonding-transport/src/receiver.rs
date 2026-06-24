@@ -27,6 +27,15 @@ use bonding_protocol::packet::BondHeader;
 use bonding_protocol::protocol::fec::{
     FecDecoder, FecParams, FecRepair, PerLegFecDecoder, PerLegRepair,
 };
+use bonding_protocol::protocol::rs::{PerLegRsDecoder, PerLegRsRepair};
+
+use crate::config::PerLegFecKind;
+
+/// A FEC-enabled leg's decoder — XOR or Reed-Solomon, per config.
+enum LegDec {
+    Xor(PerLegFecDecoder),
+    Rs(PerLegRsDecoder),
+}
 use bonding_protocol::protocol::reassembly::{DrainItem, ReassemblyBuffer};
 use bonding_protocol::protocol::scheduler::PathId;
 use bonding_protocol::stats::{BondConnStats, PathStats};
@@ -64,7 +73,7 @@ pub(crate) fn spawn_receiver(
     nack_delay: Duration,
     max_nack_retries: u32,
     fec: Option<FecParams>,
-    per_path_fec: std::collections::HashMap<PathId, FecParams>,
+    per_path_fec: std::collections::HashMap<PathId, PerLegFecKind>,
 ) -> (ReceiverHandle, JoinHandle<()>) {
     let (app_tx, app_rx) = mpsc::channel::<Bytes>(1024);
 
@@ -156,7 +165,7 @@ async fn receiver_loop(
     nack_delay: Duration,
     max_nack_retries: u32,
     fec: Option<FecParams>,
-    per_path_fec: std::collections::HashMap<PathId, FecParams>,
+    per_path_fec: std::collections::HashMap<PathId, PerLegFecKind>,
 ) -> anyhow::Result<()> {
     let mut reassembly = ReassemblyBuffer::new(hold_time);
     // Proactive FEC decoder (opt-in). Recovers a sparse loss from the
@@ -170,9 +179,16 @@ async fn receiver_loop(
     // repairs that rode the same leg, then re-injects the packet under its
     // real bond_seq into the shared reassembler.
     let per_leg_mode = !per_path_fec.is_empty();
-    let mut per_leg_decoders: Vec<Option<PerLegFecDecoder>> = paths
+    let mut per_leg_decoders: Vec<Option<LegDec>> = paths
         .iter()
-        .map(|p| per_path_fec.get(&p.id()).map(|prm| PerLegFecDecoder::new(*prm)))
+        .map(|p| {
+            per_path_fec.get(&p.id()).map(|kind| match kind {
+                PerLegFecKind::Xor(prm) => LegDec::Xor(PerLegFecDecoder::new(*prm)),
+                PerLegFecKind::ReedSolomon { data, parity } => {
+                    LegDec::Rs(PerLegRsDecoder::new(*data, *parity))
+                }
+            })
+        })
         .collect();
 
     // Adaptive hold-time servo (opt-in via hold_max > hold_time). Grows
@@ -366,7 +382,10 @@ async fn receiver_loop(
                                             dec.reset();
                                         }
                                         for d in per_leg_decoders.iter_mut().flatten() {
-                                            d.reset();
+                                            match d {
+                                                LegDec::Xor(dec) => dec.reset(),
+                                                LegDec::Rs(dec) => dec.reset(),
+                                            }
                                         }
                                         conn_stats
                                             .session_resets
@@ -496,12 +515,21 @@ async fn receiver_loop(
                     // recovered packets carry their real bond_seq and insert
                     // into the shared reassembler as late path arrivals.
                     let recoveries: Vec<(u32, bytes::Bytes)> = if per_leg_mode {
-                        match (path_idx, PerLegRepair::parse(&payload)) {
-                            (Some(idx), Some(rep)) => match per_leg_decoders[idx].as_mut() {
-                                Some(dec) => dec.push_repair(rep),
-                                None => Vec::new(),
-                            },
-                            _ => Vec::new(),
+                        // Parse the repair as this leg's configured algorithm.
+                        match path_idx.and_then(|idx| {
+                            per_leg_decoders[idx].as_mut().map(|d| (idx, d))
+                        }) {
+                            Some((_, LegDec::Xor(dec))) => {
+                                PerLegRepair::parse(&payload)
+                                    .map(|rep| dec.push_repair(rep))
+                                    .unwrap_or_default()
+                            }
+                            Some((_, LegDec::Rs(dec))) => {
+                                PerLegRsRepair::parse(&payload)
+                                    .map(|rep| dec.push_repair(rep))
+                                    .unwrap_or_default()
+                            }
+                            None => Vec::new(),
                         }
                     } else {
                         match (fec_decoder.as_mut(), FecRepair::parse(&payload)) {
@@ -611,7 +639,10 @@ async fn receiver_loop(
                             dec.reset();
                         }
                         for d in per_leg_decoders.iter_mut().flatten() {
-                            d.reset();
+                            match d {
+                                LegDec::Xor(dec) => dec.reset(),
+                                LegDec::Rs(dec) => dec.reset(),
+                            }
                         }
                         conn_stats.session_resets.fetch_add(1, Ordering::Relaxed);
                         stale_run_start = None;
@@ -672,11 +703,9 @@ async fn receiver_loop(
                 // Per-leg: feed THIS leg's decoder (it only protects this
                 // leg's packets); combined: feed the single global decoder.
                 let fec_recoveries: Vec<(u32, bytes::Bytes)> = if per_leg_mode {
-                    match path_idx {
-                        Some(idx) => match per_leg_decoders[idx].as_mut() {
-                            Some(dec) => dec.push_source(header.bond_seq, &payload),
-                            None => Vec::new(),
-                        },
+                    match path_idx.and_then(|idx| per_leg_decoders[idx].as_mut()) {
+                        Some(LegDec::Xor(dec)) => dec.push_source(header.bond_seq, &payload),
+                        Some(LegDec::Rs(dec)) => dec.push_source(header.bond_seq, &payload),
                         None => Vec::new(),
                     }
                 } else {

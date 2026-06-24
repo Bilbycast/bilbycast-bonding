@@ -11,4 +11,5 @@ pub mod fec;
 pub mod path_health;
 pub mod reassembly;
 pub mod retransmit;
+pub mod rs;
 pub mod scheduler;

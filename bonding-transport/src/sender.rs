@@ -25,6 +25,15 @@ use bonding_protocol::control::{
 use bonding_protocol::events::{PathDeadReason, PathEvent, PathEventKind, PathRebuildReason};
 use bonding_protocol::packet::{BondHeader, Priority, write_packet};
 use bonding_protocol::protocol::fec::{FecEncoder, FecParams, PerLegFecEncoder};
+use bonding_protocol::protocol::rs::PerLegRsEncoder;
+
+use crate::config::PerLegFecKind;
+
+/// A FEC-enabled leg's encoder — XOR or Reed-Solomon, per config.
+enum LegEnc {
+    Xor(PerLegFecEncoder),
+    Rs(PerLegRsEncoder),
+}
 use bonding_protocol::protocol::path_health::PathHealth;
 use bonding_protocol::protocol::retransmit::RetransmitBuffer;
 use bonding_protocol::protocol::scheduler::{
@@ -75,7 +84,7 @@ pub(crate) fn spawn_sender<S>(
     keepalive_miss_threshold: u32,
     retransmit_capacity: usize,
     fec: Option<FecParams>,
-    per_path_fec: std::collections::HashMap<PathId, FecParams>,
+    per_path_fec: std::collections::HashMap<PathId, PerLegFecKind>,
     events_tx: broadcast::Sender<PathEvent>,
     cancel: CancellationToken,
 ) -> (SenderHandle, JoinHandle<()>)
@@ -152,7 +161,7 @@ async fn sender_loop<S>(
     keepalive_miss_threshold: u32,
     retransmit_capacity: usize,
     fec: Option<FecParams>,
-    per_path_fec: std::collections::HashMap<PathId, FecParams>,
+    per_path_fec: std::collections::HashMap<PathId, PerLegFecKind>,
     events_tx: broadcast::Sender<PathEvent>,
     mut app_rx: mpsc::Receiver<OutboundMessage>,
     mut ctrl_rx: mpsc::Receiver<(PathId, PathDatagram)>,
@@ -178,9 +187,16 @@ where
     // protects only the packets that leg carries, so a leg burst is
     // recovered locally before it reaches the combined reassembler.
     let per_leg_mode = !per_path_fec.is_empty();
-    let mut per_leg_encoders: Vec<Option<PerLegFecEncoder>> = paths
+    let mut per_leg_encoders: Vec<Option<LegEnc>> = paths
         .iter()
-        .map(|p| per_path_fec.get(&p.id()).map(|prm| PerLegFecEncoder::new(*prm)))
+        .map(|p| {
+            per_path_fec.get(&p.id()).map(|kind| match kind {
+                PerLegFecKind::Xor(prm) => LegEnc::Xor(PerLegFecEncoder::new(*prm)),
+                PerLegFecKind::ReedSolomon { data, parity } => {
+                    LegEnc::Rs(PerLegRsEncoder::new(*data, *parity))
+                }
+            })
+        })
         .collect();
 
     let mut ka_interval = tokio::time::interval(keepalive_interval);
@@ -329,24 +345,33 @@ where
                     if per_leg_mode {
                         for &pid in &sel_legs {
                             let Some(idx) = path_index_by_id(pid) else { continue };
-                            let rep = match per_leg_encoders[idx].as_mut() {
-                                Some(enc) => enc.push(seq, &msg.data),
-                                None => None,
-                            };
-                            let Some(rep) = rep else { continue };
-                            rep.serialize(&mut fec_payload);
-                            // bond_seq is informational on a FEC datagram — the
-                            // receiver routes by the FEC flag and parses the
-                            // repair's own seq list; it never reassembles it.
-                            let mut header =
-                                BondHeader::new(flow_id, seq, pid, Priority::Normal);
-                            header.set_fec();
-                            write_packet(&header, &fec_payload, &mut fec_frame);
-                            if let Some(path) = paths.get(idx) {
-                                let _ = match path.primary_peer() {
-                                    Some(peer) => path.send_to(&fec_frame, peer).await,
-                                    None => path.send(&fec_frame).await,
-                                };
+                            // XOR emits ≤1 repair per packet (column fill); RS
+                            // emits `parity` repairs when a block fills. Each
+                            // rides the SAME leg it protects. bond_seq is
+                            // informational on a FEC datagram — the receiver
+                            // routes by the flag + the repair's own seq list.
+                            match per_leg_encoders[idx].as_mut() {
+                                Some(LegEnc::Xor(enc)) => {
+                                    if let Some(rep) = enc.push(seq, &msg.data) {
+                                        rep.serialize(&mut fec_payload);
+                                        send_fec_frame(
+                                            flow_id, seq, pid, idx, &fec_payload,
+                                            &mut fec_frame, &paths,
+                                        )
+                                        .await;
+                                    }
+                                }
+                                Some(LegEnc::Rs(enc)) => {
+                                    for rep in enc.push(seq, &msg.data) {
+                                        rep.serialize(&mut fec_payload);
+                                        send_fec_frame(
+                                            flow_id, seq, pid, idx, &fec_payload,
+                                            &mut fec_frame, &paths,
+                                        )
+                                        .await;
+                                    }
+                                }
+                                None => {}
                             }
                         }
                     } else if let Some(enc) = fec_encoder.as_mut() {
@@ -639,6 +664,29 @@ where
                 }
             }
         }
+    }
+}
+
+/// Send one per-leg FEC repair on a specific leg. FEC bytes are NOT counted
+/// in the per-path media byte counter (that would read as loss to the
+/// congestion controller and trigger false backoff).
+async fn send_fec_frame(
+    flow_id: u32,
+    seq: u32,
+    pid: PathId,
+    idx: usize,
+    payload: &[u8],
+    frame: &mut BytesMut,
+    paths: &[Path],
+) {
+    let mut header = BondHeader::new(flow_id, seq, pid, Priority::Normal);
+    header.set_fec();
+    write_packet(&header, payload, frame);
+    if let Some(path) = paths.get(idx) {
+        let _ = match path.primary_peer() {
+            Some(peer) => path.send_to(frame, peer).await,
+            None => path.send(frame).await,
+        };
     }
 }
 

@@ -55,8 +55,8 @@ pub struct BondSocketConfig {
     /// before it pollutes the combined reassembler, and each leg's FEC
     /// budget is dedicated. Activating this (non-empty) selects per-leg mode
     /// and the combined [`Self::fec`] is ignored. Both ends must list the
-    /// same geometry for a leg. ARQ stays combined + cross-leg regardless.
-    pub per_path_fec: std::collections::HashMap<PathId, FecParams>,
+    /// same algorithm + geometry for a leg. ARQ stays combined + cross-leg.
+    pub per_path_fec: std::collections::HashMap<PathId, PerLegFecKind>,
     /// Paths registered on this socket.
     pub paths: Vec<PathConfig>,
 }
@@ -78,6 +78,18 @@ impl Default for BondSocketConfig {
             paths: Vec::new(),
         }
     }
+}
+
+/// Per-leg FEC algorithm + geometry for one leg.
+#[derive(Debug, Clone, Copy)]
+pub enum PerLegFecKind {
+    /// Interleaved XOR (SMPTE 2022-1 column model) — recovers one loss per
+    /// column; a burst up to `columns` consecutive leg packets.
+    Xor(FecParams),
+    /// Reed-Solomon — recovers up to `parity` losses among each
+    /// `data + parity` block. Stronger for a chronically-lossy leg, at
+    /// `parity/data` overhead. `data + parity ≤ 256`.
+    ReedSolomon { data: u16, parity: u16 },
 }
 
 /// A single path definition.

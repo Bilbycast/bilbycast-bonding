@@ -19,7 +19,7 @@ use tokio::time::{sleep, timeout};
 
 use bonding_transport::{
     BondSocket, BondSocketConfig, CapacityAwareScheduler, CongestionConfig, FecParams,
-    PacketHints, PathConfig, PathPrior, PathTransport,
+    PacketHints, PathConfig, PathPrior, PathTransport, PerLegFecKind,
 };
 
 async fn free_port() -> u16 {
@@ -296,7 +296,7 @@ async fn per_leg_fec_recovers_leg_burst_without_arq() {
 
     let params = FecParams { columns: 8, rows: 4 };
     let mut per_path_fec = std::collections::HashMap::new();
-    per_path_fec.insert(0u8, params);
+    per_path_fec.insert(0u8, PerLegFecKind::Xor(params));
 
     let receiver = BondSocket::receiver(BondSocketConfig {
         flow_id: 77,
@@ -362,6 +362,84 @@ async fn per_leg_fec_recovers_leg_burst_without_arq() {
     assert_eq!(
         s.gaps_lost, 0,
         "a burst within `columns` is fully recoverable per-leg (recovered={}, lost={}, delivered={})",
+        s.gaps_recovered, s.gaps_lost, s.packets_delivered
+    );
+}
+
+/// Per-leg **Reed-Solomon** FEC recovers *multiple* losses per block with ARQ
+/// off — the strength XOR lacks (XOR recovers one per column). Drops ~1-in-5
+/// media packets (≈1–2 per 8-data RS block, parity 4) and asserts the only
+/// recovery path — the per-leg RS repairs riding the same leg — loses nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn per_leg_rs_recovers_loss_without_arq() {
+    let rx = format!("127.0.0.1:{}", free_port().await).parse().unwrap();
+    let relay: SocketAddr = format!("127.0.0.1:{}", free_port().await).parse().unwrap();
+    // Drop every 5th media packet (FEC repairs pass) — ≈1–2 per RS block.
+    let _r = spawn_fec_drop_relay(relay, rx, 5).await;
+
+    let mut per_path_fec = std::collections::HashMap::new();
+    per_path_fec.insert(0u8, PerLegFecKind::ReedSolomon { data: 8, parity: 4 });
+
+    let receiver = BondSocket::receiver(BondSocketConfig {
+        flow_id: 88,
+        hold_time: Duration::from_millis(800),
+        keepalive_interval: Duration::from_millis(120),
+        max_nack_retries: 0, // ARQ OFF — recovery can only be per-leg RS FEC
+        nack_delay: Duration::from_secs(3600),
+        per_path_fec: per_path_fec.clone(),
+        paths: vec![PathConfig {
+            id: 0,
+            name: "starlink".into(),
+            weight_hint: 1,
+            transport: udp_recv(rx),
+        }],
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+
+    let sender = BondSocket::sender(
+        BondSocketConfig {
+            flow_id: 88,
+            keepalive_interval: Duration::from_millis(120),
+            max_nack_retries: 0,
+            per_path_fec,
+            paths: vec![PathConfig {
+                id: 0,
+                name: "starlink".into(),
+                weight_hint: 1,
+                transport: udp_send(relay),
+            }],
+            ..Default::default()
+        },
+        CapacityAwareScheduler::new(vec![0]),
+    )
+    .await
+    .unwrap();
+
+    sleep(Duration::from_millis(200)).await;
+    const N: u32 = 256;
+    for i in 0..N {
+        sender
+            .send(Bytes::from(format!("rs-{i:06}")), PacketHints::default())
+            .await
+            .unwrap();
+        sleep(Duration::from_millis(1)).await;
+    }
+    let mut got = 0u32;
+    while got < N {
+        match timeout(Duration::from_secs(3), receiver.recv()).await {
+            Ok(Some(_)) => got += 1,
+            _ => break,
+        }
+    }
+    sleep(Duration::from_millis(200)).await;
+
+    let s = receiver.stats().snapshot();
+    assert!(s.gaps_recovered > 0, "RS should have recovered drops, got {}", s.gaps_recovered);
+    assert_eq!(
+        s.gaps_lost, 0,
+        "losses within parity are fully recoverable (recovered={}, lost={}, delivered={})",
         s.gaps_recovered, s.gaps_lost, s.packets_delivered
     );
 }
