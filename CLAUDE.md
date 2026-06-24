@@ -125,6 +125,7 @@ Each bonded packet is a 12-byte header followed by opaque payload:
 | **Edge integration** (`input_bonded`, `output_bonded`) | **Done** — live in `bilbycast-edge`; `Adaptive` scheduler is the edge default, telemetry on `OutputStats.bond_stats` |
 | `MediaAwareScheduler` (edge-side, parses NAL) | Done (edge-side, `engine/bonded_scheduler.rs`; layered over WeightedRtt or CapacityAware) |
 | **Proactive FEC** (interleaved XOR) | **Done (opt-in, off by default)** — `protocol/fec.rs`, FEC-flagged repair datagrams; sender emits, receiver recovers into reassembly. Codec + e2e (recover-without-ARQ) tested. Complements ARQ + IDR-dup + multi-path. |
+| **Per-leg FEC** (interleaved XOR, per path) | **Done (opt-in)** — `PerLegFecEncoder`/`Decoder` in `protocol/fec.rs`; each FEC-enabled leg protects only its own stream so a leg burst (e.g. a Starlink handoff) recovers locally instead of clustering in the combined column model. Repair enumerates its `bond_seq`s, so media packets are unchanged on the wire. Selected by `BondSocketConfig.per_path_fec` (non-empty), mutually exclusive with the combined `fec`. Codec units + leg-burst e2e tested. **Design + wire format: [`docs/per-leg-fec.md`](docs/per-leg-fec.md).** |
 
 ## Adaptive scheduling, congestion control & encryption
 
