@@ -175,14 +175,37 @@ const OWD_COLD_START_SAMPLES: u32 = 16;
 /// recompute) instead of waiting on the slower keepalive liveness timer.
 const EQ_LEG_STALE: Duration = Duration::from_millis(800);
 /// In `Auto` mode, alignment engages only when the measured inter-leg OWD
-/// **skew** (slowest eligible leg − fastest) exceeds this floor — below it the
+/// **skew** (slowest eligible leg − fastest) exceeds a floor — below it the
 /// jitter hold already absorbs the spread and time-aligning would only add
 /// latency for no aggregation benefit, so a homogeneous bond stays a no-op.
-/// Hysteresis: engage above the floor, disengage below half. **This value is
-/// the live-tunable knob** — it must be validated against real cellular +
-/// Starlink jitter (too low → engages on noise; too high → a genuinely skewed
-/// bond never aligns). `On` mode ignores it; `Off` never measures.
-const SKEW_FLOOR_US: u32 = 20_000;
+/// The floor is **derived from the jitter-hold** (`SKEW_FLOOR_HOLD_NUM/DEN` of
+/// `hold_floor`, clamped to `[MIN,MAX]`): the hold already covers spread up to
+/// ~`hold_floor` for free, so the right place to start aligning scales with it.
+/// Magnitude hysteresis (engage above the floor, disengage below half) is
+/// paired with the time debounce below. `On` mode ignores the floor; `Off`
+/// never measures.
+///
+/// **Live-validated 2026-06-25 (5G + Starlink + ISP, edge1→edge6):** a *fixed*
+/// 20 ms floor sat dead-centre in the real inter-leg skew band (~12–24 ms,
+/// mean ~13 ms) and FLAPPED — a starved bufferbloat leg churned in/out of
+/// `eq_eligible` around the floor every recompute. Deriving from the hold
+/// (60 ms hold → 45 ms floor) + the debounce stops that.
+const SKEW_FLOOR_MIN_US: u32 = 20_000;
+/// Upper clamp on the derived floor — a very deep hold must not push the engage
+/// threshold so high a genuinely large skew never aligns.
+const SKEW_FLOOR_MAX_US: u32 = 200_000;
+/// Derived floor = `SKEW_FLOOR_HOLD_NUM/DEN × hold_floor` (integer math on
+/// `Duration::as_micros()` u128). 3/4 = engage a little before the skew fully
+/// saturates the hold.
+const SKEW_FLOOR_HOLD_NUM: u128 = 3;
+const SKEW_FLOOR_HOLD_DEN: u128 = 4;
+/// Engage/disengage **debounce**: the skew must stay on one side of the floor
+/// for this many consecutive ~5 Hz recomputes before alignment flips. Kills the
+/// flap when a starved bufferbloat leg churns in/out of `eq_eligible` (each
+/// re-entry injects its sticky windowed-min OWD and would otherwise toggle
+/// engage on the very next recompute).
+const EQ_ENGAGE_DEBOUNCE: u32 = 3;
+const EQ_DISENGAGE_DEBOUNCE: u32 = 3;
 /// Grace window after the first stamp during which the loss_deadline covers the
 /// full equalization budget — long enough for every alive leg to warm
 /// (`OWD_COLD_START_SAMPLES`) and the engage decision to settle, so a high-skew
@@ -253,6 +276,8 @@ fn reset_equalization_state(
     eq_engaged: &mut bool,
     eq_active_since: &mut Option<Instant>,
     peer_align_suppress: &mut bool,
+    eq_above_count: &mut u32,
+    eq_below_count: &mut u32,
 ) {
     for l in leg_owd.iter_mut() {
         *l = LegDelay::new(rx_epoch);
@@ -261,6 +286,8 @@ fn reset_equalization_state(
     *eq_engaged = false;
     *eq_active_since = None;
     *peer_align_suppress = false;
+    *eq_above_count = 0;
+    *eq_below_count = 0;
 }
 
 /// Relative OWD (µs) of leg `idx` vs the fastest WARM leg — how much later
@@ -396,6 +423,26 @@ async fn receiver_loop(
     // gap ages out.
     let eq_budget = hold_max.unwrap_or(hold_time).max(hold_time);
     let mut eq_last_recompute = Instant::now();
+    // Skew-engage floor derived from the jitter-hold (engage only above what the
+    // hold already absorbs), clamped to a sane range. Paired with the debounce
+    // counters below so a leg churning in/out of eligibility around the floor
+    // can't flap alignment (see SKEW_FLOOR_* + live note 2026-06-25).
+    let skew_floor_us: u32 = {
+        let raw = hold_floor.as_micros() * SKEW_FLOOR_HOLD_NUM / SKEW_FLOOR_HOLD_DEN;
+        (raw.min(u64::MAX as u128) as u64)
+            .clamp(SKEW_FLOOR_MIN_US as u64, SKEW_FLOOR_MAX_US as u64) as u32
+    };
+    let mut eq_above_count: u32 = 0;
+    let mut eq_below_count: u32 = 0;
+    if equalization.measures() {
+        log::info!(
+            "bond flow {flow_id}: equalization {equalization:?}, skew-engage floor {} ms \
+             (derived from {} ms jitter-hold), budget {} ms",
+            skew_floor_us / 1000,
+            hold_floor.as_millis(),
+            eq_budget.as_millis(),
+        );
+    }
 
     // Session epoch adoption (sender-restart detection). 0 = none seen
     // yet (fresh receiver, or a v1/v2 peer that doesn't send epochs).
@@ -575,6 +622,8 @@ async fn receiver_loop(
                                             &mut eq_engaged,
                                             &mut eq_active_since,
                                             &mut peer_align_suppress,
+                                            &mut eq_above_count,
+                                            &mut eq_below_count,
                                         );
                                         pending_nacks.clear();
                                         retx_rtt = None;
@@ -913,6 +962,8 @@ async fn receiver_loop(
                             &mut eq_engaged,
                             &mut eq_active_since,
                             &mut peer_align_suppress,
+                            &mut eq_above_count,
+                            &mut eq_below_count,
                         );
                         pending_nacks.clear();
                         retx_rtt = None;
@@ -1095,13 +1146,37 @@ async fn receiver_loop(
                         // Engage decision. `On` force-engages (and overrides the
                         // sender's ride-fastest suppression). `Auto` engages only
                         // when the skew is worth the latency AND the sender isn't
-                        // ride-fastest. Hysteresis (engage above the floor,
-                        // disengage below half) stops a near-floor skew flapping.
+                        // ride-fastest. Two-stage anti-flap: MAGNITUDE hysteresis
+                        // (engage above the hold-derived floor, disengage below
+                        // half) + a TIME debounce — the skew must hold one side
+                        // for EQ_*_DEBOUNCE consecutive recomputes before the
+                        // engage state flips, so a bufferbloat leg churning in/out
+                        // of `eq_eligible` around the floor can't toggle it.
                         let force = matches!(equalization, EqualizationMode::On);
                         let suppressed = peer_align_suppress && !force;
-                        let skew_threshold =
-                            if eq_engaged { SKEW_FLOOR_US / 2 } else { SKEW_FLOOR_US };
-                        let should_engage = !suppressed && (force || skew_us > skew_threshold);
+                        if skew_us > skew_floor_us {
+                            eq_above_count = eq_above_count.saturating_add(1);
+                            eq_below_count = 0;
+                        } else if skew_us < skew_floor_us / 2 {
+                            eq_below_count = eq_below_count.saturating_add(1);
+                            eq_above_count = 0;
+                        } else {
+                            // Inside the hysteresis band: hold the current engage
+                            // state, don't progress either flip.
+                            eq_above_count = 0;
+                            eq_below_count = 0;
+                        }
+                        let should_engage = if force {
+                            true
+                        } else if suppressed {
+                            false
+                        } else if eq_engaged {
+                            // Stay engaged until sustained below the disengage band.
+                            eq_below_count < EQ_DISENGAGE_DEBOUNCE
+                        } else {
+                            // Engage only after sustained above-floor skew.
+                            eq_above_count >= EQ_ENGAGE_DEBOUNCE
+                        };
                         if should_engage {
                             let budget_us = eq_budget.as_micros().min(u32::MAX as u128) as u32;
                             for (idx, leg) in leg_owd.iter().enumerate() {
@@ -1127,14 +1202,29 @@ async fn receiver_loop(
                             // Equalization now drives the hold — the adaptive
                             // servo stands down. loss_deadline is owned by the
                             // single rule at the end of the pump tick.
+                            if !eq_engaged {
+                                log::info!(
+                                    "bond flow {flow_id}: equalization ENGAGED — aligning legs \
+                                     (skew {} ms > floor {} ms)",
+                                    skew_us / 1000,
+                                    skew_floor_us / 1000,
+                                );
+                            }
                             eq_engaged = true;
+                            eq_below_count = 0;
                         } else if eq_engaged {
-                            // Was aligning; skew dropped below the floor or the
-                            // sender went ride-fastest → stand down: clear the
-                            // per-leg offsets so the adaptive hold servo (gated on
-                            // !eq_engaged) takes back over for residual jitter.
+                            // Was aligning; skew stayed below the floor for the
+                            // debounce window or the sender went ride-fastest →
+                            // stand down: clear the per-leg offsets so the adaptive
+                            // hold servo (gated on !eq_engaged) takes back over.
                             reassembly.clear_equalization();
+                            log::info!(
+                                "bond flow {flow_id}: equalization disengaged \
+                                 (skew {} ms below floor for debounce)",
+                                skew_us / 1000,
+                            );
                             eq_engaged = false;
+                            eq_above_count = 0;
                         }
                     } else if eq_engaged {
                         // No eligible legs at all (every leg fresh-data-stale —
@@ -1146,7 +1236,12 @@ async fn receiver_loop(
                         // servo would stay gated off, and loss_deadline would
                         // stay pinned at the full budget. Stand down.
                         reassembly.clear_equalization();
+                        log::info!(
+                            "bond flow {flow_id}: equalization disengaged (no eligible legs)"
+                        );
                         eq_engaged = false;
+                        eq_above_count = 0;
+                        eq_below_count = 0;
                     }
                 }
 
