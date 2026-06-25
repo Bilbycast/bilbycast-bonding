@@ -10,10 +10,14 @@ equalization is no longer an on/off flag the operator must set — it is an
 - `equalization: "auto" | "off" | "on"` (default **`auto`**; serde-accepts the
   legacy boolean, `true`→`auto`, `false`→`off`).
   - **`auto`** — stamp + measure one-way delay ALWAYS; *engage* alignment only
-    when the measured inter-leg skew exceeds `SKEW_FLOOR_US` (hysteresis: engage
-    above the floor, disengage below half), fits the budget, and the sender
-    isn't ride-fastest. A homogeneous bond measures ~zero skew → no-op; a
-    heterogeneous bond aligns itself. Self-configuring.
+    when the measured inter-leg skew exceeds the engage floor (hysteresis: engage
+    above the floor, disengage below half, plus an `EQ_ENGAGE_DEBOUNCE` /
+    `EQ_DISENGAGE_DEBOUNCE` of 3 consecutive recomputes), fits the budget, and the
+    sender isn't ride-fastest. The floor is *derived from the jitter hold*
+    (`SKEW_FLOOR_HOLD_NUM/DEN` = 3/4 × hold, clamped to
+    `[SKEW_FLOOR_MIN_US, SKEW_FLOOR_MAX_US]` = 20–200 ms), not a fixed constant.
+    A homogeneous bond measures ~zero skew → no-op; a heterogeneous bond aligns
+    itself. Self-configuring.
   - **`off`** — never stamp/measure/align: the legacy aggregate-but-never-align
     path (the latency-critical escape hatch — a slow leg's reorder is
     ARQ/FEC-recovered rather than absorbed by alignment latency). The single
@@ -80,10 +84,12 @@ it self-aligns. Set `equalization: "off"` to keep the legacy aggregate-but-never
 align (and v1-header) path. The live edge1/edge6 configs carry explicit
 `equalization: true` (→ `auto`) so they are unaffected.
 
-**Remaining (NOT done):** the live cellular+Starlink gate has NOT been re-run on
-the auto redesign (loopback/unit only) — `SKEW_FLOOR_US` (20 ms) is a first
-guess that must be tuned against real cellular/Starlink jitter on the 3-leg test;
-a sender-restart-with-equalization e2e test is a known coverage gap.
+**Remaining (NOT done):** a sender-restart-with-equalization e2e test is a known
+coverage gap. (The fixed-20 ms engage floor was live-validated on the 3-leg
+5G+Starlink+ISP gate 2026-06-25 — it flapped dead-centre in the real ~12–24 ms
+skew band, which is why the floor is now *derived from the hold* (3/4 × hold,
+clamped 20–200 ms) with an engage/disengage debounce; see `SKEW_FLOOR_*` /
+`EQ_*_DEBOUNCE` in `receiver.rs`.)
 
 Authoritative spec for turning the bonding
 receiver from "ride the cleanest leg" into "aggregate N heterogeneous legs (different

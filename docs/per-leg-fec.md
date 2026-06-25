@@ -264,7 +264,7 @@ parity_max 6` — ≈12% overhead clean, climbing to ≈37% under heavy loss.
 | Concern | Location |
 |--------|----------|
 | Codec (`PerLegFecEncoder` / `PerLegFecDecoder` / `PerLegRepair`) | `bonding-protocol/src/protocol/fec.rs` |
-| Config field (`per_path_fec: HashMap<PathId, FecParams>`) | `bonding-transport/src/config.rs` (`BondSocketConfig`) |
+| Config field (`per_path_fec: HashMap<PathId, PerLegFecKind>`) | `bonding-transport/src/config.rs` (`BondSocketConfig`) |
 | Sender (per-leg encoders, repairs on their own leg) | `bonding-transport/src/sender.rs` |
 | Receiver (per-leg decoders, recover → reassemble, session reset) | `bonding-transport/src/receiver.rs` |
 | Edge config (`BondPathConfig.fec`) + validation (bounds + exclusivity) | `bilbycast-edge/src/config/{models,validation}.rs` |
