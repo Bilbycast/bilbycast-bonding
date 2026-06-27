@@ -579,8 +579,16 @@ where
                             // burst — one resend per seq per
                             // RETRANSMIT_DEDUP window.
                             if let Some(pkt) = retx_buf.get_for_retransmit(*lost_seq, now).cloned() {
+                                // Charge the retransmit's REAL size against the
+                                // token bucket. With the default `size: 0` the
+                                // scheduler debited only TOKEN_OVERHEAD_BYTES, so
+                                // ARQ bandwidth was ~uncounted against discovered
+                                // capacity — under congestion that turns NACK
+                                // storms into self-amplifying load on the very
+                                // leg that's already dropping.
                                 let selection = scheduler.schedule(&PacketHints {
                                     priority: Priority::High,
+                                    size: pkt.len(),
                                     ..Default::default()
                                 });
                                 let pid = match selection {

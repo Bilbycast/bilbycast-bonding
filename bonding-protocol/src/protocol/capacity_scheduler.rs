@@ -101,6 +101,18 @@ pub const TOKEN_OVERHEAD_BYTES: usize = 12;
 /// rate.
 const DEMAND_SLOW_START_MULT: f64 = 2.0;
 
+/// A leg whose delivered rate is at least this fraction of its current capacity
+/// estimate is treated as **capacity-limited** ("clean bottleneck" when loss is
+/// also negligible): it is carrying everything the estimate allows, so the
+/// estimate must probe up to discover real headroom. This delivered-vs-estimate
+/// test is timing-independent — unlike strict bucket debt (`tokens < 0`), which
+/// a low-capacity leg refills away between 5 Hz control rounds, and unlike a
+/// drained-bucket test, which false-positives in tight loops where the bucket is
+/// simply empty for lack of elapsed refill time. A leg delivering well below its
+/// estimate is merely under-offered and holds its estimate (no inflation on
+/// nothing). 0.85 leaves headroom for normal per-round delivery jitter.
+const CLEAN_BOTTLENECK_DELIVERY_FRAC: f64 = 0.85;
+
 /// Tuning for the per-path congestion controller. Defaults are chosen
 /// for a cellular + satellite contribution bond; every field is
 /// overridable from edge config.
@@ -828,6 +840,39 @@ impl BondScheduler for CapacityAwareScheduler {
         p.refill(now, cfg.burst_secs);
         let demand_pressure = p.tokens < 0.0;
 
+        // **Clean bottleneck**: the leg's token bucket is drained (it is
+        // delivering up to its CURRENT estimate — capacity-limited, not merely
+        // under-offered) AND loss is negligible. This is the authoritative
+        // "there is more usable capacity here" signal for a heterogeneous
+        // radio bond, and it is the robust replacement for the bare
+        // `demand_pressure` (tokens < 0) test:
+        //   * The RTT-derived `clean` flag reads false on 5G/Starlink purely
+        //     from baseline jitter (smoothed RTT sits tens of ms above the
+        //     windowed min even at zero loss), so a lossless leg was never
+        //     allowed to probe and the evidence bound pinned it at
+        //     probe_cap_mult × a delivered rate that was small ONLY because
+        //     the estimate was small — a mutual latch that parked the leg at
+        //     `min_rate_bps` while the bond dropped for want of its capacity.
+        //   * `demand_pressure` alone (strict bucket debt) is too brittle to
+        //     break that latch: a low-capacity leg's tiny bucket refills away
+        //     true debt between the 5 Hz control rounds, and `best()` only
+        //     routes to a leg it can AFFORD — so a floored leg is used right
+        //     up to its low estimate and the overflow spills to the sibling,
+        //     leaving this leg drained-but-not-negative and never probing.
+        // The robust, timing-independent test is the *delivered rate vs the
+        // current estimate*: a leg delivering at (or above) its estimate is
+        // carrying everything the estimate allows — capacity-limited — whereas
+        // a leg delivering well under its estimate is merely under-offered and
+        // must hold (probing on nothing inflates to fiction). Loss — not delay
+        // — is the safety bound: the instant probing up induces real loss,
+        // `congested` fires next round and backs the estimate off, so this
+        // cannot run away. (A bucket-drained test was tried and rejected: an
+        // empty bucket can mean "no time has elapsed to refill it", not "drained
+        // by load", so it false-positives in tight control loops.)
+        let at_capacity =
+            p.delivery_bps > 0.0 && p.delivery_bps >= p.capacity_bps * CLEAN_BOTTLENECK_DELIVERY_FRAC;
+        let clean_bottleneck = at_capacity && p.loss < cfg.loss_low;
+
         if congested {
             // Back off toward what's actually getting through.
             let base = if p.delivery_bps > 0.0 {
@@ -836,14 +881,17 @@ impl BondScheduler for CapacityAwareScheduler {
                 p.capacity_bps
             };
             p.capacity_bps = base * cfg.decrease as f64;
-        } else if clean && p.delivery_bps > 0.0 {
+        } else if (clean || clean_bottleneck) && p.delivery_bps > 0.0 {
             // Probe up, but never claim less than the measured delivered
-            // rate (we know at least that much fits). Under clean demand
-            // pressure (sibling died, surviving leg's bucket exhausted)
-            // grow slow-start style — see `DEMAND_SLOW_START_MULT`. No
-            // delivered-rate evidence (idle bond) → hold the estimate:
-            // probing on nothing would inflate it to fiction.
-            let mult = if demand_pressure {
+            // rate (we know at least that much fits). When the leg is the
+            // clean bottleneck (or under strict demand pressure) grow
+            // slow-start style — see `DEMAND_SLOW_START_MULT` — so a leg the
+            // bond is starved for discovers real capacity in a handful of
+            // control rounds (~1 s at 5 Hz) instead of crawling up the gentle
+            // 1.04× probe from the floor. No delivered-rate evidence (idle
+            // bond) → hold the estimate: probing on nothing would inflate it
+            // to fiction.
+            let mult = if demand_pressure || clean_bottleneck {
                 DEMAND_SLOW_START_MULT
             } else {
                 cfg.increase as f64
@@ -854,16 +902,19 @@ impl BondScheduler for CapacityAwareScheduler {
         p.capacity_bps = p
             .capacity_bps
             .clamp(cfg.min_rate_bps as f64, p.ceiling_bps);
-        if p.delivery_bps > 0.0 && !(clean && demand_pressure) {
+        if p.delivery_bps > 0.0 && !demand_pressure && !clean_bottleneck {
             // Evidence bound: never estimate more than probe_cap_mult ×
             // what the leg has recently proven it can deliver. The bound
             // rises with the realized rate, so post-failover growth is
-            // still exponential. Suspended while clean demand pressure
-            // holds — on an undersubscribed bond, delivery measures the
-            // leg's share, and pinning the estimate at probe_cap_mult ×
-            // that share would turn an instant failover into seconds of
-            // sender-side shedding.
-            //
+            // still exponential. Suspended whenever the leg is the clean
+            // bottleneck or under strict demand pressure — in both cases its
+            // bucket is drained, so delivery measures only the share its low
+            // estimate ALLOWS, not its real capacity, and the 2×delivery cap
+            // would re-pin the very leg the bond must grow into. Loss-driven
+            // back-off above is the real safety bound; the evidence cap only
+            // applies when the leg is NOT being pushed (a full bucket — an
+            // idle / under-offered leg whose delivery genuinely reflects its
+            // ceiling).
             p.capacity_bps = p.capacity_bps.min(p.delivery_bps * cfg.probe_cap_mult);
             // The min_rate floor stays authoritative for a leg that still
             // carries UNIQUE media — it is protective: removing it lets a
@@ -1080,6 +1131,57 @@ mod tests {
             s.capacity_bps(1).unwrap() >= 9_000_000,
             "survivor estimate did not ramp: {}",
             s.capacity_bps(1).unwrap()
+        );
+    }
+
+    /// **Regression for the cellular/satellite under-aggregation latch.**
+    /// A zero-loss leg whose RTT jitter keeps its smoothed RTT ~34 ms above
+    /// its windowed min (the "dead zone": not `clean` < 20 ms, not
+    /// `congested` > 40 ms) — the exact live 5G signature (rtt≈102 ms,
+    /// jit≈25 ms, loss 0) — must still discover its real capacity when the
+    /// bond is starved for it (bucket in deep debt). Before the
+    /// `zero_loss_demand` probe-up + demand-pressure evidence-bound
+    /// suspension, such a leg was pinned at `min_rate_bps` (the observed
+    /// 0.25 M) because every capacity-discovery path was gated on `clean`.
+    #[test]
+    fn lossless_jittery_leg_under_demand_discovers_capacity() {
+        // Single leg, real usable ~8 Mbps, generous ceiling. Starts at the
+        // 2 Mbps prior; the dead-zone jitter must not collapse it to the
+        // 250 kbps floor, and demand must let it climb toward 8 Mbps.
+        let priors = vec![PathPrior { id: 0, weight_hint: 1, ceiling_bps: Some(20_000_000) }];
+        let mut s = CapacityAwareScheduler::with_paths(priors, CongestionConfig::default());
+        const REAL_CAP_BPS: u64 = 8_000_000;
+        const PKT: usize = 1316;
+        let per_round = 760u64; // ~8 Mbps offered at the 200 ms control cadence
+        let mut now = Instant::now();
+
+        // One low RTT sample seeds the windowed min at 100 ms, then RTT sits
+        // at 134 ms → smoothed-RTT − min settles at ~34 ms (dead zone). Loss
+        // stays 0 throughout: the leg genuinely has headroom.
+        s.on_path_update(0, &health(100, 0.0, 0));
+
+        for round in 0..30u32 {
+            let mut sent = 0u64;
+            for _ in 0..per_round {
+                now += Duration::from_micros(260); // keeps the bucket in debt
+                if matches!(s.schedule_at(&hints(PKT), now), PathSelection::Single(0)) {
+                    sent += 1;
+                }
+            }
+            // The leg can only really deliver up to its physical capacity.
+            let offered_bps = sent * (PKT as u64 + TOKEN_OVERHEAD_BYTES as u64) * 8 * 5;
+            let delivered_bps = offered_bps.min(REAL_CAP_BPS);
+            // RTT 134 ms over a 100 ms baseline → ~34 ms inflation, ZERO loss.
+            let _ = round;
+            s.on_path_update(0, &health(134, 0.0, delivered_bps));
+        }
+
+        let cap = s.capacity_bps(0).unwrap();
+        assert!(
+            cap > 4_000_000,
+            "a lossless jittery leg under demand must discover real capacity, \
+             not pin at min_rate: cap={cap} (floor={})",
+            CongestionConfig::default().min_rate_bps
         );
     }
 
