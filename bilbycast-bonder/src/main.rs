@@ -68,6 +68,78 @@ async fn main() -> anyhow::Result<()> {
     match cfg.role {
         BonderRole::Sender => run_sender(cfg).await,
         BonderRole::Receiver => run_receiver(cfg).await,
+        BonderRole::Bridge => run_bridge(cfg).await,
+    }
+}
+
+/// Relay-hosted bond bridge: terminate the ingress bond from edge A (full
+/// ARQ/FEC/reorder recovery), then re-originate a fresh bond/single path to
+/// edge B. The recovered byte stream is pumped receiver → sender in one
+/// process — no localhost hairpin, no changes to the bonding library.
+async fn run_bridge(cfg: BonderConfig) -> anyhow::Result<()> {
+    // Ingress: terminate edge A's bond as a receiver.
+    let in_cfg = cfg.to_socket_config()?;
+    let in_ids: Vec<u8> = in_cfg.paths.iter().map(|p| p.id).collect();
+    let ingress = Arc::new(
+        BondSocket::receiver(in_cfg)
+            .await
+            .map_err(|e| anyhow!("bridge ingress (receiver) setup: {e}"))?,
+    );
+
+    // Egress: re-originate a fresh bond toward edge B as a sender.
+    let eg_cfg = cfg.egress_socket_config()?;
+    let eg_ids: Vec<u8> = eg_cfg.paths.iter().map(|p| p.id).collect();
+    let eg_sched = cfg
+        .bridge_egress
+        .as_ref()
+        .map(|e| e.scheduler)
+        .unwrap_or_default();
+    let egress = Arc::new(match eg_sched {
+        SchedulerKind::WeightedRtt => {
+            BondSocket::sender(eg_cfg, WeightedRttScheduler::new(eg_ids.clone()))
+                .await
+                .map_err(|e| anyhow!("bridge egress (sender) setup: {e}"))?
+        }
+        SchedulerKind::RoundRobin => {
+            BondSocket::sender(eg_cfg, RoundRobinScheduler::new(eg_ids.clone()))
+                .await
+                .map_err(|e| anyhow!("bridge egress (sender) setup: {e}"))?
+        }
+    });
+
+    log::info!(
+        "bond bridge up: ingress {} leg(s) -> egress {} leg(s) (latency budgets stack across both hops)",
+        in_ids.len(),
+        eg_ids.len()
+    );
+
+    tokio::spawn(stats_loop(ingress.clone(), in_ids));
+    tokio::spawn(stats_loop(egress.clone(), eg_ids));
+
+    let ingress_pump = ingress.clone();
+    let egress_pump = egress.clone();
+    let pump = async move {
+        loop {
+            match ingress_pump.recv().await {
+                Some(payload) => {
+                    if let Err(e) = egress_pump.send(payload, PacketHints::default()).await {
+                        log::warn!("bridge egress send error: {e}");
+                    }
+                }
+                None => {
+                    log::info!("bridge ingress closed");
+                    break;
+                }
+            }
+        }
+    };
+
+    tokio::select! {
+        _ = pump => Ok(()),
+        _ = signal::ctrl_c() => {
+            log::info!("ctrl-c — shutting down");
+            Ok(())
+        }
     }
 }
 

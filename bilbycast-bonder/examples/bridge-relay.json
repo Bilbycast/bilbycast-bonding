@@ -1,0 +1,22 @@
+{
+  "_comment": "Relay-hosted bond BRIDGE. Run this bilbycast-bonder co-located with a public bilbycast-relay host. It terminates edge A's multi-leg bond (5G + Starlink + ...), recovers the stream with full ARQ/FEC/reorder, then re-originates a fresh bond toward edge B. Edge A runs a bonded OUTPUT whose legs target this host's ingress ports; edge B runs a bonded (or single-leg) INPUT whose leg(s) this bridge's egress targets. The two hops MUST use different flow_id values. Latency budgets stack across the two hops — size hold_ms accordingly.",
+
+  "flow_id": 42,
+  "role": "bridge",
+  "scheduler": "weighted_rtt",
+
+  "paths": [
+    { "id": 0, "name": "from-edgeA-5g",      "transport": { "type": "udp", "bind": "0.0.0.0:7000" } },
+    { "id": 1, "name": "from-edgeA-starlink", "transport": { "type": "udp", "bind": "0.0.0.0:7002" } }
+  ],
+  "tuning": { "hold_ms": 600, "keepalive_ms": 200 },
+
+  "bridge_egress": {
+    "flow_id": 99,
+    "scheduler": "weighted_rtt",
+    "paths": [
+      { "id": 0, "name": "to-edgeB", "transport": { "type": "udp", "remote": "edgeB.example.com:7400" } }
+    ],
+    "tuning": { "hold_ms": 600, "keepalive_ms": 200 }
+  }
+}
