@@ -11,17 +11,22 @@ distinct from the always-on adaptive capacity discovery the running bond already
 ## Why this exists (what the bond does *not* already tell you)
 
 The `CapacityAwareScheduler` (default `Adaptive`) continuously estimates each leg's
-usable capacity — but the estimate is **passive and demand-bound**:
+usable capacity — and a clean leg the bond *drives* does actively discover its real
+capacity: the clean-bottleneck signal probes the estimate up slow-start even when RTT
+jitter inflates the leg's latency, so a clean-but-jittery 5G/Starlink leg under load is
+**no longer pinned at the `min_rate_bps` floor**. But the running estimate is still
+**demand-bound** — it can only learn from traffic the bond actually offers a leg:
 
-- It is learned only from *live media already flowing*, and bounded to
-  `delivered_bps × probe_cap_mult` (default `2.0`). An idle/undersubscribed leg just
-  *holds* its estimate (`capacity_scheduler.rs`: *"probing on nothing would inflate it
-  to fiction"*). So if you push 5 Mbps over a bond you only ever learn ~5–10 Mbps of
-  capacity — you cannot know whether it would carry 20 Mbps until you try it live.
-- A too-small or **mis-wired** leg is never flagged — it is silently under-allocated
-  down to the `min_rate_bps` floor (250 kbps). When `delivered_bps` is low the scheduler
-  cannot tell you *why* (small link? wrong NIC binding? dead SIM? `rp_filter`? source
-  bind wrong?).
+- A leg the bond never *pushes* (an idle bond, or a leg carrying only its small share of
+  an under-offered split) holds its estimate, bounded to `delivered_bps × probe_cap_mult`
+  (default `2.0`) — `capacity_scheduler.rs`: *"probing on nothing would inflate it to
+  fiction"*. (That evidence cap is suspended only while the leg is the clean bottleneck
+  or in demand debt, i.e. only while it is actually being driven.) So if you push 5 Mbps
+  over a bond with headroom to spare you only ever learn ~5–10 Mbps of capacity — you
+  cannot know whether it would carry 20 Mbps until you try it live.
+- A too-small, dead, or **mis-wired** leg whose delivered rate stays low still floors at
+  `min_rate_bps` (250 kbps), and the running scheduler cannot tell you *why* it is low
+  (small link? wrong NIC binding? dead SIM? `rp_filter`? source bind wrong?).
 
 So two genuinely new questions need a deliberate test:
 

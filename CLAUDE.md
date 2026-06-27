@@ -142,7 +142,37 @@ satellite link; `CapacityAwareScheduler` fixes that with a closed loop.
   the link's usable bitrate — probe up while clean, back off toward the
   delivered rate the moment loss or queue-building delay appears. The
   estimate is clamped to `[min_rate, operator_ceiling]`; `weight_hint`
-  seeds the initial prior, `CongestionConfig` tunes the law.
+  seeds the initial prior, `CongestionConfig` tunes the law. An optional
+  `delay_inflation_auto` derives the queue-build threshold per leg from
+  its own windowed baseline RTT (a bufferbloated cellular link gets a
+  proportionally looser threshold) — `false` at the library default, but
+  the edge turns it on for bonded outputs.
+- **Clean-bottleneck capacity discovery**: a clean but RTT-jittery radio
+  leg (5G / Starlink: smoothed RTT sits tens of ms above its windowed min
+  even at zero loss) is **no longer pinned at `min_rate`**. The discovery
+  signal is delivered-rate-versus-estimate, not RTT: when a leg delivers
+  ≥ `CLEAN_BOTTLENECK_DELIVERY_FRAC` (0.85) of its current capacity
+  estimate **and** loss is below `loss_low`, it is treated as
+  capacity-limited and the estimate probes **up** — slow-start style
+  (`DEMAND_SLOW_START_MULT`, 2×/round) so a leg the bond is starved for
+  reaches its real capacity in a handful of control rounds (~1 s at 5 Hz)
+  instead of crawling the gentle 1.04× probe from the floor. RTT
+  inflation in the "dead zone" (above clean, below the full congestion
+  threshold) — the live cellular-jitter signature — no longer masquerades
+  as congestion and no longer blocks discovery. A leg delivering well
+  *under* its estimate is merely under-offered and holds (probing on
+  nothing inflates to fiction).
+- **Loss is the safety bound**: the clean-bottleneck probe lifts the
+  evidence cap (`delivery_bps × probe_cap_mult`, default 2×) precisely
+  because that cap would re-pin the very leg the bond must grow into. The
+  bound that stops runaway is **loss**, not delay: the instant probing up
+  induces real loss (`loss > loss_high`) — or genuine queue-build delay
+  past the full inflation threshold — `congested` fires next round and
+  backs the estimate off toward the delivered rate, so discovery cannot
+  run away. The `min_rate` floor stays authoritative for a leg still
+  carrying *unique* media (protective against a transient low sample
+  collapsing it), but is dropped for a jitter-demoted leg so its estimate
+  tracks reality rather than over-committing parity onto a known-bad leg.
 - **Token-bucket distribution**: each leg has a bucket refilled at its
   discovered capacity. Per packet the scheduler picks the best-scoring
   eligible leg (headroom × quality), so the split is **proportional to
@@ -157,6 +187,13 @@ satellite link; `CapacityAwareScheduler` fixes that with a closed loop.
   full `PathHealth` into the controller each ack round (~5 Hz). Those
   values also populate the previously-dead `PathStats.throughput_bps` /
   `jitter_us` telemetry.
+- **ARQ retransmits are charged real bandwidth** (`bonding-transport/src/
+  sender.rs`): a NACK-driven resend is scheduled with its true payload
+  size (`size: pkt.len()`), so the chosen leg's token bucket is debited
+  for the actual bytes. Previously the resend used the default
+  `size: 0`, debiting only `TOKEN_OVERHEAD_BYTES` — ARQ traffic was
+  ~uncounted against discovered capacity, which under congestion turned a
+  NACK storm into self-amplifying load on the very leg already dropping.
 - **Time is injectable**: `CapacityAwareScheduler::schedule_at(hints,
   now)` does the real work (token refill is `now`-based, like the
   reassembly buffer); the trait `schedule` calls it with `Instant::now()`.
@@ -210,8 +247,12 @@ kernel routing table. Without it, multiple paths to the same
 destination collapse onto the default route and the bond is
 cosmetic.
 
-- Linux / Android → `SO_BINDTODEVICE`, needs `CAP_NET_RAW` (grant via
-  `setcap cap_net_raw+ep <bin>` or systemd `AmbientCapabilities`).
+- Linux / Android → `SO_BINDTODEVICE` (hard TX+RX bind, prefers
+  `CAP_NET_RAW`; grant via `setcap cap_net_raw+ep <bin>` or systemd
+  `AmbientCapabilities`). On `EPERM`/`EACCES` it does **not** fail —
+  it automatically falls back to the unprivileged `IP_UNICAST_IF` /
+  `IPV6_UNICAST_IF` egress hint (TX steering only). The mechanism each
+  path actually got is surfaced on `PathStats.pin_mechanism`.
 - macOS / FreeBSD / Fuchsia → `IP_BOUND_IF` / `IPV6_BOUND_IF`,
   unprivileged.
 - Other platforms → not implemented; fall back to source-IP binding
