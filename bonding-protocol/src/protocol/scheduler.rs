@@ -171,6 +171,16 @@ pub trait BondScheduler: Send {
     /// fresh media on top of invisible parity. Default impl is a no-op for
     /// schedulers without a per-path capacity budget.
     fn charge_path(&mut self, _path_id: PathId, _bytes: usize) {}
+
+    /// The bond's currently-discovered **aggregate usable capacity**, bits/sec:
+    /// the sum of the per-leg capacity estimates across alive legs. This is the
+    /// operator-facing "available bonded bitrate" — what a fixed external
+    /// encoder (which the edge cannot throttle) must be provisioned at or below.
+    /// Default 0 for schedulers without a per-path capacity model
+    /// (round-robin / weighted-RTT); the capacity-aware scheduler overrides it.
+    fn aggregate_capacity_bps(&self) -> u64 {
+        0
+    }
 }
 
 // ── Built-in: RoundRobinScheduler ───────────────────────────────────────────

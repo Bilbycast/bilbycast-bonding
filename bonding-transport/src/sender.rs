@@ -551,6 +551,14 @@ where
                                         relative_owd_us: body.relative_owd_us,
                                     };
                                     scheduler.on_path_update(path_id, &health);
+                                    // Publish the discovered aggregate capacity
+                                    // (sum of alive legs) so operators can read
+                                    // the bond's currently-usable bitrate and
+                                    // provision a fixed external encoder under it.
+                                    conn_stats.aggregate_capacity_bps.store(
+                                        scheduler.aggregate_capacity_bps(),
+                                        Ordering::Relaxed,
+                                    );
                                     // Adaptive per-leg RS: scale this leg's
                                     // parity with its measured loss.
                                     if let Some(Some(LegEnc::Rs(enc))) =

@@ -70,6 +70,14 @@ pub struct BondConnStats {
     /// by the hold servo on init and every retarget so exporters can
     /// watch the adaptive reorder/recovery budget breathe.
     pub current_hold_ms: AtomicU64,
+    /// Sender's current **discovered aggregate capacity**, bits/sec — the sum
+    /// of the per-leg capacity estimates the congestion controllers have found
+    /// across all alive legs. This is the bond's currently-usable bonded
+    /// bitrate: the number an operator must keep a fixed external encoder
+    /// (RTP/SRT/UDP from a tier-1 encoder the edge cannot throttle) at or below
+    /// to avoid driving the bond into overload. 0 on a receive-only side (no
+    /// scheduler runs there). Written by the sender once per control round.
+    pub aggregate_capacity_bps: AtomicU64,
 }
 
 impl BondConnStats {
@@ -94,6 +102,7 @@ impl BondConnStats {
             session_resets: self.session_resets.load(Ordering::Relaxed),
             header_parse_drops: self.header_parse_drops.load(Ordering::Relaxed),
             current_hold_ms: self.current_hold_ms.load(Ordering::Relaxed),
+            aggregate_capacity_bps: self.aggregate_capacity_bps.load(Ordering::Relaxed),
         }
     }
 }
@@ -116,6 +125,10 @@ pub struct BondConnStatsSnapshot {
     pub session_resets: u64,
     pub header_parse_drops: u64,
     pub current_hold_ms: u64,
+    /// Discovered aggregate bonded capacity, bits/sec (sum of per-leg
+    /// estimates across alive legs). The operator-facing "available bonded
+    /// bitrate"; 0 on the receive-only side. See [`BondConnStats`].
+    pub aggregate_capacity_bps: u64,
 }
 
 /// Per-path counters. One instance per registered path.

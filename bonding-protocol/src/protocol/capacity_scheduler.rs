@@ -113,6 +113,13 @@ const DEMAND_SLOW_START_MULT: f64 = 2.0;
 /// nothing). 0.85 leaves headroom for normal per-round delivery jitter.
 const CLEAN_BOTTLENECK_DELIVERY_FRAC: f64 = 0.85;
 
+/// Per-control-round decay applied to `PathCc::delivery_recent_max`. At the
+/// ~5 Hz control cadence, 0.95 halves a stale peak in ~13 rounds (~2.6 s):
+/// long enough to bridge a transient overload/ARQ storm so the leg doesn't
+/// collapse, short enough that a genuine sustained capacity loss still backs
+/// the estimate off honestly.
+const DELIVERY_MAX_DECAY: f64 = 0.95;
+
 /// Tuning for the per-path congestion controller. Defaults are chosen
 /// for a cellular + satellite contribution bond; every field is
 /// overridable from edge config.
@@ -276,6 +283,14 @@ struct PathCc {
     /// Latest measured delivered rate at the receiver, bits/sec
     /// (0 = no measurement yet).
     delivery_bps: f64,
+    /// Windowed-max delivered rate (decays by [`DELIVERY_MAX_DECAY`] each
+    /// control round). Anchors the congested back-off so a transient
+    /// ARQ/reassembly storm — which a fixed external CBR feed above the
+    /// sustainable aggregate induces — can momentarily crash `delivery_bps`
+    /// to ~0 without collapsing the estimate to the floor (the 16 Mbps→0
+    /// synchronized walk-down). A genuine sustained capacity loss decays this
+    /// within ~2-3 s so the leg still backs off honestly.
+    delivery_recent_max: f64,
 }
 
 impl PathCc {
@@ -300,6 +315,7 @@ impl PathCc {
             admit_streak: 0,
             last_update_serial: 0,
             delivery_bps: 0.0,
+            delivery_recent_max: 0.0,
         }
     }
 
@@ -785,6 +801,11 @@ impl BondScheduler for CapacityAwareScheduler {
         if health.throughput_bps > 0 {
             p.delivery_bps = health.throughput_bps as f64;
         }
+        // Windowed-max delivered rate: rises instantly to a new high, decays
+        // slowly otherwise. The congested back-off anchors to this (not the
+        // raw instantaneous sample) so a momentary delivery crash under
+        // aggregate overload can't synchronously collapse every leg.
+        p.delivery_recent_max = p.delivery_bps.max(p.delivery_recent_max * DELIVERY_MAX_DECAY);
 
         // Demote-to-exclusion: a leg loses `media_eligible` (excluded from
         // carrying UNIQUE media, kept for redundancy/FEC) on EITHER axis —
@@ -874,8 +895,20 @@ impl BondScheduler for CapacityAwareScheduler {
         let clean_bottleneck = at_capacity && p.loss < cfg.loss_low;
 
         if congested {
-            // Back off toward what's actually getting through.
-            let base = if p.delivery_bps > 0.0 {
+            // Back off toward what's *recently* been getting through — the
+            // windowed-max delivered rate, not the instantaneous sample. With a
+            // fixed external feed (RTP/SRT/UDP from a tier-1 encoder that the
+            // edge cannot throttle) above the sustainable aggregate, a transient
+            // ARQ/reassembly storm momentarily crashes `delivery_bps`; backing
+            // off to `0.85 × ~0` would walk every leg synchronously to the floor
+            // (the observed 16 Mbps → 0 collapse) and then deadlock there
+            // because the CBR overload keeps `congested` true forever. Anchoring
+            // to `delivery_recent_max` lets each leg settle at its real capacity
+            // (the excess is shed at the token bucket, not by collapsing the
+            // controller); a genuine sustained loss decays the anchor in ~2-3 s.
+            let base = if p.delivery_recent_max > 0.0 {
+                p.delivery_recent_max
+            } else if p.delivery_bps > 0.0 {
                 p.delivery_bps
             } else {
                 p.capacity_bps
@@ -915,7 +948,18 @@ impl BondScheduler for CapacityAwareScheduler {
             // applies when the leg is NOT being pushed (a full bucket — an
             // idle / under-offered leg whose delivery genuinely reflects its
             // ceiling).
-            p.capacity_bps = p.capacity_bps.min(p.delivery_bps * cfg.probe_cap_mult);
+            //
+            // Bound against the windowed-MAX delivered rate, not the raw
+            // instantaneous sample: a steady under-offered leg has
+            // `delivery_recent_max ≈ delivery_bps` so the 2× cap is unchanged,
+            // but a transient delivery crash (the ARQ/reassembly storm a
+            // non-throttleable CBR feed above the sustainable aggregate induces)
+            // no longer re-pins the estimate at `2 × ~0` → floor. The recent-max
+            // decays in ~2-3 s, so a genuine sustained drop still tightens the
+            // bound honestly.
+            p.capacity_bps = p
+                .capacity_bps
+                .min(p.delivery_recent_max.max(p.delivery_bps) * cfg.probe_cap_mult);
             // The min_rate floor stays authoritative for a leg that still
             // carries UNIQUE media — it is protective: removing it lets a
             // transient low delivery sample collapse capacity below the
@@ -947,6 +991,17 @@ impl BondScheduler for CapacityAwareScheduler {
 
     fn on_tick(&mut self, now: Instant) {
         self.refill_all(now);
+    }
+
+    fn aggregate_capacity_bps(&self) -> u64 {
+        // Sum the discovered capacity across alive legs — the bond's
+        // currently-usable bonded bitrate (the operator-facing "available
+        // bitrate" for provisioning a fixed external encoder).
+        self.paths
+            .iter()
+            .filter(|p| p.alive)
+            .map(|p| p.capacity_bps as u64)
+            .sum()
     }
 
     fn on_path_dead(&mut self, path_id: PathId) {
@@ -1075,6 +1130,46 @@ mod tests {
         let bound = (3_000_000.0 * CongestionConfig::default().probe_cap_mult) as u64;
         assert!(cap <= bound, "estimate bounded by evidence: {cap} > {bound}");
         assert!(cap > 3_000_000, "probing above the delivered rate is still allowed: {cap}");
+    }
+
+    /// Graceful degradation under a fixed-feed overload: a transient
+    /// delivery crash (the ARQ/reassembly storm a non-throttleable CBR feed
+    /// above the sustainable aggregate induces) must NOT collapse the capacity
+    /// estimate to the floor. The congested back-off anchors to the decaying
+    /// windowed-max delivered rate, so a few storm rounds settle near the real
+    /// capacity instead of synchronously walking to `min_rate` (the 16 Mbps→0
+    /// collapse). A *prolonged* loss still decays the anchor and backs off.
+    #[test]
+    fn transient_overload_does_not_collapse_to_floor() {
+        let floor = CongestionConfig::default().min_rate_bps; // 250 kbps
+        let mut s = CapacityAwareScheduler::new(vec![0]);
+        // Establish a healthy ~8 Mbps leg.
+        for _ in 0..40 {
+            s.on_path_update(0, &health(20, 0.0, 8_000_000));
+        }
+        let healthy = s.capacity_bps(0).unwrap();
+        assert!(healthy > 4_000_000, "leg should converge high: {healthy}");
+
+        // A short storm: high loss + delivery momentarily crashed to ~0.
+        for _ in 0..5 {
+            s.on_path_update(0, &health(20, 0.5, 50_000));
+        }
+        let after_storm = s.capacity_bps(0).unwrap();
+        assert!(
+            after_storm > 4 * floor,
+            "transient storm must not collapse to the floor: {after_storm} (floor {floor})"
+        );
+
+        // A prolonged outage DOES eventually back the estimate off (the anchor
+        // decays), so a genuinely dead link isn't held high forever.
+        for _ in 0..80 {
+            s.on_path_update(0, &health(20, 0.8, 0));
+        }
+        let after_outage = s.capacity_bps(0).unwrap();
+        assert!(
+            after_outage < after_storm,
+            "prolonged outage must still back off: {after_outage} !< {after_storm}"
+        );
     }
 
     /// Failover ramp: an undersubscribed backup leg (delivered rate ==
