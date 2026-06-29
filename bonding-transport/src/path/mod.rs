@@ -15,6 +15,7 @@
 //! still a one-liner on the enum. Matches the `bilbycast-edge` engine
 //! convention of enum-dispatched inputs/outputs.
 
+pub mod attached;
 pub mod udp;
 
 #[cfg(feature = "path-rist")]
@@ -31,6 +32,7 @@ use tokio::sync::mpsc;
 
 use bonding_protocol::protocol::scheduler::PathId;
 
+pub use attached::{AttachedBridgeEnds, AttachedChannels, AttachedPath};
 pub use udp::{PinMechanism, UdpPath};
 pub(crate) use udp::{UdpWatchHandle, WatchTarget};
 
@@ -75,6 +77,8 @@ pub struct PathDatagram {
 /// the compiler inlines every dispatch.
 pub enum Path {
     Udp(UdpPath),
+    /// In-process attached leg (relayed bonded leg — see [`AttachedPath`]).
+    Attached(AttachedPath),
     #[cfg(feature = "path-rist")]
     Rist(RistPath),
     #[cfg(feature = "path-quic")]
@@ -86,6 +90,7 @@ impl Path {
     pub fn id(&self) -> PathId {
         match self {
             Path::Udp(p) => p.id(),
+            Path::Attached(p) => p.id(),
             #[cfg(feature = "path-rist")]
             Path::Rist(p) => p.id(),
             #[cfg(feature = "path-quic")]
@@ -96,6 +101,7 @@ impl Path {
     pub fn name(&self) -> &str {
         match self {
             Path::Udp(p) => p.name(),
+            Path::Attached(p) => p.name(),
             #[cfg(feature = "path-rist")]
             Path::Rist(p) => p.name(),
             #[cfg(feature = "path-quic")]
@@ -110,6 +116,7 @@ impl Path {
     pub async fn send_to(&self, data: &[u8], to: SocketAddr) -> PathResult<()> {
         match self {
             Path::Udp(p) => p.send_to(data, to).await,
+            Path::Attached(p) => p.send_to(data, to).await,
             #[cfg(feature = "path-rist")]
             Path::Rist(p) => p.send_to(data, to).await,
             #[cfg(feature = "path-quic")]
@@ -120,6 +127,7 @@ impl Path {
     pub async fn send(&self, data: &[u8]) -> PathResult<()> {
         match self {
             Path::Udp(p) => p.send(data).await,
+            Path::Attached(p) => p.send(data).await,
             #[cfg(feature = "path-rist")]
             Path::Rist(p) => p.send(data).await,
             #[cfg(feature = "path-quic")]
@@ -136,6 +144,7 @@ impl Path {
     pub fn wire_overhead_per_datagram(&self) -> usize {
         match self {
             Path::Udp(p) => p.wire_overhead_per_datagram(),
+            Path::Attached(p) => p.wire_overhead_per_datagram(),
             #[cfg(feature = "path-rist")]
             Path::Rist(_) => 0,
             #[cfg(feature = "path-quic")]
@@ -146,6 +155,7 @@ impl Path {
     pub fn take_rx(&mut self) -> Option<mpsc::Receiver<PathDatagram>> {
         match self {
             Path::Udp(p) => p.take_rx(),
+            Path::Attached(p) => p.take_rx(),
             #[cfg(feature = "path-rist")]
             Path::Rist(p) => p.take_rx(),
             #[cfg(feature = "path-quic")]
@@ -156,6 +166,7 @@ impl Path {
     pub fn set_primary_peer(&self, peer: SocketAddr) {
         match self {
             Path::Udp(p) => p.set_primary_peer(peer),
+            Path::Attached(p) => p.set_primary_peer(peer),
             #[cfg(feature = "path-rist")]
             Path::Rist(p) => p.set_primary_peer(peer),
             #[cfg(feature = "path-quic")]
@@ -166,6 +177,7 @@ impl Path {
     pub fn primary_peer(&self) -> Option<SocketAddr> {
         match self {
             Path::Udp(p) => p.primary_peer(),
+            Path::Attached(p) => p.primary_peer(),
             #[cfg(feature = "path-rist")]
             Path::Rist(p) => p.primary_peer(),
             #[cfg(feature = "path-quic")]
@@ -179,6 +191,10 @@ impl Path {
     pub fn reconnect_reason(&self) -> Option<String> {
         match self {
             Path::Udp(_) => None,
+            // The bridge self-redials the relay (Register/keepalive failover)
+            // transparently; the bond leg never tears down. No reason surfaced
+            // at this layer.
+            Path::Attached(_) => None,
             #[cfg(feature = "path-rist")]
             Path::Rist(_) => None,
             #[cfg(feature = "path-quic")]
@@ -192,6 +208,8 @@ impl Path {
     pub fn pin_mechanism(&self) -> Option<PinMechanism> {
         match self {
             Path::Udp(p) => p.pin_mechanism(),
+            // The bridge's relay socket does the NIC pin (outside the bond).
+            Path::Attached(_) => None,
             #[cfg(feature = "path-rist")]
             Path::Rist(_) => None,
             #[cfg(feature = "path-quic")]
@@ -205,6 +223,7 @@ impl Path {
     pub fn note_send_ok(&self) {
         match self {
             Path::Udp(p) => p.note_send_ok(),
+            Path::Attached(_) => {}
             #[cfg(feature = "path-rist")]
             Path::Rist(_) => {}
             #[cfg(feature = "path-quic")]
@@ -219,6 +238,9 @@ impl Path {
     pub fn note_send_error(&self, err: &PathError) -> bool {
         match self {
             Path::Udp(p) => p.note_send_error(err),
+            // The bridge owns the relay socket + its own rebuild/failover;
+            // nothing to rebuild at the bond layer.
+            Path::Attached(_) => false,
             #[cfg(feature = "path-rist")]
             Path::Rist(_) => false,
             #[cfg(feature = "path-quic")]
@@ -231,6 +253,7 @@ impl Path {
     pub(crate) fn udp_watch_handle(&self) -> Option<UdpWatchHandle> {
         match self {
             Path::Udp(p) => Some(p.watch_handle()),
+            Path::Attached(_) => None,
             #[cfg(feature = "path-rist")]
             Path::Rist(_) => None,
             #[cfg(feature = "path-quic")]

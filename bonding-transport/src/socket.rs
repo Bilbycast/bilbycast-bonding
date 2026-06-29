@@ -29,9 +29,11 @@ use bonding_protocol::events::{PathEvent, PathEventKind, PathRebuildReason};
 use bonding_protocol::protocol::scheduler::{BondScheduler, PacketHints, PathId};
 use bonding_protocol::stats::{BondConnStats, PathStats};
 
+use std::collections::HashMap;
+
 use crate::config::{BondSocketConfig, PathTransport};
 use crate::crypto::BondCrypto;
-use crate::path::{Path, PathError, UdpPath, UdpWatchHandle, WatchTarget};
+use crate::path::{AttachedChannels, AttachedPath, Path, PathError, UdpPath, UdpWatchHandle, WatchTarget};
 use crate::receiver::{ReceiverHandle, spawn_receiver};
 use crate::sender::{OutboundMessage, SenderHandle, spawn_sender};
 
@@ -87,10 +89,29 @@ impl BondSocket {
     where
         S: BondScheduler + Send + 'static,
     {
+        Self::sender_attached(cfg, scheduler, HashMap::new()).await
+    }
+
+    /// Like [`sender`](Self::sender), but with in-process **attached** legs.
+    ///
+    /// Every `PathTransport::Attached` leg in `cfg.paths` must have a matching
+    /// entry in `attachments` (keyed by `PathId`) carrying its bridge channel
+    /// endpoints — the host (edge) creates those + spawns the relay bridge that
+    /// drives them. The same shared [`BondCrypto`] the UDP legs get is threaded
+    /// into each attached path.
+    pub async fn sender_attached<S>(
+        cfg: BondSocketConfig,
+        scheduler: S,
+        mut attachments: HashMap<PathId, AttachedChannels>,
+    ) -> BondResult<Self>
+    where
+        S: BondScheduler + Send + 'static,
+    {
         if cfg.paths.is_empty() {
             return Err(BondSocketError::NoPaths);
         }
-        let (paths, path_stats, path_ids, path_names) = build_paths(&cfg, true).await?;
+        let (paths, path_stats, path_ids, path_names) =
+            build_paths(&cfg, true, &mut attachments).await?;
         let conn_stats = BondConnStats::new();
         let cancel = CancellationToken::new();
         let (events_tx, _) = broadcast::channel(PATH_EVENT_CHANNEL_CAPACITY);
@@ -134,10 +155,21 @@ impl BondSocket {
 
     /// Create a receiver socket listening on all configured paths.
     pub async fn receiver(cfg: BondSocketConfig) -> BondResult<Self> {
+        Self::receiver_attached(cfg, HashMap::new()).await
+    }
+
+    /// Like [`receiver`](Self::receiver), but with in-process **attached**
+    /// legs. See [`sender_attached`](Self::sender_attached) for the
+    /// `attachments` contract.
+    pub async fn receiver_attached(
+        cfg: BondSocketConfig,
+        mut attachments: HashMap<PathId, AttachedChannels>,
+    ) -> BondResult<Self> {
         if cfg.paths.is_empty() {
             return Err(BondSocketError::NoPaths);
         }
-        let (paths, path_stats, path_ids, path_names) = build_paths(&cfg, false).await?;
+        let (paths, path_stats, path_ids, path_names) =
+            build_paths(&cfg, false, &mut attachments).await?;
         let conn_stats = BondConnStats::new();
         let cancel = CancellationToken::new();
         let (events_tx, _) = broadcast::channel(PATH_EVENT_CHANNEL_CAPACITY);
@@ -271,6 +303,7 @@ impl Drop for BondSocket {
 async fn build_paths(
     cfg: &BondSocketConfig,
     sender_mode: bool,
+    attachments: &mut HashMap<PathId, AttachedChannels>,
 ) -> BondResult<(Vec<Path>, Vec<Arc<PathStats>>, Vec<PathId>, Vec<String>)> {
     let mut paths = Vec::with_capacity(cfg.paths.len());
     let mut stats = Vec::with_capacity(cfg.paths.len());
@@ -289,7 +322,7 @@ async fn build_paths(
         // start with the legs that connect. Previously the `?` here meant
         // one timed-out QUIC handshake tore down every other (working)
         // leg. Skip the failed leg and carry on; require at least one.
-        let path = match build_one_path(p, sender_mode, crypto.clone()).await {
+        let path = match build_one_path(p, sender_mode, crypto.clone(), attachments).await {
             Ok(path) => path,
             Err(e) => {
                 log::warn!(
@@ -488,8 +521,30 @@ async fn build_one_path(
     p: &crate::config::PathConfig,
     sender_mode: bool,
     crypto: Option<std::sync::Arc<BondCrypto>>,
+    attachments: &mut HashMap<PathId, AttachedChannels>,
 ) -> BondResult<Path> {
     match &p.transport {
+        PathTransport::Attached { primary_peer } => {
+            // Pull this leg's bridge channels out of the attachments map. The
+            // host (edge) created them + spawned the relay bridge that drives
+            // them. The SAME shared BondCrypto the UDP legs got is threaded in
+            // so an encrypted bond seals/opens the 0xBD envelope on this leg
+            // exactly like a UDP leg.
+            let channels = attachments.remove(&p.id).ok_or_else(|| {
+                BondSocketError::Path(PathError::Other(format!(
+                    "attached bond leg '{}' (id {}) has no bridge channels in the attachments map",
+                    p.name, p.id
+                )))
+            })?;
+            let _ = sender_mode; // an attached leg is symmetric (bridge owns direction)
+            Ok(Path::Attached(AttachedPath::new(
+                p.id,
+                p.name.clone(),
+                channels,
+                *primary_peer,
+                crypto.clone(),
+            )))
+        }
         PathTransport::Udp {
             bind,
             remote,

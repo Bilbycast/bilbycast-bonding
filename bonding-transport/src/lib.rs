@@ -70,6 +70,7 @@ pub use config::{
     BondSocketConfig, EqualizationMode, PathConfig, PathTransport, PerLegFecKind,
 };
 pub use crypto::{BondCrypto, BondCryptoError};
+pub use path::{AttachedBridgeEnds, AttachedChannels, AttachedPath};
 #[cfg(feature = "path-quic")]
 pub use config::{QuicRole, QuicTlsMode};
 #[cfg(feature = "path-rist")]

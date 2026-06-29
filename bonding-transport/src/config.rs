@@ -183,6 +183,21 @@ pub enum PathTransport {
         remote: Option<SocketAddr>,
         interface: Option<String>,
     },
+    /// In-process **attached** leg — a relayed bonded leg whose carrier is an
+    /// `mpsc` bridge owned by the host (the edge) rather than a socket. The
+    /// host bridge owns the relay socket (Register/keepalive rendezvous +
+    /// failover) and the tunnel framing; the bond hands it datagrams in
+    /// process with no loopback hop. `primary_peer` is a synthetic placeholder
+    /// (the bridge owns the real relay peer) so the keepalive + NACK
+    /// back-channel machinery treats the leg as live.
+    ///
+    /// The channel endpoints can't live here (the enum is `Clone + Debug`,
+    /// `mpsc::Receiver` is neither) — they travel in the separate
+    /// `attachments` argument to
+    /// [`BondSocket::sender_attached`](crate::socket::BondSocket::sender_attached)
+    /// / [`receiver_attached`](crate::socket::BondSocket::receiver_attached),
+    /// keyed by `PathId`.
+    Attached { primary_peer: SocketAddr },
     /// RIST Simple Profile — unidirectional at the bond layer.
     /// `role` decides whether this leg transmits or receives bond
     /// frames; bond automatically skips recv-role RIST paths when
