@@ -63,8 +63,63 @@ struct AckSample {
     received: u64,
     /// Receiver-side byte count for this path.
     bytes_received: u64,
-    /// Sender-side arrival instant of this ack.
-    at: Instant,
+    /// Sender-side SEND instant of the keepalive probe this ack answers —
+    /// NOT the ack's arrival time. The receiver sampled `bytes_received`
+    /// when it processed that probe, so the delta between two probes' send
+    /// instants is the interval those bytes accumulated over. Differencing on
+    /// the send clock (instead of ack arrival) makes the delivered-rate
+    /// immune to return-path jitter/reordering — see [`ack_delivery`].
+    probe_sent_at: Instant,
+}
+
+/// Coarse absurd-value backstop for a single leg's measured delivered rate,
+/// bits/sec. No real bonded leg (cellular / satellite / ethernet) delivers
+/// above this over a keepalive window, so a higher figure is a measurement
+/// artifact, not headroom to probe into. Defence-in-depth on top of the
+/// send-clock differencing in [`ack_delivery`]: it caps what feeds the
+/// scheduler's capacity evidence bound (`delivery × probe_cap_mult`) so a
+/// stray sample can never switch congestion control off.
+const MAX_PLAUSIBLE_LEG_BPS: f64 = 10_000_000_000.0;
+
+/// Windowed loss fraction + delivered bitrate from two successive
+/// keepalive-acks on ONE path.
+///
+/// Both quantities are differenced on the probe **send** clock
+/// (`probe_sent_at`): the numerator (`bytes_received` delta) is measured at
+/// the receiver when it saw each probe, and the matching denominator is the
+/// send-time gap between those probes — the two stay on the same monotonic
+/// clock regardless of when the acks came back. Using the ack *arrival* delta
+/// instead (the original bug) let a reordered/late ack pair a near-zero
+/// denominator with a full window of bytes and report a multi-Gbps delivered
+/// rate; that lifted the scheduler's capacity evidence bound
+/// (`delivery × probe_cap_mult`) to garbage and disabled congestion control
+/// during exactly the loss storm it needed to throttle.
+///
+/// Returns `None` for a non-advancing ack (`cur` not strictly newer than
+/// `prev` — an out-of-order or duplicate ack): its receiver counters are a
+/// stale snapshot that must neither fabricate a rate nor regress the baseline.
+fn ack_delivery(prev: &AckSample, cur: &AckSample) -> Option<(f32, u64)> {
+    if cur.probe_sent_at <= prev.probe_sent_at {
+        return None;
+    }
+    let dt = cur
+        .probe_sent_at
+        .duration_since(prev.probe_sent_at)
+        .as_secs_f64();
+    let sent_d = cur.sent.saturating_sub(prev.sent);
+    let recv_d = cur.received.saturating_sub(prev.received);
+    let bytes_d = cur.bytes_received.saturating_sub(prev.bytes_received);
+    let loss = if sent_d > 0 {
+        (sent_d.saturating_sub(recv_d) as f32 / sent_d as f32).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let bps = if dt > 1e-6 {
+        ((bytes_d as f64 * 8.0 / dt).min(MAX_PLAUSIBLE_LEG_BPS)) as u64
+    } else {
+        0
+    };
+    Some((loss, bps))
 }
 
 /// Handle retained by `BondSocket::sender`.
@@ -206,6 +261,17 @@ where
         .collect();
 
     let mut ka_interval = tokio::time::interval(keepalive_interval);
+    // Skip (not Burst) missed keepalive ticks: if the sender task stalls
+    // across one or more intervals (runtime starvation under a loss storm),
+    // the default Burst would fire the backlog back-to-back, emitting probes
+    // whose `probe_sent_at` stamps are only microseconds apart. `ack_delivery`
+    // would then divide a full interval of forward-delayed receiver bytes by
+    // that sub-ms send gap and fabricate a multi-Gbps delivered rate — the
+    // same capacity-estimate blowup the send-clock differencing exists to
+    // prevent, just via coalesced sends instead of return-path reorder. Skip
+    // fires a single probe after a stall and resumes on cadence, so
+    // consecutive `probe_sent_at` gaps stay ~`keepalive_interval`.
+    ka_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // Track in-flight keepalive stamps per path for RTT computation.
     // Per-path keepalive RTT tracking. On paths where `path_rtt >
     // keepalive_interval` there are multiple KAs in flight at any
@@ -478,50 +544,39 @@ where
                                     let rtt = sent_at.elapsed();
 
                                     // Windowed loss + delivered bitrate:
-                                    // diff this ack against the previous
-                                    // one for THIS path. Lifetime ratios
-                                    // dilute bursts and never drive a
-                                    // congestion controller usefully.
+                                    // diff this ack against the previous one
+                                    // for THIS path, on the probe SEND clock
+                                    // (`sent_at`, matched from `pending_ka`).
+                                    // Lifetime ratios dilute bursts and never
+                                    // drive a congestion controller usefully;
+                                    // the ack ARRIVAL clock fabricates rates
+                                    // under return-path jitter — see
+                                    // [`ack_delivery`].
                                     let cur = AckSample {
                                         sent: body.packets_sent_on_path,
                                         received: body.packets_received_on_path,
                                         bytes_received: body.bytes_received_on_path,
-                                        at: now,
+                                        probe_sent_at: sent_at,
                                     };
-                                    let (loss_rate, delivery_bps) = match last_ack[idx] {
-                                        Some(prev) => {
-                                            let dt = now
-                                                .saturating_duration_since(prev.at)
-                                                .as_secs_f64();
-                                            let sent_d = cur.sent.saturating_sub(prev.sent);
-                                            let recv_d = cur.received.saturating_sub(prev.received);
-                                            let bytes_d =
-                                                cur.bytes_received.saturating_sub(prev.bytes_received);
-                                            let loss = if sent_d > 0 {
-                                                sent_d.saturating_sub(recv_d) as f32 / sent_d as f32
-                                            } else {
-                                                0.0
-                                            };
-                                            let bps = if dt > 1e-6 {
-                                                (bytes_d as f64 * 8.0 / dt) as u64
-                                            } else {
-                                                0
-                                            };
-                                            (loss.clamp(0.0, 1.0), bps)
-                                        }
-                                        None => (0.0, 0),
+                                    // `None` = an out-of-order / duplicate ack
+                                    // (still counted for RTT + liveness below,
+                                    // but its stale receiver snapshot must not
+                                    // regress the baseline or feed a bogus
+                                    // rate). First ack has no prior → 0/0.
+                                    let measurement = match &last_ack[idx] {
+                                        Some(prev) => ack_delivery(prev, &cur),
+                                        None => Some((0.0, 0)),
                                     };
-                                    last_ack[idx] = Some(cur);
+                                    if measurement.is_some() {
+                                        last_ack[idx] = Some(cur);
+                                    }
 
+                                    // RTT, peer version + keepalive count are
+                                    // per-probe and order-independent → always
+                                    // record. Loss / throughput / jitter only
+                                    // advance on a fresh (newer) measurement.
                                     if let Some(ps) = path_stats_for(idx) {
                                         ps.rtt_us.store(rtt.as_micros() as u64, Ordering::Relaxed);
-                                        ps.loss_ppm.store(
-                                            (loss_rate * 1_000_000.0) as u64,
-                                            Ordering::Relaxed,
-                                        );
-                                        ps.throughput_bps.store(delivery_bps, Ordering::Relaxed);
-                                        ps.jitter_us
-                                            .store(body.jitter_us as u64, Ordering::Relaxed);
                                         // v5 negotiation: record the receiver's
                                         // advertised data-header version for this
                                         // leg. send_on_path gates v2 (send-stamped)
@@ -532,39 +587,53 @@ where
                                             Ordering::Relaxed,
                                         );
                                         ps.keepalives_received.fetch_add(1, Ordering::Relaxed);
+                                        if let Some((loss_rate, delivery_bps)) = measurement {
+                                            ps.loss_ppm.store(
+                                                (loss_rate * 1_000_000.0) as u64,
+                                                Ordering::Relaxed,
+                                            );
+                                            ps.throughput_bps
+                                                .store(delivery_bps, Ordering::Relaxed);
+                                            ps.jitter_us
+                                                .store(body.jitter_us as u64, Ordering::Relaxed);
+                                        }
                                     }
 
-                                    // Feed the scheduler a full health
-                                    // snapshot — RTT, windowed loss,
-                                    // delivered bitrate, jitter.
-                                    let health = PathHealth {
-                                        rtt: Some(rtt),
-                                        loss_rate,
-                                        throughput_bps: delivery_bps,
-                                        jitter_us: body.jitter_us as u64,
-                                        queue_depth: 0,
-                                        // v4 keepalive-ack: this leg's
-                                        // receiver-measured relative one-way
-                                        // delay, for the equalization
-                                        // budget-demote (u32::MAX on an older
-                                        // peer → demote stays jitter-only).
-                                        relative_owd_us: body.relative_owd_us,
-                                    };
-                                    scheduler.on_path_update(path_id, &health);
-                                    // Publish the discovered aggregate capacity
-                                    // (sum of alive legs) so operators can read
-                                    // the bond's currently-usable bitrate and
-                                    // provision a fixed external encoder under it.
-                                    conn_stats.aggregate_capacity_bps.store(
-                                        scheduler.aggregate_capacity_bps(),
-                                        Ordering::Relaxed,
-                                    );
-                                    // Adaptive per-leg RS: scale this leg's
-                                    // parity with its measured loss.
-                                    if let Some(Some(LegEnc::Rs(enc))) =
-                                        per_leg_encoders.get_mut(idx)
-                                    {
-                                        enc.set_loss(loss_rate);
+                                    // Feed the scheduler a full health snapshot
+                                    // only on a fresh measurement — an
+                                    // out-of-order ack carries a stale delivered
+                                    // rate that would disturb the windowed
+                                    // capacity control.
+                                    if let Some((loss_rate, delivery_bps)) = measurement {
+                                        let health = PathHealth {
+                                            rtt: Some(rtt),
+                                            loss_rate,
+                                            throughput_bps: delivery_bps,
+                                            jitter_us: body.jitter_us as u64,
+                                            queue_depth: 0,
+                                            // v4 keepalive-ack: this leg's
+                                            // receiver-measured relative one-way
+                                            // delay, for the equalization
+                                            // budget-demote (u32::MAX on an older
+                                            // peer → demote stays jitter-only).
+                                            relative_owd_us: body.relative_owd_us,
+                                        };
+                                        scheduler.on_path_update(path_id, &health);
+                                        // Publish the discovered aggregate capacity
+                                        // (sum of alive legs) so operators can read
+                                        // the bond's currently-usable bitrate and
+                                        // provision a fixed external encoder under it.
+                                        conn_stats.aggregate_capacity_bps.store(
+                                            scheduler.aggregate_capacity_bps(),
+                                            Ordering::Relaxed,
+                                        );
+                                        // Adaptive per-leg RS: scale this leg's
+                                        // parity with its measured loss.
+                                        if let Some(Some(LegEnc::Rs(enc))) =
+                                            per_leg_encoders.get_mut(idx)
+                                        {
+                                            enc.set_loss(loss_rate);
+                                        }
                                     }
                                     // Liveness: a fresh ack revives this
                                     // path if it was dead. Also tell the
@@ -974,5 +1043,93 @@ mod once_cell_sync {
         pub fn get_or_init(&self) -> Instant {
             *self.inner.get_or_init(Instant::now)
         }
+    }
+}
+
+#[cfg(test)]
+mod ack_delivery_tests {
+    use super::{ack_delivery, AckSample, MAX_PLAUSIBLE_LEG_BPS};
+    use std::time::{Duration, Instant};
+
+    fn sample(sent: u64, received: u64, bytes: u64, probe_sent_at: Instant) -> AckSample {
+        AckSample {
+            sent,
+            received,
+            bytes_received: bytes,
+            probe_sent_at,
+        }
+    }
+
+    #[test]
+    fn in_order_reports_true_rate_and_loss() {
+        let t0 = Instant::now();
+        // 250 kB delivered over a 200 ms send interval = 10 Mbps.
+        // 20 of 200 packets lost = 10% loss.
+        let prev = sample(0, 0, 0, t0);
+        let cur = sample(200, 180, 250_000, t0 + Duration::from_millis(200));
+        let (loss, bps) = ack_delivery(&prev, &cur).expect("newer ack yields a measurement");
+        assert!((loss - 0.10).abs() < 1e-4, "loss={loss}");
+        assert_eq!(bps, 10_000_000, "250000 B * 8 / 0.2 s");
+    }
+
+    #[test]
+    fn out_of_order_ack_is_rejected_not_a_blowup() {
+        // The bug: a late/reordered ack processed after a newer one. Its
+        // receiver snapshot is OLDER (fewer bytes) and its probe was sent
+        // EARLIER. On the arrival clock this paired a near-zero dt with a
+        // backwards byte delta and fabricated a huge rate; on the send clock
+        // it is simply not newer, so no measurement is produced.
+        let t0 = Instant::now();
+        let newer = sample(400, 400, 500_000, t0 + Duration::from_millis(400));
+        let older = sample(200, 200, 250_000, t0 + Duration::from_millis(200));
+        assert!(
+            ack_delivery(&newer, &older).is_none(),
+            "an ack not strictly newer than the baseline must yield no rate"
+        );
+        // Equal send-time (same-stamp duplicate) is also rejected.
+        assert!(ack_delivery(&newer, &newer).is_none());
+    }
+
+    #[test]
+    fn send_clock_denominator_ignores_return_path_jitter() {
+        // Two probes sent 400 ms apart carrying 500 kB of receiver bytes =
+        // 10 Mbps, REGARDLESS of how bunched their acks arrived. Under the old
+        // arrival-clock code, acks arriving 5 ms apart would have computed
+        // 500000*8/0.005 = 800 Mbps. The send clock pins it to the truth.
+        let t0 = Instant::now();
+        let prev = sample(0, 0, 0, t0);
+        let cur = sample(400, 400, 500_000, t0 + Duration::from_millis(400));
+        let (_, bps) = ack_delivery(&prev, &cur).unwrap();
+        assert_eq!(bps, 10_000_000, "rate keys off the 400 ms SEND gap, not ack arrival");
+    }
+
+    #[test]
+    fn absurd_byte_delta_is_clamped() {
+        // Defence-in-depth: even a pathological byte delta over a real
+        // interval cannot report a rate that would switch congestion control
+        // off — it is capped at the plausible-leg ceiling.
+        let t0 = Instant::now();
+        let prev = sample(0, 0, 0, t0);
+        let cur = sample(1, 1, u64::MAX / 16, t0 + Duration::from_millis(200));
+        let (_, bps) = ack_delivery(&prev, &cur).unwrap();
+        assert_eq!(bps, MAX_PLAUSIBLE_LEG_BPS as u64);
+    }
+
+    #[test]
+    fn sub_microsecond_interval_yields_zero_rate() {
+        let t0 = Instant::now();
+        let prev = sample(0, 0, 0, t0);
+        let cur = sample(10, 10, 100_000, t0 + Duration::from_nanos(500));
+        let (_, bps) = ack_delivery(&prev, &cur).unwrap();
+        assert_eq!(bps, 0, "an unmeasurably short interval is not trusted");
+    }
+
+    #[test]
+    fn zero_sent_delta_reports_no_loss() {
+        let t0 = Instant::now();
+        let prev = sample(100, 90, 100_000, t0);
+        let cur = sample(100, 90, 100_000, t0 + Duration::from_millis(200));
+        let (loss, _) = ack_delivery(&prev, &cur).unwrap();
+        assert_eq!(loss, 0.0, "no packets sent in the interval => loss undefined => 0");
     }
 }
