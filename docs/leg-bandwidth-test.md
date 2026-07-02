@@ -82,6 +82,14 @@ Notes:
 - Catches, at commissioning time, the exact failures that recur in this testbed: wrong
   interface binding, missing/changed cellular source IP, NO-CARRIER uplinks, legs silently
   collapsing onto the default route.
+- **The reported per-leg `mtu` is the local NIC MTU, not the end-to-end path MTU** — treat
+  it as a starting upper bound. Set the bonded *output*'s `path_mtu` knob (documented in
+  `bilbycast-edge/docs/bonding.md`) to the **smallest** end-to-end path MTU across all legs
+  so the sender re-chunks TS to fit and no leg IP-fragments. Measure the true value on a
+  constrained (cellular / satellite) leg with a DF ping sweep (`ping -M do -s <n>`), since
+  CGNAT bearers black-hole PMTU discovery. Folding an automatic path-MTU probe into this
+  leg test (a Phase-2-style auto-probe) is deferred — set `path_mtu` from the measured
+  value for now.
 
 What Phase 1 does **not** do: it does not measure throughput. For a *live* leg the
 report points the operator at the existing `capacity_bps` telemetry; for an *idle* leg it
