@@ -66,7 +66,17 @@
 //!   insurance rather than a stall point. It re-admits with hysteresis once
 //!   fresh jitter drops below half the threshold. The last eligible leg is
 //!   never demoted (a bond of all-jittery legs still carries media on the
-//!   least-bad). Opt-out with `jitter_demote_us = 0`.
+//!   least-bad). Opt-out with `jitter_demote_us = 0`. The jitter axis only
+//!   demotes a leg carrying at least [`JITTER_TRUST_MIN_BPS`]: the receiver's
+//!   jitter is an *interarrival-gap* deviation, so a leg the scheduler is
+//!   throttling toward zero reports huge jitter purely from sparse arrivals —
+//!   demoting on that would bench any leg the instant a faster sibling joins
+//!   (the timestamp-based OWD axis, being rate-independent, still demotes a
+//!   genuinely un-alignable late leg at any volume). And because a demoted leg
+//!   is starved of the fresh samples re-admission needs, it is optimistically
+//!   re-exposed after [`REEXPOSE_STARVED_ROUNDS`] starved rounds to re-prove
+//!   itself under real traffic — so a benched leg self-heals into a warm
+//!   standby instead of staying dead until a full path bounce.
 //!
 //! No async, no locks — same constraints as the rest of `bonding-protocol`.
 //! [`std::time::Instant`] is the only time source (already used by the
@@ -202,6 +212,42 @@ pub struct CongestionConfig {
 /// react within a second.
 const JITTER_DEMOTE_ROUNDS: u32 = 3;
 
+/// Minimum delivered rate (bits/sec) a leg must be carrying for its
+/// *interarrival* jitter to be trusted as a demote signal. The receiver's
+/// jitter estimator is a pure interarrival-gap deviation (RFC 3550 A.8 over
+/// inter-packet gaps), so it measures **the cadence of the packets the
+/// scheduler chose to put on the leg**, not just the path. A leg the
+/// scheduler is throttling toward zero (its share went to faster siblings)
+/// gets sparse, irregular arrivals whose gap deviation balloons to hundreds
+/// of ms — a pure artifact of being starved, not a bufferbloated radio. If
+/// that artifact were allowed to trip the jitter demote it would exclude the
+/// leg, which drops its traffic to zero, which freezes the artifact — a
+/// self-reinforcing starvation trap (a leg benched the moment a faster leg
+/// joins, never re-admitted). So the jitter axis only demotes a leg that is
+/// actually carrying a meaningful share; below this floor its interarrival
+/// jitter is ignored for demotion. The *timestamp-based* OWD axis
+/// (`un_equalizable`) is rate-independent and stays active at any volume, so a
+/// genuinely un-alignable late leg is still demoted regardless of load. Tied
+/// to the capacity floor: a leg carrying at least `min_rate_bps` is being
+/// used as media; below it, it is being starved.
+const JITTER_TRUST_MIN_BPS: u64 = 250_000;
+
+/// Consecutive *starved* control rounds a jitter-demoted leg waits before it
+/// is optimistically re-exposed (`media_eligible = true`) to re-prove itself
+/// under real traffic. A demoted leg carries no unique media, so it is
+/// starved every round and can never accumulate the *fresh* good samples that
+/// re-admission needs — without this it is benched forever (only a full
+/// dead→alive bounce would reset it). Re-exposing lets it re-enter the spill
+/// pool: if it is genuinely bad it re-demotes within `JITTER_DEMOTE_ROUNDS`
+/// once it carries real load (now above `JITTER_TRUST_MIN_BPS`, so the demote
+/// is trustworthy); if it is fine — or simply out-competed by faster legs — it
+/// stays a warm standby that instantly absorbs spill when a sibling drops,
+/// which is the whole reason the operator added the leg. ~100 rounds ≈ 20 s at
+/// the 5 Hz keepalive-ack cadence: infrequent enough that a genuinely-bad
+/// leg's brief re-trial is a negligible duty cycle, short enough that a
+/// recovered leg rejoins within seconds.
+const REEXPOSE_STARVED_ROUNDS: u32 = 100;
+
 /// Auto delay-threshold = baseline RTT × this fraction. 0.7 places a
 /// ~360 ms cellular baseline at ~250 ms (the value such links need
 /// hand-tuned today) and a ~22 ms terrestrial baseline below the floor.
@@ -277,6 +323,11 @@ struct PathCc {
     demote_streak: u32,
     /// Consecutive fresh rounds below `jitter_demote_us / 2` (toward re-admit).
     admit_streak: u32,
+    /// Consecutive *starved* rounds while `media_eligible == false`. Drives
+    /// the [`REEXPOSE_STARVED_ROUNDS`] auto re-expose so a demoted leg that
+    /// can never earn fresh samples (because being demoted starves it) is not
+    /// benched forever. Reset whenever the leg carries traffic or is eligible.
+    demoted_starved_rounds: u32,
     /// Scheduler `sched_serial` at this path's last health update; if it
     /// hasn't advanced, the bond was idle and nothing was starved.
     last_update_serial: u64,
@@ -291,6 +342,20 @@ struct PathCc {
     /// synchronized walk-down). A genuine sustained capacity loss decays this
     /// within ~2-3 s so the leg still backs off honestly.
     delivery_recent_max: f64,
+    /// Live per-leg send-rate ceiling handed down by an external
+    /// **shared-leg capacity broker** (host-level cross-flow fair-share
+    /// arbiter), bits/sec (`f64::INFINITY` = no broker constraint). Applied
+    /// to the token bucket only (via [`Self::effective_bps`]); it throttles
+    /// how much this flow may OFFER on the leg. `capacity_bps` keeps
+    /// discovering the flow's demand (bounded by the evidence cap to ~2× the
+    /// ceiling once throttled) and is still published via `capacity_pub` as a
+    /// fallback demand reference — but the broker primarily reads each leg's
+    /// measured *delivered* rate, which (unlike the frozen-on-idle estimate)
+    /// stays fresh when a leg goes idle/dead. Refreshed from a shared atomic
+    /// in [`CapacityAwareScheduler::refill_all`], never on the hot path beyond
+    /// one relaxed load. `INFINITY` when no broker is registered → identical
+    /// to the pre-broker behaviour.
+    broker_ceiling_bps: f64,
 }
 
 impl PathCc {
@@ -313,20 +378,34 @@ impl PathCc {
             media_eligible: true,
             demote_streak: 0,
             admit_streak: 0,
+            demoted_starved_rounds: 0,
             last_update_serial: 0,
             delivery_bps: 0.0,
             delivery_recent_max: 0.0,
+            broker_ceiling_bps: f64::INFINITY,
         }
     }
 
-    /// Token-bucket burst depth in bytes for the current capacity.
+    /// The rate this leg may actually OFFER, bits/sec: the discovered
+    /// capacity clamped to the broker's live fair-share ceiling. Drives the
+    /// token bucket (refill rate + burst depth) so a broker-capped leg sends
+    /// no faster than its allocation, while `capacity_bps` keeps discovering
+    /// (and publishing) the flow's uncapped demand. `INFINITY` broker ceiling
+    /// → `effective == capacity_bps` (pre-broker behaviour).
+    #[inline]
+    fn effective_bps(&self) -> f64 {
+        self.capacity_bps.min(self.broker_ceiling_bps)
+    }
+
+    /// Token-bucket burst depth in bytes for the current *effective* rate.
     #[inline]
     fn burst_bytes(&self, burst_secs: f32) -> f64 {
-        (self.capacity_bps / 8.0) * burst_secs as f64
+        (self.effective_bps() / 8.0) * burst_secs as f64
     }
 
     /// Refill the bucket for the elapsed time since the last refill,
     /// capped at the burst depth. Dead paths neither refill nor drain.
+    /// Fills at the *effective* (broker-capped) rate.
     fn refill(&mut self, now: Instant, burst_secs: f32) {
         let dt = now.saturating_duration_since(self.last_refill).as_secs_f64();
         self.last_refill = now;
@@ -335,7 +414,7 @@ impl PathCc {
             return;
         }
         let burst = self.burst_bytes(burst_secs);
-        self.tokens = (self.tokens + (self.capacity_bps / 8.0) * dt).min(burst);
+        self.tokens = (self.tokens + (self.effective_bps() / 8.0) * dt).min(burst);
     }
 
     /// Quality factor in (0, 1]: loss, RTT-inflation, and interarrival
@@ -410,8 +489,17 @@ pub struct CapacityAwareScheduler {
     oversubscribed_drops: u64,
     /// Shared, per-path live capacity estimate (bits/sec). Cloned out via
     /// [`Self::capacity_handles`] so the edge can publish it as telemetry
-    /// after the scheduler is moved into the sender task.
+    /// after the scheduler is moved into the sender task. Under a shared-leg
+    /// broker this doubles as the **demand** signal the broker reads back.
     capacity_pub: Vec<Arc<AtomicU64>>,
+    /// Shared, per-path live send-rate **ceiling** (bits/sec) written by an
+    /// external shared-leg capacity broker; `u64::MAX` = no constraint (the
+    /// default, and the value when no broker is registered). Read into each
+    /// `PathCc::broker_ceiling_bps` in [`Self::refill_all`] — one relaxed
+    /// atomic load per leg per refill, never any locking on the hot path.
+    /// Cloned out via [`Self::ceiling_handles`] before the scheduler moves
+    /// into the sender task.
+    ceiling_sub: Vec<Arc<AtomicU64>>,
     /// Operator redundancy policy (replicate across N best legs).
     redundancy: RedundancyPolicy,
 }
@@ -448,6 +536,10 @@ impl CapacityAwareScheduler {
             .iter()
             .map(|p| Arc::new(AtomicU64::new(p.capacity_bps as u64)))
             .collect();
+        let ceiling_sub = paths
+            .iter()
+            .map(|_| Arc::new(AtomicU64::new(u64::MAX)))
+            .collect();
         Self {
             paths,
             cfg,
@@ -455,6 +547,7 @@ impl CapacityAwareScheduler {
             sched_serial: 0,
             oversubscribed_drops: 0,
             capacity_pub,
+            ceiling_sub,
             redundancy: RedundancyPolicy::default(),
         }
     }
@@ -468,6 +561,20 @@ impl CapacityAwareScheduler {
             .iter()
             .enumerate()
             .map(|(i, p)| (p.id, self.capacity_pub[i].clone()))
+            .collect()
+    }
+
+    /// Shared handles to each path's live send-rate ceiling (bits/sec),
+    /// keyed by path id. A shared-leg capacity broker stores each leg's
+    /// fair-share allocation here (`u64::MAX` = unconstrained); the
+    /// scheduler reads it into the token bucket every refill. Grab these
+    /// before moving the scheduler into the sender so the broker can drive
+    /// them from its own timer.
+    pub fn ceiling_handles(&self) -> Vec<(PathId, Arc<AtomicU64>)> {
+        self.paths
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (p.id, self.ceiling_sub[i].clone()))
             .collect()
     }
 
@@ -501,7 +608,28 @@ impl CapacityAwareScheduler {
 
     fn refill_all(&mut self, now: Instant) {
         let burst = self.cfg.burst_secs;
-        for p in &mut self.paths {
+        let mult = self.cfg.probe_cap_mult;
+        for (i, p) in self.paths.iter_mut().enumerate() {
+            // Pull the broker's live fair-share ceiling (one relaxed load).
+            // u64::MAX sentinel → no constraint (INFINITY).
+            let c = self.ceiling_sub[i].load(Ordering::Relaxed);
+            let bc = if c == u64::MAX { f64::INFINITY } else { c as f64 };
+            p.broker_ceiling_bps = bc;
+            // Bound the discovery estimate when the broker is throttling this
+            // leg. Without this, a perpetually-capped leg keeps its bucket in
+            // debt (offered > effective), which the controller reads as demand
+            // pressure, lifts the evidence cap, and slow-starts capacity_bps
+            // ×2/round → it runs away to INFINITY (garbage demand telemetry,
+            // and an un-paced effective rate the instant the broker is
+            // disabled). Cap it at ceiling × probe_cap_mult: enough headroom
+            // for the broker to see the leg wants more and grow it, no runaway.
+            if bc.is_finite() {
+                let bound = bc * mult;
+                if p.capacity_bps > bound {
+                    p.capacity_bps = bound;
+                    self.capacity_pub[i].store(bound as u64, Ordering::Relaxed);
+                }
+            }
             p.refill(now, burst);
         }
     }
@@ -819,10 +947,25 @@ impl BondScheduler for CapacityAwareScheduler {
         // starved leg's decayed jitter must never auto-flip the flag — and a
         // demoted leg keeps carrying redundancy/FEC so it stays measured and
         // can re-admit once it's clean on BOTH axes.
+        //
+        // The jitter axis (a) additionally requires the leg to be carrying at
+        // least [`JITTER_TRUST_MIN_BPS`]. The receiver's jitter is an
+        // interarrival-gap deviation, so a leg the scheduler is throttling
+        // toward zero (its share went to faster siblings) reports huge jitter
+        // purely from sparse, irregular arrivals — the scheduler would then be
+        // demoting the leg for a cadence it imposed itself, benching it the
+        // moment a faster leg joins and (because a benched leg is starved
+        // forever) never re-admitting it. Below the floor the interarrival
+        // jitter is not a trustworthy path signal, so it does not demote. The
+        // OWD axis (b) is timestamp-based (rate-independent) and stays active
+        // at any volume, so a genuinely un-alignable late leg is still demoted.
         if !starved {
             let owd_measured = health.relative_owd_us != u32::MAX;
             let owd_us = health.relative_owd_us as u64;
-            let jittery = cfg.jitter_demote_us > 0 && p.jitter_us > cfg.jitter_demote_us;
+            let jitter_trustworthy = health.throughput_bps >= JITTER_TRUST_MIN_BPS;
+            let jittery = cfg.jitter_demote_us > 0
+                && p.jitter_us > cfg.jitter_demote_us
+                && jitter_trustworthy;
             let un_equalizable =
                 cfg.max_bonding_latency_us > 0 && owd_measured && owd_us > cfg.max_bonding_latency_us;
             // Re-admit needs BOTH axes clean (hysteresis at half the threshold).
@@ -845,6 +988,30 @@ impl BondScheduler for CapacityAwareScheduler {
                 }
             }
             // Hysteresis band: hold the flag and streaks.
+        }
+
+        // Break the starvation trap. A demoted leg carries no unique media, so
+        // it is starved every round and the `!starved`-gated logic above can
+        // never accumulate the fresh good samples re-admission needs — left
+        // alone it stays benched until a full dead→alive bounce, defeating the
+        // whole point of the operator's standby leg (it cannot backfill a
+        // sibling outage). After [`REEXPOSE_STARVED_ROUNDS`] starved rounds
+        // with no fresh evidence either way, optimistically re-expose it so it
+        // re-competes for spill: if it is genuinely bad it re-demotes within
+        // `JITTER_DEMOTE_ROUNDS` once it carries a trustworthy load; if it is
+        // fine — or simply out-competed by faster legs — it becomes the warm
+        // standby it was added to be, ready to absorb spill the instant a
+        // sibling drops.
+        if !p.media_eligible && starved {
+            p.demoted_starved_rounds = p.demoted_starved_rounds.saturating_add(1);
+            if p.demoted_starved_rounds >= REEXPOSE_STARVED_ROUNDS {
+                p.media_eligible = true;
+                p.demote_streak = 0;
+                p.admit_streak = 0;
+                p.demoted_starved_rounds = 0;
+            }
+        } else {
+            p.demoted_starved_rounds = 0;
         }
 
         // Capacity control step.
@@ -1031,6 +1198,7 @@ impl BondScheduler for CapacityAwareScheduler {
             p.media_eligible = true;
             p.demote_streak = 0;
             p.admit_streak = 0;
+            p.demoted_starved_rounds = 0;
             p.tokens = 0.0;
             self.publish(i);
         }
@@ -1091,6 +1259,87 @@ mod tests {
             }
             other => panic!("expected Duplicate, got {other:?}"),
         }
+    }
+
+    /// A broker-supplied per-leg ceiling throttles that leg's *offered* rate
+    /// (token bucket) so traffic shifts to an unconstrained sibling — while
+    /// the capped leg's DISCOVERED `capacity_bps` (the demand signal the
+    /// broker reads back) is left untouched.
+    #[test]
+    fn broker_ceiling_throttles_send_rate_not_demand() {
+        let mut s = CapacityAwareScheduler::new(vec![0, 1]);
+        let ceilings = s.ceiling_handles();
+        let c0 = ceilings.iter().find(|(id, _)| *id == 0).unwrap().1.clone();
+        // Hard-cap leg 0 to 100 kbps; leave leg 1 unconstrained (u64::MAX).
+        c0.store(100_000, Ordering::Relaxed);
+        // Both legs measured clean with a high delivered rate → both probe
+        // their capacity estimate up equally.
+        for _ in 0..10 {
+            s.on_path_update(0, &health(20, 0.0, 10_000_000));
+            s.on_path_update(1, &health(20, 0.0, 10_000_000));
+        }
+        // Offer ~2 Mbps of 1000-byte packets over 1 s of controlled time.
+        let t0 = Instant::now();
+        let (mut leg0, mut leg1) = (0u64, 0u64);
+        for k in 0..2000u64 {
+            let now = t0 + Duration::from_micros(k * 500);
+            match s.schedule_at(&hints(1000), now) {
+                PathSelection::Single(0) => leg0 += 1,
+                PathSelection::Single(1) => leg1 += 1,
+                _ => {}
+            }
+        }
+        assert!(
+            leg1 > leg0 * 3,
+            "broker-capped leg 0 ({leg0}) must carry far less than uncapped leg 1 ({leg1})"
+        );
+        // Leg 0's discovered demand still exceeds its ceiling (so the broker
+        // sees it wants more) but is BOUNDED to ~2× the ceiling — the
+        // anti-runaway clamp, not the old unbounded signal.
+        let cap0 = s.capacity_bps(0).unwrap();
+        assert!(cap0 > 100_000, "demand exceeds the ceiling (wants more): {cap0}");
+        assert!(cap0 <= 200_000 + 1, "demand bounded to ~2× ceiling, no runaway: {cap0}");
+        // Clearing the ceiling (u64::MAX) restores full throughput eligibility.
+        c0.store(u64::MAX, Ordering::Relaxed);
+        let t1 = t0 + Duration::from_secs(2);
+        let mut leg0b = 0u64;
+        for k in 0..500u64 {
+            let now = t1 + Duration::from_micros(k * 500);
+            if let PathSelection::Single(0) = s.schedule_at(&hints(1000), now) {
+                leg0b += 1;
+            }
+        }
+        assert!(leg0b > 0, "uncapped leg 0 carries traffic again once the ceiling lifts");
+    }
+
+    /// A broker-capped leg under sustained demand pressure must NOT let its
+    /// discovery estimate (capacity_bps) run away to INFINITY — it is bounded
+    /// to ceiling × probe_cap_mult so the demand signal stays sane and the
+    /// effective rate can't blow up if the broker is later disabled.
+    #[test]
+    fn broker_cap_bounds_estimate_no_runaway() {
+        let mut s = CapacityAwareScheduler::new(vec![0]);
+        let ceilings = s.ceiling_handles();
+        let c0 = ceilings[0].1.clone();
+        c0.store(1_000_000, Ordering::Relaxed); // 1 Mbps broker ceiling
+        let t0 = Instant::now();
+        // Offer ~3.2 Mbps (>> the 1 Mbps cap) so the bucket stays in debt =
+        // perpetual demand pressure, plus a high clean delivered signal — the
+        // exact conditions that lift the evidence cap and slow-start the
+        // estimate toward INFINITY without the bound.
+        for k in 0..400u64 {
+            let now = t0 + Duration::from_millis(k * 5);
+            let _ = s.schedule_at(&hints(2000), now);
+            s.on_path_update(0, &health(20, 0.0, 10_000_000));
+        }
+        // Final refill applies the bound.
+        let _ = s.schedule_at(&hints(2000), t0 + Duration::from_secs(3));
+        let cap = s.capacity_bps(0).unwrap();
+        assert!(
+            cap <= 1_000_000 * 2 + 1,
+            "broker-capped estimate bounded at ceiling×probe_cap_mult (2 Mbps), got {cap}"
+        );
+        assert!(cap < u64::MAX / 2, "no runaway to u64::MAX: {cap}");
     }
 
     /// estimate upward over successive health samples.
@@ -1620,24 +1869,112 @@ mod tests {
         assert!(total > 0, "an all-jittery bond must still carry media, not blackout");
     }
 
-    /// E-fix: a jitter-DEMOTED leg delivering far below the min_rate floor
-    /// has its capacity tracked to its delivered rate × probe_cap_mult, NOT
-    /// floored back up to min_rate — otherwise it is over-committed wasted
-    /// parity it cannot carry. A media-eligible leg, by contrast, keeps the
-    /// protective floor (see `eligible_weak_leg_keeps_min_rate_floor`).
+    /// A leg the scheduler is throttling toward zero (its share went to faster
+    /// siblings) reports huge *interarrival* jitter purely from sparse, irregular
+    /// arrivals — a pacing artifact, not a bad radio. That must NOT demote it,
+    /// or adding a fast leg benches a healthy one (the starvation trap this fix
+    /// targets). Only a leg carrying at least `JITTER_TRUST_MIN_BPS` is judged
+    /// on its interarrival jitter.
+    #[test]
+    fn starved_leg_not_demoted_on_pacing_jitter() {
+        let mut s = CapacityAwareScheduler::new(vec![0, 1]);
+        // Both legs carry only ~100 kbps (below the 250 kbps trust floor), but
+        // leg 1 shows catastrophic 300 ms jitter. Fresh samples (no scheduling
+        // between rounds). The low volume means leg 1's jitter is untrustworthy
+        // — the scheduler is starving it, not the radio misbehaving.
+        for _ in 0..(JITTER_DEMOTE_ROUNDS + 5) {
+            s.on_path_update(0, &health(20, 0.0, 100_000));
+            s.on_path_update(1, &health_j(20, 0.0, 100_000, 300_000));
+        }
+        // Leg 1 stays media-eligible → still carries a share when scheduled.
+        // (If it had been demoted, media_only selection would give it exactly 0.)
+        let base = Instant::now() + Duration::from_secs(1);
+        let mut counts = [0u64; 2];
+        let mut t = base;
+        for _ in 0..1000 {
+            t += Duration::from_millis(1);
+            if let PathSelection::Single(p) = s.schedule_at(&hints(1316), t) {
+                counts[p as usize] += 1;
+            }
+        }
+        assert!(
+            counts[1] > 0,
+            "a throttled leg must not be demoted on pacing jitter: {counts:?}"
+        );
+    }
+
+    /// The starvation-trap fix: a genuinely-demoted leg carries no unique media,
+    /// so it is starved of the *fresh* samples re-admission needs and — without
+    /// a backstop — stays benched forever (only a full dead→alive bounce would
+    /// reset it). After `REEXPOSE_STARVED_ROUNDS` starved rounds it auto-re-exposes
+    /// and carries media again: a benched standby self-heals instead of staying
+    /// dead exactly when a sibling outage would need it.
+    #[test]
+    fn demoted_leg_reexposes_after_starvation() {
+        let mut s = CapacityAwareScheduler::new(vec![0, 1]);
+        // Demote leg 1 on trustworthy high-volume jitter (20 Mbps, 300 ms).
+        for _ in 0..(JITTER_DEMOTE_ROUNDS + 2) {
+            s.on_path_update(0, &health(20, 0.0, 2_000_000));
+            s.on_path_update(1, &health_j(20, 0.0, 20_000_000, 300_000));
+        }
+        // Confirm it is benched: carries zero unique media.
+        let mut t = Instant::now() + Duration::from_secs(1);
+        let mut pre = [0u64; 2];
+        for _ in 0..300 {
+            t += Duration::from_millis(1);
+            if let PathSelection::Single(p) = s.schedule_at(&hints(1316), t) {
+                pre[p as usize] += 1;
+            }
+        }
+        assert_eq!(pre[1], 0, "leg starts benched: {pre:?}");
+
+        // Starve it: each round advance the scheduler (packet lands on eligible
+        // leg 0) then feed leg 1 a health update — it is never picked, so it is
+        // `starved` and the `!starved`-gated re-admit can never progress. After
+        // the cooldown it must auto-re-expose despite never earning a fresh
+        // sample while benched.
+        for _ in 0..(REEXPOSE_STARVED_ROUNDS + 2) {
+            t += Duration::from_millis(1);
+            let _ = s.schedule_at(&hints(1316), t);
+            s.on_path_update(1, &health_j(20, 0.0, 0, 300_000));
+        }
+        // Leg 1 carries media again once the bond is oversubscribed enough to
+        // spill onto it.
+        let mut post = [0u64; 2];
+        for _ in 0..1000 {
+            t += Duration::from_millis(1);
+            if let PathSelection::Single(p) = s.schedule_at(&hints(1316), t) {
+                post[p as usize] += 1;
+            }
+        }
+        assert!(
+            post[1] > 0,
+            "benched leg must re-expose and carry media again: {post:?}"
+        );
+    }
+
+    /// E-fix: a jitter-DEMOTED leg delivering below the min_rate floor has its
+    /// capacity tracked to its delivered rate × probe_cap_mult, NOT floored
+    /// back up to min_rate — otherwise it is over-committed wasted parity it
+    /// cannot carry. A media-eligible leg, by contrast, keeps the protective
+    /// floor (see `eligible_weak_leg_keeps_min_rate_floor`).
     #[test]
     fn demoted_weak_leg_not_floored_above_evidence() {
-        // min_rate 800 kbps; leg is catastrophically jittery (→ demoted)
-        // and only ever delivers 130 kbps.
+        // min_rate 800 kbps; leg is catastrophically jittery (→ demoted) while
+        // delivering 300 kbps — above `JITTER_TRUST_MIN_BPS` so the jitter is a
+        // trustworthy demote signal (a leg carrying essentially nothing is not
+        // demoted on interarrival jitter — see `starved_leg_not_demoted_on_
+        // pacing_jitter`), yet still below the 800 kbps min_rate floor so the
+        // un-flooring is exercised.
         let cfg = CongestionConfig { min_rate_bps: 800_000, ..CongestionConfig::default() };
         let priors = vec![PathPrior { id: 0, weight_hint: 1, ceiling_bps: None }];
         let mut s = CapacityAwareScheduler::with_paths(priors, cfg);
         for _ in 0..50 {
             // No scheduling → no demand pressure → evidence bound applies.
-            s.on_path_update(0, &health_j(20, 0.0, 130_000, 300_000));
+            s.on_path_update(0, &health_j(20, 0.0, 300_000, 300_000));
         }
         let cap = s.capacity_bps(0).unwrap();
-        let bound = (130_000.0 * CongestionConfig::default().probe_cap_mult) as u64;
+        let bound = (300_000.0 * CongestionConfig::default().probe_cap_mult) as u64;
         assert!(
             cap <= bound,
             "demoted weak leg must track its evidence bound, not the floor: cap={cap} bound={bound}"

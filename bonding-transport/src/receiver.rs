@@ -64,6 +64,20 @@ const STALE_FLOOD_MIN_PACKETS: u64 = 100;
 /// "too jittery to gate latency on" means.
 const HOLD_JITTER_EXCLUDE_US: u64 = 150_000;
 
+/// A leg with no data arrival for at least this long has its reported
+/// interarrival jitter decayed toward zero on the pump tick. The estimator
+/// only ticks on arrival, so a leg the sender stopped scheduling — its share
+/// moved to faster siblings, or it was jitter-demoted to zero traffic —
+/// otherwise FREEZES its last sample, surfacing to the operator as a stuck
+/// multi-second "jitter" on a leg that is merely idle (the exact symptom that
+/// makes a parked bond leg look broken when it is fine). 500 ms is a few
+/// keepalive rounds: long enough not to touch a leg between normal media
+/// packets, short enough that a parked leg's telemetry goes honest quickly.
+const JITTER_IDLE_DECAY_AFTER: Duration = Duration::from_millis(500);
+/// Per-pump-tick (~10 ms) decay multiplier applied to an idle leg's reported
+/// jitter. 0.9/tick converges a frozen multi-second reading to ~0 within ~1 s.
+const JITTER_IDLE_DECAY: f64 = 0.9;
+
 pub(crate) struct ReceiverHandle {
     pub rx: mpsc::Receiver<Bytes>,
 }
@@ -1097,6 +1111,29 @@ async fn receiver_loop(
             _ = pump.tick() => {
                 let now = Instant::now();
                 drain_reassembly(&mut reassembly, &app_tx, &conn_stats, &mut drain_scratch, now, &mut pending_nacks, true);
+
+                // Estimator hygiene: the interarrival-jitter estimator only
+                // ticks on arrival, so a leg that goes quiet (parked by the
+                // sender's scheduler, or jitter-demoted to zero traffic) freezes
+                // its last sample and reports a stuck multi-second "jitter" for a
+                // leg that is simply idle. Decay a quiet leg's reported jitter
+                // toward zero so telemetry honestly reflects "no data" instead of
+                // a stale spike; advancing `last_arrival` also keeps the whole
+                // idle gap from re-spiking the estimator when the leg resumes.
+                for (id, e) in path_jitter.iter_mut() {
+                    if now.saturating_duration_since(e.0) >= JITTER_IDLE_DECAY_AFTER {
+                        e.2 *= JITTER_IDLE_DECAY;
+                        if e.2 < 1.0 {
+                            e.2 = 0.0;
+                        }
+                        e.0 = now;
+                        if let Some(idx) = path_index_by_id(*id) {
+                            if let Some(ps) = path_stats_for(idx) {
+                                ps.jitter_us.store(e.2 as u64, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                }
 
                 // Per-leg equalization recompute (~5 Hz; L3). Align every
                 // eligible (warm + fresh) leg to the SLOWEST eligible one so
