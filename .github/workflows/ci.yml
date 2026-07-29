@@ -1,0 +1,96 @@
+name: CI
+
+# Compile-check and test every pull request and every push to main.
+#
+# Why this exists: until now bilbycast-bonding had NO workflows at all. Nothing
+# built or tested this repo automatically, ever — the suite only ran when
+# somebody happened to type `cargo test` locally. That is how
+# `bond_heterogeneous.rs::udp_plus_quic_deliver_in_order` sat broken since the
+# initial commit (2026-04-18) without anyone noticing: it asserted the scheduler
+# had placed at least one packet on BOTH legs of a short burst, which the
+# adaptive scheduler never promised, so it failed roughly 1 run in 10. A
+# once-in-ten failure in a suite nothing runs is invisible indefinitely. The
+# assertion is fixed; this workflow is what stops the next one hiding as long.
+#
+# Scope is the DEFAULT feature set (path-udp + path-rist + path-quic), which is
+# what `cargo build` gives you and what bilbycast-edge compiles against.
+#
+# Deliberately NOT run here:
+#   * `cargo fmt --check` — this tree is not rustfmt-clean, and a bare
+#     `cargo fmt` rewrites ~200 files. Adding the gate would mean either a
+#     permanently red CI or a giant unrelated reformat commit.
+#   * `cargo clippy -D warnings` — worth adding, but it should land as its own
+#     change after the existing lint debt is triaged, not bundled in here where
+#     it would make this workflow look like it introduced the failures.
+# `cargo check --all-targets` already keeps the tree warning-free today.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check-and-test:
+    name: cargo check + test (default features)
+    runs-on: ubuntu-24.04
+    steps:
+      # bonding-transport path-depends on ../../bilbycast-rist/rist-transport,
+      # and `path-rist` is in the DEFAULT feature set — so the sibling must be
+      # on disk even for a plain check. Checking both repos out as peer
+      # directories makes the relative `../..` reference resolve exactly as it
+      # does in a local monorepo checkout.
+      #
+      # No token needed: Bilbycast/bilbycast-rist is public, so the default
+      # GITHUB_TOKEN can read it.
+      - name: Checkout bilbycast-rist (path dependency)
+        uses: actions/checkout@v7
+        with:
+          repository: Bilbycast/bilbycast-rist
+          path: bilbycast-rist
+          submodules: recursive
+
+      - name: Checkout bilbycast-bonding
+        uses: actions/checkout@v7
+        with:
+          path: bilbycast-bonding
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # No apt step on purpose: this workspace is pure Rust. quinn and rustls
+      # are pinned to the `ring` backend (default-features = false), not
+      # aws-lc-rs, so there is no cmake / nasm / perl requirement — the stock
+      # runner's C compiler is enough for `ring` and `rcgen`.
+
+      # Cargo.lock is gitignored in this repo, so there is no lockfile to hash
+      # and `--locked` cannot be used. Key the cache on the manifests instead;
+      # the prefix restore-key keeps most of the build when one dep moves.
+      - name: Cache cargo registry and build
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            bilbycast-bonding/target
+          key: ci-bonding-${{ hashFiles('bilbycast-bonding/**/Cargo.toml') }}
+          restore-keys: |
+            ci-bonding-
+
+      - name: cargo check
+        working-directory: bilbycast-bonding
+        run: cargo check --all-targets
+
+      # The integration tests bind real loopback sockets (UDP + QUIC) and are
+      # timing-sensitive by nature. Single-threaded so the bond's timers are not
+      # fighting other tests for CPU on a 2-core runner, which is what pushed
+      # the old flaky assertion over the edge.
+      - name: cargo test
+        working-directory: bilbycast-bonding
+        run: cargo test -- --test-threads=1
