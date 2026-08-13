@@ -101,6 +101,15 @@ pub fn rs_reconstruct(
     shards: &mut [Option<Vec<u8>>],
     shard_len: usize,
 ) -> bool {
+    // Dimension contract, checked once per block (never per packet): the
+    // array must hold `k + m` slots and every present shard must be exactly
+    // `shard_len` bytes, or the Gauss-Jordan below indexes / copies out of
+    // range. Callers inside this crate always satisfy it; this is the guard
+    // for the public API and for a shard assembled from wire-supplied
+    // lengths.
+    if shards.len() < k + m || shards.iter().flatten().any(|s| s.len() != shard_len) {
+        return false;
+    }
     let missing: Vec<usize> = (0..k).filter(|&j| shards[j].is_none()).collect();
     if missing.is_empty() {
         return true;
@@ -228,6 +237,22 @@ impl PerLegRsRepair {
         let parity_index = r.get_u16();
         let shard_len = r.get_u16();
         let count = r.get_u16() as usize;
+        // Structural bounds, enforced here so `PerLegRsDecoder` never has to
+        // defend each index. Every one of these is fixed by the encoder
+        // (`PerLegRsEncoder::push`): k ≥ 1 and m ≥ 1, exactly one `bond_seq`
+        // per data shard, a parity index addressing a real parity slot, a
+        // shard of `2 + max_payload` (so ≥ 2) bytes, and a block inside the
+        // GF(256) element budget. A repair violating any of them cannot have
+        // been produced by a peer running this protocol.
+        if data_shards == 0
+            || parity_shards == 0
+            || parity_index >= parity_shards
+            || shard_len < 2
+            || count != data_shards as usize
+            || data_shards as usize + parity_shards as usize > RS_MAX_BLOCK
+        {
+            return None;
+        }
         let mut off = Self::FIXED_HDR;
         if buf.len() < off + count * 4 + shard_len as usize {
             return None;
@@ -406,10 +431,39 @@ impl PerLegRsDecoder {
     }
 
     pub fn push_repair(&mut self, r: PerLegRsRepair) -> Vec<(u32, Bytes)> {
+        // `PerLegRsRepair` has public fields and this is a public entry point,
+        // so `parse`'s bounds are NOT an invariant of the type — bilbycast-edge
+        // depends on this crate directly and could hand us a hand-built value.
+        // Without this, `seqs[j]` and `shards[k + idx]` are indexed with
+        // attacker- or caller-chosen values. Cost is one branch per FEC
+        // datagram; this is not the media path.
+        if r.data_shards == 0
+            || r.parity_shards == 0
+            || r.parity_index >= r.parity_shards
+            || r.shard_len < 2
+            || r.seqs.len() != r.data_shards as usize
+            || r.parity.len() != r.shard_len as usize
+            || r.data_shards as usize + r.parity_shards as usize > RS_MAX_BLOCK
+        {
+            return Vec::new();
+        }
         let key = match r.seqs.first() {
             Some(s) => *s,
             None => return Vec::new(),
         };
+        // Every repair of one block is emitted by a single `PerLegRsEncoder::
+        // push` and therefore agrees on geometry, shard length and member
+        // list. A repair that disagrees with the block it would join is stale
+        // or forged; accepting it would let its parity shard be indexed and
+        // length-matched against a different block's dimensions.
+        if let Some(b) = self.blocks.get(&key)
+            && (b.k != r.data_shards as usize
+                || b.m != r.parity_shards as usize
+                || b.shard_len != r.shard_len as usize
+                || b.seqs != r.seqs)
+        {
+            return Vec::new();
+        }
         if !self.blocks.contains_key(&key) {
             if self.blocks.len() >= self.block_cap {
                 if let Some(old) = self.block_order.pop_front() {
@@ -470,6 +524,13 @@ impl PerLegRsDecoder {
         let mut shards: Vec<Option<Vec<u8>>> = vec![None; k + m];
         for (j, sq) in seqs.iter().enumerate().take(k) {
             if let Some(p) = self.seen.get(sq) {
+                // A member that doesn't fit the block's shard can't belong to
+                // it — bail rather than pad out of range or reconstruct
+                // garbage. Mirrors the same guard in `fec::FecDecoder::attempt`
+                // and `fec::PerLegFecDecoder::try_recover`.
+                if 2 + p.len() > shard_len {
+                    return Vec::new();
+                }
                 shards[j] = Some(pad_shard(p, shard_len));
             }
         }
@@ -497,6 +558,41 @@ impl PerLegRsDecoder {
 
 #[cfg(test)]
 mod tests {
+
+    /// `PerLegRsRepair` has public fields, so `parse`'s structural bounds are
+    /// not an invariant of the type — bilbycast-edge depends on this crate
+    /// directly. `push_repair` must defend itself. Each case below indexed out
+    /// of range before the guard: `parity_index` past the parity slots,
+    /// `seqs.len()` disagreeing with `data_shards`, and a parity buffer
+    /// shorter than the declared shard length.
+    #[test]
+    fn push_repair_rejects_hand_built_out_of_range_repairs() {
+        let bad = |f: &dyn Fn(&mut PerLegRsRepair)| {
+            let mut r = PerLegRsRepair {
+                data_shards: 2,
+                parity_shards: 1,
+                parity_index: 0,
+                shard_len: 4,
+                seqs: vec![1, 2],
+                parity: Bytes::from_static(&[0u8; 4]),
+            };
+            f(&mut r);
+            let mut dec = PerLegRsDecoder::new(2, 1);
+            assert!(dec.push_repair(r).is_empty());
+        };
+
+        bad(&|r| r.parity_index = 999);
+        bad(&|r| r.parity_index = r.parity_shards);
+        bad(&|r| r.data_shards = 0);
+        bad(&|r| r.parity_shards = 0);
+        bad(&|r| r.shard_len = 1);
+        bad(&|r| r.seqs = vec![1]);
+        bad(&|r| r.parity = Bytes::from_static(&[0u8; 2]));
+        bad(&|r| {
+            r.data_shards = 200;
+            r.parity_shards = 200;
+        });
+    }
     use super::*;
 
     fn shard(byte: u8, len: usize) -> Vec<u8> {
@@ -572,6 +668,74 @@ mod tests {
         let mut buf = BytesMut::new();
         r.serialize(&mut buf);
         assert_eq!(PerLegRsRepair::parse(&buf).unwrap(), r);
+    }
+
+    // ── Malformed-repair rejection (remote-input hardening) ──────────────
+    //
+    // Every value in a `PerLegRsRepair` is attacker-chosen on the wire. These
+    // pin the structural contract `parse` enforces, and the two use-site
+    // guards that structure alone cannot express.
+
+    /// Assemble a raw `PerLegRsRepair` wire image from arbitrary field values.
+    fn rs_wire(k: u16, m: u16, idx: u16, shard_len: u16, seqs: &[u32]) -> BytesMut {
+        let mut b = BytesMut::new();
+        b.put_u16(k);
+        b.put_u16(m);
+        b.put_u16(idx);
+        b.put_u16(shard_len);
+        b.put_u16(seqs.len() as u16);
+        for s in seqs {
+            b.put_u32(*s);
+        }
+        b.put_slice(&vec![0u8; shard_len as usize]);
+        b
+    }
+
+    #[test]
+    fn rs_parse_rejects_out_of_range_fields() {
+        // parity_index ≥ parity_shards → would index shards[k + idx] OOB.
+        assert!(PerLegRsRepair::parse(&rs_wire(1, 1, 999, 10, &[7])).is_none());
+        // count < data_shards → would index seqs[j] OOB in try_block.
+        assert!(PerLegRsRepair::parse(&rs_wire(5, 1, 0, 4, &[7])).is_none());
+        // shard_len < 2 → no room for pad_shard's length prefix.
+        assert!(PerLegRsRepair::parse(&rs_wire(1, 1, 0, 0, &[7])).is_none());
+        assert!(PerLegRsRepair::parse(&rs_wire(1, 1, 0, 1, &[7])).is_none());
+        // Zero shard counts.
+        assert!(PerLegRsRepair::parse(&rs_wire(0, 1, 0, 4, &[])).is_none());
+        assert!(PerLegRsRepair::parse(&rs_wire(1, 0, 0, 4, &[7])).is_none());
+        // k + m past the GF(256) element budget.
+        assert!(PerLegRsRepair::parse(&rs_wire(200, 200, 0, 4, &[7; 200])).is_none());
+        // ...and a well-formed one still parses.
+        assert!(PerLegRsRepair::parse(&rs_wire(2, 1, 0, 4, &[7, 8])).is_some());
+    }
+
+    #[test]
+    fn rs_decoder_bails_on_member_larger_than_shard() {
+        // A repair claiming a 4-byte shard while a real 1316-byte member of
+        // its block is cached must bail, not pad out of range.
+        let mut dec = PerLegRsDecoder::new(8, 4);
+        dec.push_source(100, &Bytes::from(vec![0xAA; 1316]));
+        let r = PerLegRsRepair::parse(&rs_wire(2, 1, 0, 4, &[100, 101])).unwrap();
+        assert!(dec.push_repair(r).is_empty());
+    }
+
+    #[test]
+    fn rs_decoder_rejects_repair_disagreeing_with_its_block() {
+        // Two repairs keyed to the same block with different shard_len would
+        // put mismatched-length parity into one reconstruction.
+        let mut dec = PerLegRsDecoder::new(8, 4);
+        let a = PerLegRsRepair::parse(&rs_wire(2, 2, 0, 8, &[500, 501])).unwrap();
+        let b = PerLegRsRepair::parse(&rs_wire(2, 2, 1, 40, &[500, 501])).unwrap();
+        assert!(dec.push_repair(a).is_empty());
+        assert!(dec.push_repair(b).is_empty());
+    }
+
+    #[test]
+    fn rs_reconstruct_rejects_inconsistent_shard_dimensions() {
+        let mut short: Vec<Option<Vec<u8>>> = vec![None, Some(vec![0u8; 4])];
+        assert!(!rs_reconstruct(1, 1, &mut short, 8), "wrong shard length");
+        let mut small: Vec<Option<Vec<u8>>> = vec![None];
+        assert!(!rs_reconstruct(1, 1, &mut small, 8), "array shorter than k + m");
     }
 
     #[test]

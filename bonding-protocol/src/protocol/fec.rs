@@ -96,7 +96,10 @@ impl FecRepair {
         let rows = r.get_u16();
         let column = r.get_u16();
         let block_len = r.get_u16() as usize;
-        if buf.len() < Self::HDR + block_len {
+        // `build_repair` always emits `2 + max_payload` bytes, so a block
+        // shorter than the 2-byte length prefix is malformed — reject it here
+        // rather than let `attempt` read `acc[0..2]` out of range.
+        if block_len < 2 || buf.len() < Self::HDR + block_len {
             return None;
         }
         Some(Self {
@@ -444,7 +447,18 @@ impl PerLegRepair {
         let mut bl = &buf[off..off + 2];
         let block_len = bl.get_u16() as usize;
         off += 2;
-        if buf.len() < off + block_len {
+        // Structural bounds. `build_per_leg_repair` emits a block of
+        // `2 + max_member_len` (so >= 2) bytes and a group of exactly `rows`
+        // members — and `rows >= 2` both by `FecParams::is_valid` and by the
+        // edge's own config validation, which caps rows to [2, 64].
+        //
+        // `count < 2`, not `count == 0`: a zero-member repair is inert (the
+        // `missing?` short-circuit drops it), but a ONE-member repair is the
+        // actual primitive — with no other member to XOR against, it hands
+        // `try_recover` a fully attacker-chosen (bond_seq, payload) pair that
+        // the receiver then inserts into the reassembler as if it were
+        // recovered media. Rejecting `block_len < 2` alone does not close it.
+        if count < 2 || block_len < 2 || buf.len() < off + block_len {
             return None;
         }
         Some(Self {
@@ -924,6 +938,57 @@ mod tests {
         assert!(dec.push_repair(col0).is_empty(), "2 missing → stashed");
         let rec = dec.push_source(10, &payloads[0]);
         assert_eq!(rec, vec![(12u32, payloads[2].clone())], "arrival of 10 recovers 12");
+    }
+
+    /// Every field of a wire repair is attacker-chosen. A repair carrying a
+    /// block shorter than the 2-byte length prefix (or no member seqs at all)
+    /// is structurally impossible from `build_per_leg_repair` and must be
+    /// rejected at parse — with `count == 1` nothing else bounds the
+    /// `acc[0..2]` read in `try_recover`.
+    #[test]
+    fn per_leg_parse_rejects_short_block_and_empty_seq_list() {
+        let wire = |count: u16, seqs: &[u32], block_len: u16| {
+            let mut b = BytesMut::new();
+            b.put_u16(2); // columns
+            b.put_u16(2); // rows
+            b.put_u16(count);
+            for s in seqs {
+                b.put_u32(*s);
+            }
+            b.put_u16(block_len);
+            b.put_slice(&vec![0u8; block_len as usize]);
+            b
+        };
+        assert!(PerLegRepair::parse(&wire(1, &[u32::MAX], 0)).is_none(), "0-byte block");
+        assert!(PerLegRepair::parse(&wire(1, &[u32::MAX], 1)).is_none(), "1-byte block");
+        assert!(PerLegRepair::parse(&wire(0, &[], 4)).is_none(), "no member seqs");
+        // THE attack shape: a single-member repair with a well-formed block.
+        // Nothing else in the pipeline bounds it, and `try_recover` would hand
+        // the reassembler an entirely attacker-chosen (bond_seq, payload).
+        assert!(
+            PerLegRepair::parse(&wire(1, &[u32::MAX], 4)).is_none(),
+            "one-member repair is an injection primitive, not a repair"
+        );
+        assert!(PerLegRepair::parse(&wire(2, &[1, 2], 4)).is_some(), "well-formed still parses");
+    }
+
+    /// Same shape for the combined repair: `FecDecoder::attempt` reads the
+    /// length prefix out of the XOR accumulator.
+    #[test]
+    fn combined_parse_rejects_short_block() {
+        let wire = |block_len: u16| {
+            let mut b = BytesMut::new();
+            b.put_u32(0);
+            b.put_u16(2);
+            b.put_u16(2);
+            b.put_u16(0);
+            b.put_u16(block_len);
+            b.put_slice(&vec![0u8; block_len as usize]);
+            b
+        };
+        assert!(FecRepair::parse(&wire(0)).is_none());
+        assert!(FecRepair::parse(&wire(1)).is_none());
+        assert!(FecRepair::parse(&wire(2)).is_some());
     }
 
     /// reset() drops cached members + pending repairs so a stale repair
