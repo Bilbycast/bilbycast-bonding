@@ -525,8 +525,20 @@ where
                     // datagrams, but ignore gracefully if a peer mis-routes.
                     continue;
                 }
+                // `header.flow_id == flow_id` on both arms below is the
+                // mirror of the check the receiver already applies to
+                // inbound keepalives. Without it any datagram that
+                // parses is accepted for THIS flow: a forged NACK (no
+                // epoch field exists on one, so there is nothing else
+                // to check it against) drives real retransmits, debits
+                // the congestion controller's token bucket and inflates
+                // `packets_retransmitted`; a forged ack feeds
+                // `ack_delivery` and can revive a leg the sender had
+                // correctly written off. Neither is authenticated —
+                // that needs `BondSocketConfig::encryption_key` — but a
+                // flow that isn't ours is free to reject.
                 match CtrlPacket::parse(&dg.data) {
-                    Ok(CtrlPacket::KeepaliveAck { body, .. }) => {
+                    Ok(CtrlPacket::KeepaliveAck { header, body }) if header.flow_id == flow_id => {
                         if let Some(idx) = path_index_by_id(path_id) {
                             // Match by stamp — find and remove the
                             // in-flight entry with the same stamp.
@@ -648,7 +660,7 @@ where
                             }
                         }
                     }
-                    Ok(CtrlPacket::Nack { body, .. }) => {
+                    Ok(CtrlPacket::Nack { header, body }) if header.flow_id == flow_id => {
                         let now = Instant::now();
                         for lost_seq in &body.missing {
                             // Dedup: receivers re-NACK on their retry

@@ -206,6 +206,36 @@ satellite link; `CapacityAwareScheduler` fixes that with a closed loop.
   UDP path; QUIC legs are already TLS. Wrong-key / tampered datagrams are
   dropped before the protocol decoder.
 
+### The control plane is unauthenticated without `encryption_key`
+
+Set it on any leg reachable from the public internet, and surface that in
+the manager for internet-exposed bonded links. With `encryption_key`
+unset, a plain-UDP leg's control channel (`0xBE`: keepalive,
+keepalive-ack, NACK) accepts anything that parses. Everything the code
+does to defend it is a **cost multiplier against an off-path forger, not
+a proof**; only the AEAD is closure, because `BondCrypto` drops forged
+control datagrams before the decoder ever sees them. What is in place,
+and what it is actually worth:
+
+| Guard | Where | Bound it buys |
+|---|---|---|
+| `header.flow_id` must match | receiver (keepalive), sender (`KeepaliveAck` + `Nack`) | Rejects another flow's control traffic. A forger who knows the flow_id — it is on the wire in clear on every data packet — is unaffected. |
+| Session-epoch corroboration: 2 sightings, ≥ `keepalive_interval` apart | `receiver::EpochTracker` | Kills the two-packet burst. Defeated on its own by a spray: ordinary jitter, or one tick lost on every leg, opens the gap. |
+| **Incumbent-silence gate**: the adopted session unheard for 3 keepalive ticks | `receiver::EpochTracker::incumbent_silence` | While the sender is talking, an attacker must silence it across **every leg** for 3 consecutive ticks — at which point he is on-path. Clamped by `keepalive_miss_threshold` so a genuine restart still lands inside the sender's own liveness budget (~600 ms at the shipped 200 ms / 5 defaults). **Not always armed**: the incumbent goes quiet by itself at every sender restart and stale-flood re-anchor, and a sprayer wins the corroboration race in that window. |
+| **Data-plane establishment**: only a keepalive whose advertised tip is inside the *anchored* seq window marks a session established | `receiver::EpochTracker::established` | The rule that bounds the line above. Adoption is won on packet rate, so adoption confers no protection of its own — the winner of a race cannot turn the incumbent-silence gate back on the real sender. The genuine sender's media anchors the buffer, so it retakes the flow on its next corroboration round (~2 rounds measured). Reduces a spray from an unbounded outage to a sub-second interruption per re-anchor. |
+| Retired-epoch quarantine, and its expiry | `ABANDONED_EPOCH_QUARANTINE` | Stops a bufferbloated leg's queued old-instance keepalives flipping the session backward, without making a mis-adoption permanent. The genuine sender re-establishes ~5 s after any mis-adoption, forged or accidental. |
+| Peer learning gated on a parsed keepalive for our flow bearing our epoch | `receiver_loop` | A bare `0xBE` byte can no longer repoint NACK carriage and blackhole ARQ. |
+
+Two things deliberately do **not** authenticate anything and should not
+be read as if they did: `tip_in_window` (a challenger advertising a tip
+inside the live seq window is evidence it owns the data plane, but it is
+a 32-bit guess, not a signature), and adoption itself. Neither the first
+control packet after start-up nor a corroborated challenger has proved
+anything — both are adopted **provisionally**, and the real sender takes
+the flow straight back. For a corroboration round or two after any
+start-up, restart or stale-flood re-anchor, the epoch is simply whoever
+sends most often.
+
 End-to-end proof: `tests/bond_adaptive.rs` shapes one UDP path to 2 Mbps
 and another to 16 Mbps over loopback and asserts the adaptive scheduler
 shifts the **majority** of traffic to the high-capacity link (both stay

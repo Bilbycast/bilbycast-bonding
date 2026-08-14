@@ -227,6 +227,430 @@ const EQ_DISENGAGE_DEBOUNCE: u32 = 3;
 /// skew) drops its loss_deadline back to the adaptive jitter-hold.
 const COLD_START_GRACE: Duration = Duration::from_secs(3);
 
+/// Floor/ceiling on the wall-clock separation the two control packets
+/// corroborating a NEW `session_epoch` must span before the receiver
+/// adopts it (the working value is the bond's own `keepalive_interval`
+/// clamped into this range).
+///
+/// **Spacing is a cost multiplier, not a boundary.** Corroboration was
+/// once "two *consecutive* control packets carrying the same new
+/// epoch", with no timing constraint at all: two forged keepalives
+/// emitted back-to-back (microseconds apart, ~82 bytes total) were
+/// always "consecutive", so one burst hijacked the session — retiring
+/// the genuine sender's epoch, killing its keepalive-acks, so the
+/// sender declared every leg dead and stopped scheduling. Requiring the
+/// pair to straddle a keepalive interval raises the attack from two
+/// packets to *sustaining* a spray across an interval, which costs an
+/// attacker ~200 ms of ~1 kpps and nothing else — the merged genuine
+/// keepalive stream only has to hiccup once (ordinary jitter, or one
+/// tick lost on every leg) for a sprayed candidate to survive the
+/// window. The rule that actually bites is the incumbent-silence gate
+/// on [`EpochTracker::incumbent_silence`]; this one just makes a
+/// two-packet forgery useless.
+///
+/// **Cost to the legitimate case: none in packets, ≤1 keepalive
+/// interval in latency.** A restarted sender emits its new epoch on
+/// every path every interval, so the corroborating pair arrives
+/// naturally spaced.
+const EPOCH_CORROBORATION_GAP_MIN: Duration = Duration::from_millis(100);
+const EPOCH_CORROBORATION_GAP_MAX: Duration = Duration::from_secs(2);
+
+/// Keepalive ticks of incumbent silence a challenger epoch must observe
+/// before it may be adopted — see [`EpochTracker::incumbent_silence`],
+/// which also clamps this against `keepalive_miss_threshold` so
+/// adoption always lands *inside* the sender's own liveness budget.
+const EPOCH_INCUMBENT_SILENCE_TICKS: u32 = 3;
+
+/// How long a retired epoch stays quarantined after a session reset.
+///
+/// The quarantine stops a congested leg draining queued old-instance
+/// keepalives seconds after the reset from flipping the session
+/// backward — real on the multi-second buffer depths this product
+/// targets (cellular / Starlink). It used to be **permanent**, which
+/// made any mis-adoption, forged or accidental, unrecoverable: the
+/// genuine sender's epoch could never become a candidate again, its
+/// keepalives hit a no-op and were dropped before the ack, and the bond
+/// stayed dead until an operator restarted something.
+///
+/// **Bounding it was, on its own, worth nothing.** Candidate accounting
+/// used to be wiped by every keepalive bearing the adopted epoch, so an
+/// attacker holding the session merely had to keep talking (he sprays;
+/// the real sender corroborates at 5 Hz) and the genuine candidate was
+/// cleared before it could ever reach two spaced sightings — a "5 s"
+/// bound that in practice never expired. Two changes make the bound
+/// real, and [`EpochTracker`] is unit-tested for both directions:
+///
+/// * the incumbent no longer clears candidates at all — the
+///   incumbent-silence gate took over that job, and does it without
+///   handing the incumbent a veto; and
+/// * once the quarantine has lapsed, the retired epoch may displace a
+///   *still-talking* incumbent, but only while advertising a tip inside
+///   the live seq window ([`TipEvidence::OwnsDataPlane`]) — i.e. only
+///   while it demonstrably owns the data plane this receiver is
+///   reassembling. A genuine sender whose media is still arriving
+///   satisfies that for free; an off-path forger would have to guess a
+///   32-bit tip within ±capacity of a value moving at the media rate.
+///   Its candidate slot is protected from eviction too, so an attacker
+///   spraying fresh epochs cannot squeeze it out of the table.
+///
+/// **Residual risk.** None of this authenticates anything. With
+/// `BondSocketConfig::encryption_key` unset the bond control plane is
+/// unauthenticated by construction, and every rule here is a cost
+/// multiplier against an off-path forger, not a proof. The only real
+/// closure is the AEAD: with a key set, `BondCrypto` drops forged
+/// control datagrams before the decoder ever sees them. Set it on any
+/// leg exposed to the public internet.
+const ABANDONED_EPOCH_QUARANTINE: Duration = Duration::from_secs(5);
+
+/// Competing epoch candidates tracked at once. Two is enough to keep a
+/// genuine sender's candidate alive alongside the epoch this session
+/// retired, while staying a fixed-size array on the receiver's stack —
+/// no map, no allocation, nothing an attacker can grow.
+const EPOCH_CANDIDATE_SLOTS: usize = 2;
+
+/// What the reassembly buffer says about a keepalive's advertised
+/// `highest_bond_seq_sent` — the only evidence a receiver has that the
+/// peer sending a control packet is also the peer whose media it is
+/// currently reassembling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TipEvidence {
+    /// Buffer un-anchored: no data has landed, so it has no opinion.
+    /// Permissive enough for the very first adoption, but never counts
+    /// as positive evidence — at start-up it is true for *everyone*.
+    NoOpinion,
+    /// The advertised tip lands inside the anchored seq window: this
+    /// peer's own data is what the buffer is carrying right now.
+    OwnsDataPlane,
+    /// Anchored, and the advertised tip is from a foreign seq space —
+    /// a restarted sender (re-anchored near 0) or a forgery.
+    Foreign,
+}
+
+impl TipEvidence {
+    fn classify(anchored: bool, tip_in_window: bool) -> Self {
+        match (anchored, tip_in_window) {
+            (false, _) => Self::NoOpinion,
+            (true, true) => Self::OwnsDataPlane,
+            (true, false) => Self::Foreign,
+        }
+    }
+
+    /// May the FIRST epoch be adopted with no corroboration at all?
+    /// Only over a buffer that is un-anchored or anchored on this same
+    /// peer's seq space; an anchored-foreign tip must corroborate.
+    #[inline]
+    fn permits_first_adoption(self) -> bool {
+        !matches!(self, Self::Foreign)
+    }
+
+    #[inline]
+    fn owns_data_plane(self) -> bool {
+        matches!(self, Self::OwnsDataPlane)
+    }
+}
+
+/// What a control packet's `session_epoch` means for the session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EpochAction {
+    /// Nothing to do: the epoch matches the adopted session, is 0 (an
+    /// epoch-less peer), is a still-quarantined retired epoch, or is a
+    /// candidate that hasn't corroborated yet.
+    None,
+    /// First epoch adopted over an anchor that demonstrably belongs to
+    /// this sender — no session reset (the mid-stream-join case). The
+    /// resulting session is *provisional*: see `EpochTracker::established`.
+    AdoptedSilently,
+    /// A new sender instance is confirmed — reset the session.
+    Reset { old_epoch: u32 },
+}
+
+/// One competing `session_epoch` and its corroboration history.
+#[derive(Debug, Clone, Copy)]
+struct EpochCandidate {
+    epoch: u32,
+    /// Control packets seen bearing it since it entered the table.
+    count: u32,
+    /// First and most recent sighting — `first_at` drives the spacing
+    /// rule, `last_at` picks the eviction victim when both slots are
+    /// occupied by other epochs.
+    first_at: Instant,
+    last_at: Instant,
+}
+
+/// Session-epoch adoption state machine (sender-restart detection).
+///
+/// Split out of `receiver_loop` so the adopt/reject decision is unit
+/// testable in both directions, which is the whole difficulty: a forged
+/// burst — or a sustained forged *spray* — must be rejected, and a
+/// genuine sender restart must still be adopted promptly, because
+/// breaking the latter means a restarted encoder never recovers.
+///
+/// Adoption of an epoch that is not already `current` requires ALL of:
+///
+/// 1. two control packets bearing it (`count >= 2`),
+/// 2. separated by at least `min_gap` (see
+///    [`EPOCH_CORROBORATION_GAP_MIN`]), and
+/// 3. the incumbent session silent for `incumbent_silence` — unless the
+///    incumbent is still *provisional* (`!established`, nothing has
+///    confirmed it against the data plane) or the challenger is this
+///    session's own retired epoch presenting
+///    [`TipEvidence::OwnsDataPlane`] (the post-quarantine recovery path,
+///    see [`ABANDONED_EPOCH_QUARANTINE`]).
+///
+/// Rules 1–2 are a rate test and a spray beats them outright: ordinary
+/// link jitter, or one tick lost on every leg, opens the gap — see
+/// [`EPOCH_CORROBORATION_GAP_MIN`]. Rule 3 is what an attacker cannot
+/// buy with traffic *while the sender is talking*: he must silence it
+/// across every leg for three consecutive keepalive ticks, and at that
+/// point he is on-path.
+///
+/// **Rule 3 is not always armed, and that is the honest bound.** The
+/// incumbent goes quiet by itself at every sender restart and every
+/// stale-flood re-anchor, and in that window rules 1–2 are all that is
+/// left — so a sprayer wins the race and takes the flow. What stops
+/// that being an outage is `established`: adoption confers no
+/// protection of its own, so the winner cannot then point rule 3 back
+/// at the real sender. The real sender's media anchors the reassembly
+/// buffer, its next keepalive therefore carries
+/// [`TipEvidence::OwnsDataPlane`], and it takes the flow back on its
+/// next corroboration round. The residual is a sub-second interruption
+/// per re-anchor, not a session an off-path forger can hold.
+///
+/// None of this authenticates anything — see
+/// [`ABANDONED_EPOCH_QUARANTINE`] for why only
+/// `BondSocketConfig::encryption_key` is closure.
+#[derive(Debug)]
+struct EpochTracker {
+    /// Adopted epoch. 0 = none seen yet (fresh receiver, or a v1/v2
+    /// peer that doesn't send epochs).
+    current: u32,
+    /// Whether `current` has been confirmed against the data plane — a
+    /// keepalive bearing it whose advertised tip landed inside the
+    /// anchored seq window, i.e. this really is the peer whose media the
+    /// receiver is reassembling. **Nothing else sets it**, and that is
+    /// the point: adoption is won on packet rate, so any rule that let
+    /// an adoption establish itself would hand the winner of a race the
+    /// incumbent-silence gate to point back at the real sender.
+    ///
+    /// Both adoption routes therefore start **provisional** (`false`)
+    /// unless the adopting keepalive already owned the data plane:
+    ///
+    /// * the silent first-epoch adoption, because at start-up the buffer
+    ///   is un-anchored and the first control packet to arrive wins by
+    ///   arriving, attacker or not; and
+    /// * corroborated adoption, because the incumbent-silence gate opens
+    ///   by itself at every sender restart and every stale-flood
+    ///   re-anchor, and in that window "two sightings a `min_gap` apart"
+    ///   is a rate test a 1 kpps spray always beats.
+    ///
+    /// Provisional sessions get no incumbent-silence protection, so a
+    /// forged session is displaced by the real sender's very next
+    /// corroboration round — its media anchors the buffer, so its
+    /// keepalives carry [`TipEvidence::OwnsDataPlane`] and an off-path
+    /// forger's cannot. A genuine restart is provisional for at most one
+    /// keepalive interval (the reset un-anchors, its own media
+    /// re-anchors), far inside the retired epoch's quarantine.
+    established: bool,
+    /// Competing candidates. Deliberately NOT cleared by keepalives
+    /// bearing `current`: an incumbent able to wipe a challenger's
+    /// corroboration is an incumbent that can never be displaced while
+    /// it keeps talking, which is exactly what made a mis-adoption
+    /// permanent. The incumbent-silence gate covers what the clearing
+    /// used to.
+    candidates: [Option<EpochCandidate>; EPOCH_CANDIDATE_SLOTS],
+    /// Epoch retired by the most recent session reset, and when.
+    abandoned: u32,
+    abandoned_at: Option<Instant>,
+    /// First nonzero epoch ever seen on this flow. Uncorroborated
+    /// first-epoch adoption is confined to it, so once two different
+    /// epochs are in play neither can take the session for free.
+    first_epoch: Option<u32>,
+    /// Most recent sighting of the adopted session (or of an epoch-less
+    /// peer while the session is itself epoch-less) — the incumbent's
+    /// liveness clock.
+    last_current_seen: Option<Instant>,
+    /// Minimum spacing between the first and the corroborating packet.
+    min_gap: Duration,
+    /// How long the incumbent must have been unheard before a
+    /// challenger may take the session. `3 × keepalive_interval`,
+    /// clamped down by `keepalive_miss_threshold × keepalive_interval`
+    /// so it can never exceed the sender's own liveness budget: a
+    /// genuine restart emits no current-epoch keepalives at all, so
+    /// this expires ~600 ms after the restart at the shipped 200 ms /
+    /// 5 defaults — well inside the 1000 ms liveness window and far
+    /// inside the 3 s stale-flood backstop.
+    incumbent_silence: Duration,
+}
+
+impl EpochTracker {
+    fn new(keepalive_interval: Duration, keepalive_miss_threshold: u32) -> Self {
+        Self {
+            current: 0,
+            established: false,
+            candidates: [None; EPOCH_CANDIDATE_SLOTS],
+            abandoned: 0,
+            abandoned_at: None,
+            first_epoch: None,
+            last_current_seen: None,
+            min_gap: keepalive_interval
+                .clamp(EPOCH_CORROBORATION_GAP_MIN, EPOCH_CORROBORATION_GAP_MAX),
+            incumbent_silence: keepalive_interval
+                .saturating_mul(EPOCH_INCUMBENT_SILENCE_TICKS)
+                .min(keepalive_interval.saturating_mul(keepalive_miss_threshold.max(1))),
+        }
+    }
+
+    #[inline]
+    fn current(&self) -> u32 {
+        self.current
+    }
+
+    /// Feed the `session_epoch` of an inbound keepalive for this flow.
+    ///
+    /// `tip` is [`TipEvidence::classify`] of the reassembly buffer's
+    /// anchor state and `tip_in_window(body.highest_bond_seq_sent)` —
+    /// evaluated by the caller so this stays free of the buffer.
+    fn observe(&mut self, epoch: u32, tip: TipEvidence, now: Instant) -> EpochAction {
+        if epoch == 0 {
+            // Epoch-less peer (v1/v2). Nothing to adopt, and it
+            // deliberately does NOT touch a candidate — an epoch-less
+            // stray must not be able to cancel a genuine restart's
+            // corroboration. It counts as incumbent liveness only while
+            // the session is itself epoch-less, for the same reason: a
+            // stray 0 must not be able to extend a departed sender's
+            // apparent silence and stall a genuine restart.
+            if self.current == 0 {
+                self.last_current_seen = Some(now);
+            }
+            return EpochAction::None;
+        }
+        let first = *self.first_epoch.get_or_insert(epoch);
+        if epoch == self.current {
+            self.last_current_seen = Some(now);
+            if tip.owns_data_plane() {
+                // The incumbent's advertised tip lands inside the seq
+                // space we are actually reassembling: this is the peer
+                // whose media we are carrying, not merely the peer that
+                // spoke first. Promote out of provisional.
+                self.established = true;
+            }
+            return EpochAction::None;
+        }
+        if self.current == 0 && first == epoch && tip.permits_first_adoption() {
+            // The FIRST nonzero epoch is adopted without a reset only
+            // when the anchor demonstrably belongs to this sender
+            // (un-anchored, or its advertised tip lands inside the
+            // anchored seq window — the mid-stream-join case), and only
+            // while no competing epoch has been seen. An anchored
+            // buffer whose anchor is from a foreign seq space must go
+            // the full corroboration route below, or every new-instance
+            // packet drops as stale until manual restart.
+            self.current = epoch;
+            self.established = tip.owns_data_plane();
+            self.last_current_seen = Some(now);
+            self.candidates = [None; EPOCH_CANDIDATE_SLOTS];
+            return EpochAction::AdoptedSilently;
+        }
+        if epoch == self.abandoned
+            && self
+                .abandoned_at
+                .is_some_and(|t| now.saturating_duration_since(t) < ABANDONED_EPOCH_QUARANTINE)
+        {
+            // Queued traffic from the instance a reset just retired.
+            // Bounded, not permanent — see ABANDONED_EPOCH_QUARANTINE.
+            return EpochAction::None;
+        }
+        let (count, first_at) = self.record_candidate(epoch, now);
+        let spaced = now.saturating_duration_since(first_at) >= self.min_gap;
+        if count < 2 || !spaced {
+            return EpochAction::None;
+        }
+        // Incumbent-silence gate. Two exemptions, both of which require
+        // the challenger to be something an off-path forger is not:
+        // the incumbent never proved itself against the data plane, or
+        // the challenger is the epoch THIS receiver retired and is
+        // advertising a tip inside the live seq window.
+        let incumbent_quiet = self
+            .last_current_seen
+            .is_none_or(|t| now.saturating_duration_since(t) >= self.incumbent_silence);
+        let recovering_retired_sender = epoch == self.abandoned && tip.owns_data_plane();
+        if !incumbent_quiet && self.established && !recovering_retired_sender {
+            return EpochAction::None;
+        }
+        let old_epoch = self.current;
+        self.current = epoch;
+        // Corroboration is a rate test, and a spray passes it: whoever
+        // sends most often wins the race the moment the gate opens, and
+        // the gate opens on its own at every restart and every forced
+        // re-anchor — no attacker effort required. So corroboration
+        // alone must NOT confer establishment, or the winner of that
+        // race gets the incumbent-silence gate pointed at the real
+        // sender and holds the flow until the next watchdog re-anchor,
+        // which merely re-runs the same race. Establishment comes only
+        // from the data plane: the peer whose media this receiver is
+        // actually reassembling. A restarted sender is provisional for
+        // at most one keepalive interval — the reset un-anchors the
+        // buffer, its own media re-anchors it, and its next keepalive
+        // lands `OwnsDataPlane` — which is far inside the retired
+        // epoch's quarantine, so the bufferbloat flip-back the
+        // quarantine exists to stop is still blocked by then.
+        self.established = tip.owns_data_plane();
+        self.last_current_seen = Some(now);
+        self.abandoned = old_epoch;
+        self.abandoned_at = Some(now);
+        self.candidates = [None; EPOCH_CANDIDATE_SLOTS];
+        EpochAction::Reset { old_epoch }
+    }
+
+    /// Credit a sighting of `epoch` to the candidate table, returning
+    /// its running count and first-sighting instant.
+    fn record_candidate(&mut self, epoch: u32, now: Instant) -> (u32, Instant) {
+        if let Some(c) = self.candidates.iter_mut().flatten().find(|c| c.epoch == epoch) {
+            c.count = c.count.saturating_add(1);
+            c.last_at = now;
+            return (c.count, c.first_at);
+        }
+        let fresh = EpochCandidate { epoch, count: 1, first_at: now, last_at: now };
+        if let Some(free) = self.candidates.iter_mut().find(|c| c.is_none()) {
+            *free = Some(fresh);
+            return (1, now);
+        }
+        // Both slots hold other epochs: evict the stalest — but never
+        // the slot holding the epoch this session retired. That entry
+        // is the retired sender's route back in (see
+        // ABANDONED_EPOCH_QUARANTINE) and an attacker spraying fresh
+        // epochs must not be able to squeeze it out of the table.
+        let mut victim: Option<(usize, Instant)> = None;
+        for (i, slot) in self.candidates.iter().enumerate() {
+            if let Some(c) = slot
+                && c.epoch != self.abandoned
+                && victim.is_none_or(|(_, t)| c.last_at < t)
+            {
+                victim = Some((i, c.last_at));
+            }
+        }
+        if let Some((i, _)) = victim {
+            self.candidates[i] = Some(fresh);
+        }
+        (1, now)
+    }
+
+    /// Re-arm first-epoch adoption after the stale-flood watchdog forced
+    /// a re-anchor: the next sender instance may be epoch-less (v2) or
+    /// epoched (v3) and both must re-anchor cleanly from here.
+    fn force_reanchor(&mut self) -> u32 {
+        let old = self.current;
+        self.current = 0;
+        self.established = false;
+        self.candidates = [None; EPOCH_CANDIDATE_SLOTS];
+        self.abandoned = 0;
+        self.abandoned_at = None;
+        self.first_epoch = None;
+        self.last_current_seen = None;
+        old
+    }
+}
+
 /// Per-leg relative one-way-delay estimator (receiver side). Built from the
 /// v2 header `send_stamp_us`: `raw = arrival_us − send_stamp_us` carries the
 /// true OWD plus a constant (sender-epoch − receiver-epoch) offset that
@@ -458,21 +882,14 @@ async fn receiver_loop(
         );
     }
 
-    // Session epoch adoption (sender-restart detection). 0 = none seen
-    // yet (fresh receiver, or a v1/v2 peer that doesn't send epochs).
-    let mut current_epoch: u32 = 0;
-    // Candidate epoch + consecutive-control-packet count. Two
-    // consecutive control packets bearing the same NEW epoch are
-    // required before a session reset, so one stray late datagram
-    // from an old process can't nuke a healthy bond.
-    let mut pending_epoch: u32 = 0;
-    let mut pending_epoch_count: u32 = 0;
-    // Epoch retired by the most recent session reset. A congested leg
-    // can drain queued old-instance keepalives in a burst seconds after
-    // the reset; epochs are random per instance, so the retired value
-    // can only be stale traffic — never a candidate again (two of them
-    // must not flip the session backward).
-    let mut abandoned_epoch: u32 = 0;
+    // Session epoch adoption (sender-restart detection): two control
+    // packets bearing the same NEW epoch, separated by at least one
+    // keepalive interval AND landing after the incumbent session has
+    // gone unheard for three keepalive ticks, are required before a
+    // session reset — so neither one stray late datagram from an old
+    // process, nor a forged back-to-back burst, nor a sustained forged
+    // spray can nuke a healthy bond. See `EpochTracker`.
+    let mut epochs = EpochTracker::new(keepalive_interval, keepalive_miss_threshold);
     // Stale-flood watchdog: an anchored buffer rejecting EVERY insert
     // for a sustained window means the anchor is from a dead seq space
     // and no epoch-based reset is coming (e.g. the sender rolled back
@@ -561,14 +978,17 @@ async fn receiver_loop(
                     last_rx[idx] = Some(rx_now);
                 }
                 if is_control(&dg.data) {
-                    // Remember peer before handling control so the
-                    // echo goes back to the right address even if the
-                    // inbound is the very first packet on this path.
-                    if let Some(idx) = path_idx {
-                        if let Some(path) = paths.get(idx) {
-                            path.set_primary_peer(dg.from);
-                        }
-                    }
+                    // NB: the peer is deliberately NOT learned here.
+                    // `is_control` is a one-byte magic test, so learning
+                    // the peer at this point let ANY datagram whose
+                    // first byte is 0xBE — no flow_id, no epoch, no
+                    // parse — repoint this path's NACK carriage at the
+                    // sender of that byte, silently killing ARQ. The
+                    // peer is learned below, once the datagram has
+                    // parsed as a keepalive for OUR flow bearing OUR
+                    // session epoch. The keepalive echo doesn't need it
+                    // either — the ack is sent to `dg.from` directly.
+                    //
                     // Inline keepalive handling: we need access to the
                     // reassembly buffer (for tail-tip advance) and
                     // pending_nacks, both owned by this loop.
@@ -580,98 +1000,63 @@ async fn receiver_loop(
                             // Session-epoch handling. A restarted sender
                             // re-anchors bond_seq near 0; an anchored
                             // reassembly buffer would reject its every
-                            // packet as stale forever. The FIRST nonzero
-                            // epoch is adopted without a reset only when
-                            // the anchor demonstrably belongs to this
-                            // sender (un-anchored, or its advertised tip
-                            // lands inside the anchored seq window — the
-                            // mid-stream-join case). An anchored buffer
-                            // whose anchor is from a foreign seq space
-                            // (e.g. an epoch-less v2 sender fed this
-                            // receiver, then restarted as v3 with seqs
-                            // near 0) must treat the first epoch like
-                            // any other new epoch — 2 consecutive
-                            // control packets → full reset — or every
-                            // new-instance packet drops as stale until
-                            // manual restart.
+                            // packet as stale forever. Adoption rules
+                            // (spacing, incumbent silence, and what the
+                            // advertised tip proves) live on
+                            // `EpochTracker`.
                             let epoch = body.session_epoch;
-                            if epoch != 0 {
-                                if epoch == current_epoch {
-                                    // A control packet carrying the
-                                    // adopted epoch clears any candidate
-                                    // — one stray datagram bearing a
-                                    // foreign epoch must never creep
-                                    // toward a reset.
-                                    pending_epoch = 0;
-                                    pending_epoch_count = 0;
-                                } else if current_epoch == 0
-                                    && reassembly.tip_in_window(body.highest_bond_seq_sent)
-                                {
-                                    current_epoch = epoch;
-                                } else if epoch == abandoned_epoch {
-                                    // Queued traffic from the instance a
-                                    // reset already retired — never a
-                                    // candidate (quarantined below).
-                                } else {
-                                    if epoch == pending_epoch {
-                                        pending_epoch_count += 1;
-                                    } else {
-                                        pending_epoch = epoch;
-                                        pending_epoch_count = 1;
-                                    }
-                                    if pending_epoch_count >= 2 {
-                                        let old_epoch = current_epoch;
-                                        current_epoch = epoch;
-                                        abandoned_epoch = old_epoch;
-                                        pending_epoch = 0;
-                                        pending_epoch_count = 0;
-                                        // Drop everything keyed on the old
-                                        // seq space; the next data packet
-                                        // re-anchors fresh.
-                                        reassembly.reset();
-                                        reset_equalization_state(
-                                            &mut leg_owd,
-                                            rx_epoch,
-                                            &mut eq_active,
-                                            &mut eq_engaged,
-                                            &mut eq_active_since,
-                                            &mut peer_align_suppress,
-                                            &mut eq_above_count,
-                                            &mut eq_below_count,
-                                        );
-                                        pending_nacks.clear();
-                                        retx_rtt = None;
-                                        stale_run_start = None;
-                                        stale_run_count = 0;
-                                        if let Some(dec) = fec_decoder.as_mut() {
-                                            dec.reset();
-                                        }
-                                        for d in per_leg_decoders.iter_mut().flatten() {
-                                            match d {
-                                                LegDec::Xor(dec) => dec.reset(),
-                                                LegDec::Rs(dec) => dec.reset(),
-                                            }
-                                        }
-                                        conn_stats
-                                            .session_resets
-                                            .fetch_add(1, Ordering::Relaxed);
-                                        let path_name = path_idx
-                                            .and_then(|i| path_names.get(i).cloned())
-                                            .unwrap_or_default();
-                                        let _ = events_tx.send(PathEvent {
-                                            path_id,
-                                            path_name,
-                                            kind: PathEventKind::SessionReset {
-                                                old_epoch,
-                                                new_epoch: epoch,
-                                            },
-                                        });
-                                        log::info!(
-                                            "bond receiver: sender restart detected, \
-                                             session reset (epoch {old_epoch} -> {epoch})"
-                                        );
+                            let tip = TipEvidence::classify(
+                                reassembly.is_anchored(),
+                                reassembly.tip_in_window(body.highest_bond_seq_sent),
+                            );
+                            if let EpochAction::Reset { old_epoch } =
+                                epochs.observe(epoch, tip, rx_now)
+                            {
+                                // Drop everything keyed on the old seq
+                                // space; the next data packet re-anchors
+                                // fresh.
+                                reassembly.reset();
+                                reset_equalization_state(
+                                    &mut leg_owd,
+                                    rx_epoch,
+                                    &mut eq_active,
+                                    &mut eq_engaged,
+                                    &mut eq_active_since,
+                                    &mut peer_align_suppress,
+                                    &mut eq_above_count,
+                                    &mut eq_below_count,
+                                );
+                                pending_nacks.clear();
+                                retx_rtt = None;
+                                stale_run_start = None;
+                                stale_run_count = 0;
+                                if let Some(dec) = fec_decoder.as_mut() {
+                                    dec.reset();
+                                }
+                                for d in per_leg_decoders.iter_mut().flatten() {
+                                    match d {
+                                        LegDec::Xor(dec) => dec.reset(),
+                                        LegDec::Rs(dec) => dec.reset(),
                                     }
                                 }
+                                conn_stats
+                                    .session_resets
+                                    .fetch_add(1, Ordering::Relaxed);
+                                let path_name = path_idx
+                                    .and_then(|i| path_names.get(i).cloned())
+                                    .unwrap_or_default();
+                                let _ = events_tx.send(PathEvent {
+                                    path_id,
+                                    path_name,
+                                    kind: PathEventKind::SessionReset {
+                                        old_epoch,
+                                        new_epoch: epoch,
+                                    },
+                                });
+                                log::info!(
+                                    "bond receiver: sender restart detected, \
+                                     session reset (epoch {old_epoch} -> {epoch})"
+                                );
                             }
                             // Quarantine: a keepalive whose epoch field
                             // differs from the adopted value (0 = an
@@ -687,10 +1072,20 @@ async fn receiver_loop(
                             // produced) — process only the epoch
                             // candidate logic above and drop the body.
                             // Adoption in this same iteration updates
-                            // `current_epoch` first, so a just-adopted
-                            // keepalive processes normally.
-                            if epoch != current_epoch {
+                            // the tracker's `current` first, so a
+                            // just-adopted keepalive processes normally.
+                            if epoch != epochs.current() {
                                 continue;
+                            }
+                            // Peer learning, gated on everything above:
+                            // this datagram parsed as a keepalive, for
+                            // our flow_id, bearing our session epoch.
+                            // NACK carriage follows `primary_peer`, so
+                            // an ungated update here is a one-datagram
+                            // ARQ blackhole (see the note at the top of
+                            // the control branch).
+                            if let Some(path) = path_idx.and_then(|i| paths.get(i)) {
+                                path.set_primary_peer(dg.from);
                             }
                             let received_on_path = *path_recv_counter.get(&path_id).unwrap_or(&0);
                             let bytes_received_on_path =
@@ -715,7 +1110,7 @@ async fn receiver_loop(
                                 packets_received_on_path: received_on_path,
                                 bytes_received_on_path,
                                 jitter_us,
-                                session_epoch: current_epoch,
+                                session_epoch: epochs.current(),
                                 relative_owd_us,
                                 recv_protocol_version: advertised_version,
                             };
@@ -960,14 +1355,10 @@ async fn receiver_loop(
                     if stale_run_count >= STALE_FLOOD_MIN_PACKETS
                         && rx_now.saturating_duration_since(started) >= STALE_FLOOD_WINDOW
                     {
-                        let old_epoch = current_epoch;
                         // Re-arm first-epoch adoption: the next sender
                         // instance may be epoch-less (v2) or epoched
                         // (v3); both re-anchor cleanly from here.
-                        current_epoch = 0;
-                        abandoned_epoch = 0;
-                        pending_epoch = 0;
-                        pending_epoch_count = 0;
+                        let old_epoch = epochs.force_reanchor();
                         reassembly.reset();
                         reset_equalization_state(
                             &mut leg_owd,
@@ -1559,6 +1950,554 @@ mod tests {
         // nack_delay above the cap: no inverted-clamp panic, floor wins.
         let big = Duration::from_millis(400);
         assert_eq!(nack_retry_interval(Some(Duration::from_secs(1)), big), big);
+    }
+
+    // ── Session-epoch adoption (EpochTracker) ────────────────────────
+    //
+    // Both directions matter and are asserted here: a forged burst —
+    // and a sustained forged SPRAY, which the spacing rule alone does
+    // not stop — must be rejected, and a GENUINE sender restart must
+    // still be adopted, because breaking the latter means a restarted
+    // encoder never recovers.
+
+    const KA: Duration = Duration::from_millis(200);
+    /// The shipped default `keepalive_miss_threshold`.
+    const MISS: u32 = 5;
+    /// The incumbent-silence window at those defaults: 3 × KA, i.e.
+    /// 600 ms, inside the sender's own 1000 ms liveness budget.
+    const SILENCE: Duration = Duration::from_millis(600);
+
+    fn tracker() -> EpochTracker {
+        EpochTracker::new(KA, MISS)
+    }
+
+    /// Bring a tracker to a settled, ESTABLISHED session on epoch `e`,
+    /// as a live bond is once the sender's media has anchored the
+    /// buffer: the first keepalive adopts silently over an un-anchored
+    /// buffer, and the next one carries a tip inside the now-anchored
+    /// seq window, which promotes the session out of provisional.
+    fn settled(e: u32, t0: Instant) -> EpochTracker {
+        let mut tr = tracker();
+        assert_eq!(
+            tr.observe(e, TipEvidence::NoOpinion, t0),
+            EpochAction::AdoptedSilently
+        );
+        assert_eq!(
+            tr.observe(e, TipEvidence::OwnsDataPlane, t0),
+            EpochAction::None
+        );
+        assert!(tr.established, "a data-plane-confirmed session is established");
+        assert_eq!(tr.current(), e);
+        tr
+    }
+
+    #[test]
+    fn forged_epoch_burst_microseconds_apart_is_rejected() {
+        let t0 = Instant::now();
+        let mut tr = settled(0xAAAA_AAAA, t0);
+        // Two forged keepalives ~1 µs apart — the original attack: two
+        // packets, ~82 bytes, beating the sender's 200 ms cadence.
+        let t1 = t0 + Duration::from_secs(1);
+        assert_eq!(tr.observe(0xDEAD_BEEF, TipEvidence::Foreign, t1), EpochAction::None);
+        assert_eq!(
+            tr.observe(0xDEAD_BEEF, TipEvidence::Foreign, t1 + Duration::from_micros(1)),
+            EpochAction::None
+        );
+        // Even a long burst inside one keepalive interval loses.
+        for i in 0..1000u32 {
+            assert_eq!(
+                tr.observe(
+                    0xDEAD_BEEF,
+                    TipEvidence::Foreign,
+                    t1 + Duration::from_micros(i as u64 * 100)
+                ),
+                EpochAction::None,
+                "burst packet {i} adopted a forged epoch"
+            );
+        }
+        assert_eq!(tr.current(), 0xAAAA_AAAA, "session was hijacked");
+    }
+
+    #[test]
+    fn genuine_restart_is_still_adopted() {
+        let t0 = Instant::now();
+        let mut tr = settled(0x1111_1111, t0);
+        // The old instance is gone, so nothing refreshes the incumbent's
+        // liveness clock; the restarted sender emits its new epoch on
+        // every path, every keepalive interval. First tick: candidate.
+        let t1 = t0 + Duration::from_secs(30);
+        assert_eq!(tr.observe(0x2222_2222, TipEvidence::Foreign, t1), EpochAction::None);
+        // Second path, same tick (µs later) — still not spaced.
+        assert_eq!(
+            tr.observe(0x2222_2222, TipEvidence::Foreign, t1 + Duration::from_micros(50)),
+            EpochAction::None
+        );
+        // Next keepalive tick: corroborated across a real interval, and
+        // the incumbent has been unheard far longer than the silence
+        // window, so the restart lands.
+        assert_eq!(
+            tr.observe(0x2222_2222, TipEvidence::Foreign, t1 + KA),
+            EpochAction::Reset { old_epoch: 0x1111_1111 }
+        );
+        assert_eq!(tr.current(), 0x2222_2222);
+    }
+
+    #[test]
+    fn a_restart_lands_within_the_senders_own_liveness_budget() {
+        // The cost the incumbent-silence gate adds to the legitimate
+        // case, pinned: a restart at t must be adopted by t + SILENCE +
+        // one interval, which is inside the 1000 ms the sender waits
+        // before declaring the legs dead at the shipped defaults.
+        let t0 = Instant::now();
+        let mut tr = settled(0x1111_1111, t0);
+        let mut adopted: Option<Duration> = None;
+        for tick in 1..=10u32 {
+            let arrival = t0 + KA * tick;
+            if tr.observe(0x2222_2222, TipEvidence::Foreign, arrival) != EpochAction::None {
+                adopted = Some(arrival - t0);
+                break;
+            }
+        }
+        let took = adopted.expect("a restarted sender was never adopted");
+        assert_eq!(took, SILENCE, "restart adoption drifted to {took:?}");
+        assert!(
+            took < KA.saturating_mul(MISS),
+            "adoption must land before the sender declares every leg dead"
+        );
+    }
+
+    #[test]
+    fn live_sender_keepalive_blocks_a_forged_candidate() {
+        let t0 = Instant::now();
+        let mut tr = settled(0x1111_1111, t0);
+        // The attacker seeds and re-seeds a candidate; the live sender's
+        // keepalives never let the incumbent-silence window open, so no
+        // amount of spacing corroborates. (The incumbent deliberately
+        // does NOT wipe the candidate — an incumbent that can erase a
+        // challenger's history is an incumbent that can never be
+        // displaced while it keeps talking.)
+        for round in 0..20u32 {
+            let base = t0 + KA * round;
+            assert_eq!(tr.observe(0xDEAD_BEEF, TipEvidence::Foreign, base), EpochAction::None);
+            assert_eq!(
+                tr.observe(0x1111_1111, TipEvidence::OwnsDataPlane, base + KA / 2),
+                EpochAction::None
+            );
+        }
+        assert_eq!(tr.current(), 0x1111_1111);
+    }
+
+    /// The reviewer's spray: 1 pkt/ms of forged keepalives against a
+    /// genuine sender whose arrivals carry ordinary ±3 ms jitter. The
+    /// spacing rule alone is defeated here — the merged arrival stream
+    /// hands the attacker a >`min_gap` window on most ticks — so this
+    /// test is entirely about the incumbent-silence gate.
+    #[test]
+    fn spray_under_keepalive_jitter_never_hijacks() {
+        const JITTER_MS: [i64; 6] = [0, 3, -3, 2, -2, 1];
+        let t0 = Instant::now();
+        let mut tr = settled(0x1111_1111, t0);
+        let mut prev = t0;
+        for tick in 1..=60u32 {
+            let j = JITTER_MS[tick as usize % JITTER_MS.len()];
+            let arrival = t0 + KA * tick + Duration::from_millis((3 + j) as u64);
+            let mut spray = prev + Duration::from_millis(1);
+            while spray < arrival {
+                assert_eq!(
+                    tr.observe(0xDEAD_BEEF, TipEvidence::Foreign, spray),
+                    EpochAction::None,
+                    "spray packet before tick {tick} hijacked the session"
+                );
+                spray += Duration::from_millis(1);
+            }
+            assert_eq!(
+                tr.observe(0x1111_1111, TipEvidence::OwnsDataPlane, arrival),
+                EpochAction::None
+            );
+            prev = arrival;
+        }
+        assert_eq!(tr.current(), 0x1111_1111, "spray beat the incumbent-silence gate");
+        assert_eq!(tr.abandoned, 0, "nothing was retired");
+    }
+
+    /// One genuine keepalive tick lost on every leg — routine on a
+    /// cellular bond — must not hand the session over. The gap it opens
+    /// is 2 × KA; the gate needs 3.
+    #[test]
+    fn one_lost_keepalive_tick_does_not_hand_over_the_session() {
+        let t0 = Instant::now();
+        let mut tr = settled(0x1111_1111, t0);
+        for tick in 1..=12u32 {
+            let arrival = t0 + KA * tick;
+            let mut spray = t0 + KA * (tick - 1) + Duration::from_millis(1);
+            while spray < arrival {
+                assert_eq!(
+                    tr.observe(0xDEAD_BEEF, TipEvidence::Foreign, spray),
+                    EpochAction::None,
+                    "spray during tick {tick} hijacked the session"
+                );
+                spray += Duration::from_millis(1);
+            }
+            // Tick 3 is lost on every leg.
+            if tick != 3 {
+                assert_eq!(
+                    tr.observe(0x1111_1111, TipEvidence::OwnsDataPlane, arrival),
+                    EpochAction::None
+                );
+            }
+        }
+        assert_eq!(tr.current(), 0x1111_1111, "one lost tick handed over the session");
+    }
+
+    /// The honest bound, asserted so it cannot drift silently: three
+    /// consecutive ticks with the real sender unheard on EVERY leg is
+    /// exactly what an attacker must produce. At that point he is
+    /// on-path and 60 % of the way to the sender declaring the bond
+    /// dead on its own.
+    #[test]
+    fn three_lost_keepalive_ticks_is_the_documented_bound() {
+        let t0 = Instant::now();
+        let mut tr = settled(0x1111_1111, t0);
+        // Two ticks of silence is not enough…
+        assert_eq!(
+            tr.observe(0xDEAD_BEEF, TipEvidence::Foreign, t0 + KA),
+            EpochAction::None
+        );
+        assert_eq!(
+            tr.observe(0xDEAD_BEEF, TipEvidence::Foreign, t0 + KA * 2),
+            EpochAction::None
+        );
+        // …the third is.
+        assert_eq!(
+            tr.observe(0xDEAD_BEEF, TipEvidence::Foreign, t0 + SILENCE),
+            EpochAction::Reset { old_epoch: 0x1111_1111 }
+        );
+    }
+
+    /// One forged keepalive at start-up wins the race — the buffer is
+    /// un-anchored, so it has no opinion and the first control packet
+    /// to arrive is adopted, attacker or not. That adoption is
+    /// PROVISIONAL: it gets no incumbent-silence protection, so the
+    /// real sender — whose media anchors the buffer and whose keepalives
+    /// therefore carry a live tip — takes the session straight back.
+    #[test]
+    fn forged_first_keepalive_is_provisional_and_loses_to_the_real_sender() {
+        const FORGED: u32 = 0xDEAD_BEEF;
+        const GENUINE: u32 = 0x0BAD_F00D;
+        let t0 = Instant::now();
+        let mut tr = tracker();
+        assert_eq!(
+            tr.observe(FORGED, TipEvidence::NoOpinion, t0),
+            EpochAction::AdoptedSilently
+        );
+        assert!(!tr.established, "a start-up adoption must not be established");
+
+        let mut resets = 0u32;
+        let mut adopted_at: Option<u32> = None;
+        for tick in 1..=300u32 {
+            let arrival = t0 + KA * tick;
+            if let EpochAction::Reset { old_epoch } =
+                tr.observe(GENUINE, TipEvidence::OwnsDataPlane, arrival)
+            {
+                assert_eq!(old_epoch, FORGED);
+                resets += 1;
+                adopted_at.get_or_insert(tick);
+            }
+            // The attacker keeps shouting his epoch between every
+            // genuine tick — with a forged tip, because he does not
+            // know the seq space the receiver is reassembling.
+            tr.observe(FORGED, TipEvidence::Foreign, arrival + KA / 2);
+        }
+        assert_eq!(
+            adopted_at,
+            Some(2),
+            "one packet at start-up owns the session against a live sender"
+        );
+        assert_eq!(resets, 1, "the session oscillated instead of settling");
+        assert_eq!(tr.current(), GENUINE);
+    }
+
+    /// After a hijack, the genuine sender must get back in. The retired
+    /// epoch's quarantine bounds how long, and the attacker cannot
+    /// extend it by talking: he cannot wipe the genuine candidate, and
+    /// the retired sender's live tip exempts it from the
+    /// incumbent-silence gate once the quarantine lapses.
+    #[test]
+    fn hijacked_session_recovers_when_the_real_sender_keeps_shouting() {
+        const FORGED: u32 = 0xDEAD_BEEF;
+        const GENUINE: u32 = 0x0BAD_F00D;
+        let t0 = Instant::now();
+        let mut tr = settled(GENUINE, t0);
+
+        // The only way in: the real sender unheard on every leg across
+        // the whole silence window, then a spaced pair.
+        let h0 = t0 + SILENCE;
+        assert_eq!(tr.observe(FORGED, TipEvidence::Foreign, h0), EpochAction::None);
+        assert_eq!(
+            tr.observe(FORGED, TipEvidence::Foreign, h0 + KA),
+            EpochAction::Reset { old_epoch: GENUINE }
+        );
+        let hijacked_at = h0 + KA;
+
+        // The genuine sender never stopped: the reset un-anchored the
+        // buffer, its media re-anchors it, so its keepalives carry a
+        // live tip. The attacker holds the session by refreshing
+        // between every one of them.
+        let mut resets = 0u32;
+        let mut recovered_after: Option<Duration> = None;
+        for tick in 1..=300u32 {
+            let arrival = hijacked_at + KA * tick;
+            if let EpochAction::Reset { old_epoch } =
+                tr.observe(GENUINE, TipEvidence::OwnsDataPlane, arrival)
+            {
+                assert_eq!(old_epoch, FORGED);
+                resets += 1;
+                recovered_after.get_or_insert(arrival - hijacked_at);
+            }
+            tr.observe(FORGED, TipEvidence::Foreign, arrival + KA / 2);
+        }
+        assert_eq!(tr.current(), GENUINE, "the outage was permanent, not bounded");
+        assert_eq!(resets, 1, "the session oscillated instead of settling");
+        let took = recovered_after.expect("the genuine sender never recovered");
+        assert!(
+            took >= ABANDONED_EPOCH_QUARANTINE && took < ABANDONED_EPOCH_QUARANTINE + KA * 3,
+            "recovery took {took:?}, expected just after the \
+             {ABANDONED_EPOCH_QUARANTINE:?} quarantine"
+        );
+    }
+
+    #[test]
+    fn retired_epoch_is_quarantined_then_recoverable() {
+        let t0 = Instant::now();
+        let mut tr = settled(0x1111_1111, t0);
+        // A confirmed restart retires 0x1111_1111.
+        let t1 = t0 + Duration::from_secs(10);
+        assert_eq!(tr.observe(0x2222_2222, TipEvidence::Foreign, t1), EpochAction::None);
+        assert_eq!(
+            tr.observe(0x2222_2222, TipEvidence::Foreign, t1 + KA),
+            EpochAction::Reset { old_epoch: 0x1111_1111 }
+        );
+        let reset_at = t1 + KA;
+        // Inside the quarantine, queued old-instance keepalives (even
+        // spaced ones) cannot flip the session backward.
+        assert_eq!(
+            tr.observe(0x1111_1111, TipEvidence::Foreign, reset_at + KA),
+            EpochAction::None
+        );
+        assert_eq!(
+            tr.observe(0x1111_1111, TipEvidence::Foreign, reset_at + KA * 2),
+            EpochAction::None
+        );
+        assert_eq!(tr.current(), 0x2222_2222);
+        // After it, a sender still shouting that epoch re-establishes on
+        // the normal corroboration path — the mis-adoption is NOT
+        // permanent (that permanence is what turned a 2-packet forgery
+        // into an unrecoverable outage).
+        let after = reset_at + ABANDONED_EPOCH_QUARANTINE + Duration::from_millis(1);
+        assert_eq!(tr.observe(0x1111_1111, TipEvidence::Foreign, after), EpochAction::None);
+        assert_eq!(
+            tr.observe(0x1111_1111, TipEvidence::Foreign, after + KA),
+            EpochAction::Reset { old_epoch: 0x2222_2222 }
+        );
+        assert_eq!(tr.current(), 0x1111_1111);
+    }
+
+    #[test]
+    fn first_epoch_over_own_anchor_adopts_silently_over_foreign_corroborates() {
+        let t0 = Instant::now();
+        // Un-anchored / tip-in-window → silent adoption, no reset.
+        let mut tr = tracker();
+        assert_eq!(
+            tr.observe(7, TipEvidence::NoOpinion, t0),
+            EpochAction::AdoptedSilently
+        );
+
+        // Anchored in a FOREIGN seq space (the v2→v3 upgrade case):
+        // the first epoch must go the full corroboration route or every
+        // new-instance packet drops as stale until manual restart.
+        let mut tr = tracker();
+        assert_eq!(tr.observe(7, TipEvidence::Foreign, t0), EpochAction::None);
+        assert_eq!(
+            tr.observe(7, TipEvidence::Foreign, t0 + Duration::from_micros(3)),
+            EpochAction::None
+        );
+        assert_eq!(
+            tr.observe(7, TipEvidence::Foreign, t0 + KA),
+            EpochAction::Reset { old_epoch: 0 }
+        );
+        assert_eq!(tr.current(), 7);
+    }
+
+    /// Free, uncorroborated adoption is confined to the FIRST nonzero
+    /// epoch this flow ever saw. Once two are in play neither may take
+    /// the session for a single packet, however permissive the buffer's
+    /// opinion of its tip is — otherwise a forger who loses the
+    /// start-up race just waits for the next un-anchored moment.
+    #[test]
+    fn a_second_competing_epoch_cannot_be_adopted_for_free() {
+        let t0 = Instant::now();
+        let mut tr = tracker();
+        // First epoch seen, but over a foreign anchor: no free adoption.
+        assert_eq!(tr.observe(7, TipEvidence::Foreign, t0), EpochAction::None);
+        assert_eq!(tr.current(), 0);
+        // A different epoch now arrives over a buffer with no opinion.
+        // Pre-fix that was a free session for one packet.
+        assert_eq!(
+            tr.observe(9, TipEvidence::NoOpinion, t0 + Duration::from_millis(1)),
+            EpochAction::None,
+            "a second competing epoch was adopted for free"
+        );
+        assert_eq!(tr.current(), 0);
+        // It must corroborate like anything else.
+        assert_eq!(
+            tr.observe(9, TipEvidence::NoOpinion, t0 + KA + Duration::from_millis(1)),
+            EpochAction::Reset { old_epoch: 0 }
+        );
+        assert_eq!(tr.current(), 9);
+    }
+
+    /// Both competing candidates are tracked, so an attacker spraying a
+    /// second epoch cannot starve a genuine restart out of the table.
+    #[test]
+    fn two_competing_candidates_are_tracked_independently() {
+        let t0 = Instant::now();
+        let mut tr = settled(0x1111_1111, t0);
+        // Restart at t0: no more incumbent keepalives. The genuine new
+        // epoch alternates with a forged one on every arrival.
+        for tick in 1..=3u32 {
+            let at = t0 + KA * tick;
+            let genuine = tr.observe(0x2222_2222, TipEvidence::Foreign, at);
+            if tick < 3 {
+                assert_eq!(genuine, EpochAction::None);
+            } else {
+                assert_eq!(genuine, EpochAction::Reset { old_epoch: 0x1111_1111 });
+            }
+            tr.observe(0xDEAD_BEEF, TipEvidence::Foreign, at + KA / 4);
+        }
+        assert_eq!(tr.current(), 0x2222_2222, "the forged epoch starved the restart out");
+    }
+
+    /// A sprayer wins every corroboration race, so corroboration alone
+    /// must not confer establishment.
+    ///
+    /// The incumbent-silence gate stops a spray while the real sender is
+    /// talking, but the gate opens by itself at every sender restart and
+    /// every stale-flood re-anchor — the incumbent has genuinely gone
+    /// quiet, no attacker effort required. In that window adoption
+    /// reduces to "two sightings a `min_gap` apart", which is a rate
+    /// test: 1 pkt/ms beats 5 keepalives/s every time. If that win also
+    /// marked the session ESTABLISHED, the sprayer inherited the
+    /// incumbent-silence gate and turned it against the real sender,
+    /// whose media the receiver is demonstrably still reassembling. The
+    /// watchdog's next re-anchor only re-ran the same race, so the
+    /// outage was unbounded — FINDING-22 again, for ~1 kpps.
+    ///
+    /// Establishment therefore comes only from the data plane, and this
+    /// pins the bound: the sprayer may take the flow for one corroboration
+    /// round, and the genuine sender takes it back on its next one.
+    #[test]
+    fn a_sprayer_cannot_hold_the_session_through_a_reanchor() {
+        const SPRAY: u32 = 0xDEAD_BEEF;
+        const GENUINE: u32 = 0x0BAD_F00D;
+        let t0 = Instant::now();
+        let mut tr = settled(0x1111_1111, t0);
+        // The stale-flood watchdog has just fired. It resets the
+        // reassembly buffer, so the genuine sender's media re-anchors it
+        // within microseconds: from here every genuine keepalive carries
+        // OwnsDataPlane and the off-path sprayer's carries Foreign,
+        // because he cannot guess a 32-bit tip moving at the media rate.
+        tr.force_reanchor();
+
+        let mut resets = 0u32;
+        let mut genuine_won_at: Option<Duration> = None;
+        for ms in 0..6_000u64 {
+            let at = t0 + Duration::from_millis(ms);
+            // The sprayer, 1 pkt/ms, unbroken.
+            tr.observe(SPRAY, TipEvidence::Foreign, at);
+            // The genuine sender, one keepalive per interval.
+            if ms % 200 == 100
+                && let EpochAction::Reset { .. } =
+                    tr.observe(GENUINE, TipEvidence::OwnsDataPlane, at)
+            {
+                resets += 1;
+                genuine_won_at.get_or_insert(Duration::from_millis(ms));
+            }
+        }
+        assert_eq!(tr.current(), GENUINE, "the sprayer held the session");
+        assert!(
+            tr.established,
+            "the recovered session must be established, or the sprayer's              next corroboration round takes it straight back"
+        );
+        let took = genuine_won_at.expect("the genuine sender never got back in");
+        assert!(
+            took <= KA * 3,
+            "recovery took {took:?}: it must land within a couple of              corroboration rounds, not wait for another watchdog re-anchor"
+        );
+        assert_eq!(resets, 1, "the session oscillated instead of settling");
+    }
+
+    #[test]
+    fn epochless_keepalives_neither_adopt_nor_clear_a_candidate() {
+        let t0 = Instant::now();
+        let mut tr = settled(0x1111_1111, t0);
+        // The genuine sender restarted, so nothing bearing the adopted
+        // epoch arrives again and the silence window runs from t0.
+        assert_eq!(
+            tr.observe(0x3333_3333, TipEvidence::Foreign, t0 + KA),
+            EpochAction::None
+        );
+        // An epoch-0 (v1/v2 peer, or a stray) keepalive must neither
+        // cancel the corroboration nor pass itself off as the incumbent
+        // still being alive.
+        assert_eq!(
+            tr.observe(0, TipEvidence::Foreign, t0 + KA + KA / 2),
+            EpochAction::None
+        );
+        assert_eq!(
+            tr.observe(0x3333_3333, TipEvidence::Foreign, t0 + SILENCE),
+            EpochAction::Reset { old_epoch: 0x1111_1111 }
+        );
+    }
+
+    #[test]
+    fn corroboration_gap_is_clamped_from_the_keepalive_interval() {
+        assert_eq!(EpochTracker::new(KA, MISS).min_gap, KA);
+        // A sub-100 ms cadence still demands the floor…
+        assert_eq!(
+            EpochTracker::new(Duration::from_millis(10), MISS).min_gap,
+            EPOCH_CORROBORATION_GAP_MIN
+        );
+        // …and a very slow cadence is capped, so adoption never waits
+        // longer than the natural inter-keepalive spacing.
+        assert_eq!(
+            EpochTracker::new(Duration::from_secs(30), MISS).min_gap,
+            EPOCH_CORROBORATION_GAP_MAX
+        );
+    }
+
+    #[test]
+    fn incumbent_silence_never_exceeds_the_senders_liveness_budget() {
+        // Shipped defaults: 3 ticks, inside the 5-tick liveness window.
+        assert_eq!(EpochTracker::new(KA, 5).incumbent_silence, SILENCE);
+        // A tighter miss threshold clamps it, so a genuine restart is
+        // still adopted before the sender gives up on its legs.
+        assert_eq!(EpochTracker::new(KA, 2).incumbent_silence, KA * 2);
+        assert_eq!(EpochTracker::new(KA, 0).incumbent_silence, KA);
+    }
+
+    #[test]
+    fn force_reanchor_rearms_first_epoch_adoption() {
+        let t0 = Instant::now();
+        let mut tr = settled(0x1111_1111, t0);
+        assert_eq!(tr.force_reanchor(), 0x1111_1111);
+        assert_eq!(tr.current(), 0);
+        // Including the previously-retired value, and the first-epoch
+        // memory: after a forced re-anchor nothing is quarantined and
+        // the next instance — v2 or v3 — re-anchors cleanly.
+        assert_eq!(
+            tr.observe(0x1111_1111, TipEvidence::NoOpinion, t0),
+            EpochAction::AdoptedSilently
+        );
     }
 
     #[test]

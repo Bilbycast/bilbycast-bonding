@@ -20,7 +20,7 @@ use bytes::{Bytes, BytesMut};
 use tokio::net::UdpSocket;
 use tokio::time::{sleep, timeout};
 
-use bonding_protocol::control::{CtrlHeader, CtrlPacket, CtrlType, KeepaliveBody};
+use bonding_protocol::control::{CtrlHeader, CtrlPacket, CtrlType, KeepaliveBody, NackBody};
 use bonding_transport::{
     BondScheduler, BondSocket, BondSocketConfig, PacketHints, PathConfig, PathEventKind,
     PathId, PathSelection, PathTransport, WeightedRttScheduler,
@@ -240,6 +240,336 @@ async fn single_spurious_epoch_keepalive_does_not_reset() {
         0,
         "one spoofed keepalive must not reset the session"
     );
+}
+
+/// Two forged keepalives sent back-to-back must NOT hijack the session.
+///
+/// The corroboration rule used to be "two *consecutive* control packets
+/// carrying the same new epoch", with no timing constraint: a burst of
+/// two forged keepalives ~1 µs apart (≈82 bytes, no key, no state) beat
+/// the real sender's 100–200 ms keepalive cadence every time. Adoption
+/// then retired the genuine sender's epoch into a **permanent**
+/// quarantine, so its keepalives hit a no-op and were dropped before the
+/// ack — the sender missed `keepalive_miss_threshold` acks on every leg,
+/// marked them all dead, and the scheduler dropped every packet:
+/// permanent media outage on a live bonded input.
+///
+/// Adoption now also requires the pair to straddle a keepalive interval,
+/// which the live sender's own keepalives interrupt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn forged_keepalive_burst_does_not_hijack_the_session() {
+    let rx_a: SocketAddr = format!("127.0.0.1:{}", free_port().await).parse().unwrap();
+
+    let rx_cfg = BondSocketConfig {
+        flow_id: 23,
+        hold_time: Duration::from_millis(100),
+        keepalive_interval: Duration::from_millis(100),
+        paths: vec![udp_recv_path(0, "a", rx_a)],
+        ..Default::default()
+    };
+    let receiver = BondSocket::receiver(rx_cfg).await.unwrap();
+
+    let tx_cfg = BondSocketConfig {
+        flow_id: 23,
+        keepalive_interval: Duration::from_millis(100),
+        keepalive_miss_threshold: 3,
+        paths: vec![udp_send_path(0, "a", rx_a)],
+        ..Default::default()
+    };
+    let sender = BondSocket::sender(tx_cfg, WeightedRttScheduler::new(vec![0]))
+        .await
+        .unwrap();
+
+    const N: u32 = 20;
+    for i in 0..N {
+        sender
+            .send(Bytes::from(format!("p-{i:06}")), PacketHints::default())
+            .await
+            .unwrap();
+    }
+    for _ in 0..N {
+        timeout(Duration::from_secs(3), receiver.recv())
+            .await
+            .expect("recv timed out")
+            .expect("channel closed");
+    }
+
+    // The attack: two identical forged keepalives, one flush apart.
+    let spoof = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let pkt = CtrlPacket::Keepalive {
+        header: CtrlHeader::new(CtrlType::Keepalive, 0, 23),
+        body: KeepaliveBody {
+            stamp_us: 1,
+            packets_sent_on_path: 0,
+            highest_bond_seq_sent: 900_000,
+            bytes_sent_on_path: 0,
+            session_epoch: 0x1337_c0de,
+            mode_flags: 0,
+        },
+    };
+    let mut buf = BytesMut::new();
+    pkt.serialize(&mut buf);
+    spoof.send_to(&buf, rx_a).await.unwrap();
+    spoof.send_to(&buf, rx_a).await.unwrap();
+
+    // Long enough for the sender to have missed 3 keepalive-acks had the
+    // hijack landed (3 × 100 ms), plus margin.
+    sleep(Duration::from_millis(700)).await;
+
+    for i in 0..N {
+        sender
+            .send(Bytes::from(format!("q-{i:06}")), PacketHints::default())
+            .await
+            .unwrap();
+    }
+    for i in 0..N {
+        let b = timeout(Duration::from_secs(3), receiver.recv())
+            .await
+            .expect("post-forgery recv timed out — the bond went silent")
+            .expect("channel closed");
+        assert_eq!(b.as_ref(), format!("q-{i:06}").as_bytes());
+    }
+    assert_eq!(
+        receiver.stats().snapshot().session_resets,
+        0,
+        "a forged keepalive burst hijacked the session epoch"
+    );
+    // The sender's leg must still be alive — that is the mechanism that
+    // turned the hijack into a total outage.
+    assert!(
+        !sender.path_stats(0).unwrap().snapshot().dead,
+        "sender leg died: the receiver stopped acking the genuine keepalives"
+    );
+}
+
+/// A stray control-magic byte must not repoint NACK carriage.
+///
+/// The receiver used to call `set_primary_peer(dg.from)` for every
+/// inbound datagram that passed `is_control()` — a **one-byte magic
+/// test**, before any parse, flow_id check or epoch check. NACKs are
+/// carried to `primary_peer`, so anyone able to send `0xBE` at the leg's
+/// port could repoint the whole ARQ back-channel at themselves and
+/// silently blackhole retransmit requests: loss stops being recovered
+/// while every counter still looks healthy. Peer learning is now gated
+/// on a datagram that parses as a keepalive for our flow bearing our
+/// session epoch.
+///
+/// Topology: sender → shim (drops every 10th forward packet) → receiver,
+/// with a third socket spraying `0xBE` at the receiver's leg throughout.
+/// Every payload must still arrive, which requires the NACKs to have
+/// reached the real sender.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stray_control_byte_does_not_steal_nack_carriage() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let rx_a: SocketAddr = format!("127.0.0.1:{}", free_port().await).parse().unwrap();
+    let shim_addr: SocketAddr = format!("127.0.0.1:{}", free_port().await).parse().unwrap();
+
+    // Bidirectional shim: forward drops every 10th data-ish datagram so
+    // real gaps appear; the reverse direction (NACKs) is forwarded
+    // verbatim to whoever last sent forward traffic.
+    let stop = Arc::new(AtomicBool::new(false));
+    let shim = Arc::new(UdpSocket::bind(shim_addr).await.unwrap());
+    {
+        let shim = shim.clone();
+        let stop = stop.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 2048];
+            let mut client: Option<SocketAddr> = None;
+            let mut n: u64 = 0;
+            while !stop.load(Ordering::Relaxed) {
+                let Ok(Ok((len, from))) =
+                    timeout(Duration::from_millis(50), shim.recv_from(&mut buf)).await
+                else {
+                    continue;
+                };
+                if from == rx_a {
+                    if let Some(c) = client {
+                        let _ = shim.send_to(&buf[..len], c).await;
+                    }
+                    continue;
+                }
+                client = Some(from);
+                // Only shed fresh media (0xBC, not RETRANSMIT-flagged);
+                // never a keepalive or a resend, or the test measures
+                // liveness/ARQ-retry instead of NACK carriage.
+                let is_fresh_data = buf[0] == 0xBC && (buf[1] & 0x0F) & 0x1 == 0;
+                if is_fresh_data {
+                    n += 1;
+                    if n.is_multiple_of(10) {
+                        continue;
+                    }
+                }
+                let _ = shim.send_to(&buf[..len], rx_a).await;
+            }
+        });
+    }
+
+    // Spray a bare control-magic byte at the receiver's leg for the whole
+    // run — the old code adopted the sprayer as the NACK peer.
+    {
+        let stop = stop.clone();
+        tokio::spawn(async move {
+            let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            while !stop.load(Ordering::Relaxed) {
+                let _ = sock.send_to(&[0xBEu8], rx_a).await;
+                sleep(Duration::from_millis(1)).await;
+            }
+        });
+    }
+
+    let rx_cfg = BondSocketConfig {
+        flow_id: 29,
+        hold_time: Duration::from_millis(2000),
+        nack_delay: Duration::from_millis(30),
+        max_nack_retries: 16,
+        keepalive_interval: Duration::from_millis(100),
+        paths: vec![udp_recv_path(0, "a", rx_a)],
+        ..Default::default()
+    };
+    let receiver = BondSocket::receiver(rx_cfg).await.unwrap();
+
+    let tx_cfg = BondSocketConfig {
+        flow_id: 29,
+        keepalive_interval: Duration::from_millis(100),
+        retransmit_capacity: 4096,
+        paths: vec![udp_send_path(0, "a", shim_addr)],
+        ..Default::default()
+    };
+    let sender = BondSocket::sender(tx_cfg, WeightedRttScheduler::new(vec![0]))
+        .await
+        .unwrap();
+
+    const N: u32 = 200;
+    for i in 0..N {
+        sender
+            .send(Bytes::from(format!("n-{i:06}")), PacketHints::default())
+            .await
+            .unwrap();
+        sleep(Duration::from_millis(2)).await;
+    }
+    for i in 0..N {
+        let b = timeout(Duration::from_secs(5), receiver.recv())
+            .await
+            .unwrap_or_else(|_| panic!("payload {i} never arrived — NACKs went to the sprayer"))
+            .expect("channel closed");
+        assert_eq!(b.as_ref(), format!("n-{i:06}").as_bytes());
+    }
+    stop.store(true, Ordering::Relaxed);
+    let rx_stats = receiver.stats().snapshot();
+    assert_eq!(rx_stats.gaps_lost, 0, "gaps aged out unrecovered");
+    assert!(
+        sender.stats().snapshot().packets_retransmitted > 0,
+        "the shim never shed anything — test would be vacuous"
+    );
+}
+
+/// A NACK bearing a foreign `flow_id` must drive no retransmits.
+///
+/// The sender matched `Ok(CtrlPacket::Nack { body, .. })` and discarded
+/// the header, so any datagram that parsed as a NACK was served for
+/// whatever flow this sender happened to be running — the mirror image
+/// of a check the receiver has always applied to inbound keepalives. A
+/// NACK carries no session epoch, so `flow_id` is the only thing there
+/// is to reject it with: forged ones drive real resends, debit the
+/// congestion controller's token bucket for bandwidth nobody asked for,
+/// and inflate `packets_retransmitted`. The same header check now
+/// guards `KeepaliveAck`, which feeds `ack_delivery` and can revive a
+/// leg the sender had correctly written off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn foreign_flow_id_nack_drives_no_retransmits() {
+    const FLOW: u32 = 31;
+    let rx_a: SocketAddr = format!("127.0.0.1:{}", free_port().await).parse().unwrap();
+    // The sender binds a known port so the forgery has somewhere to go.
+    let tx_a: SocketAddr = format!("127.0.0.1:{}", free_port().await).parse().unwrap();
+
+    let rx_cfg = BondSocketConfig {
+        flow_id: FLOW,
+        hold_time: Duration::from_millis(100),
+        keepalive_interval: Duration::from_millis(100),
+        paths: vec![udp_recv_path(0, "a", rx_a)],
+        ..Default::default()
+    };
+    let receiver = BondSocket::receiver(rx_cfg).await.unwrap();
+
+    let tx_cfg = BondSocketConfig {
+        flow_id: FLOW,
+        keepalive_interval: Duration::from_millis(100),
+        retransmit_capacity: 1024,
+        paths: vec![PathConfig {
+            id: 0,
+            name: "a".into(),
+            weight_hint: 1,
+            transport: PathTransport::Udp {
+                bind: Some(tx_a),
+                remote: Some(rx_a),
+                interface: None,
+            },
+        }],
+        ..Default::default()
+    };
+    let sender = BondSocket::sender(tx_cfg, WeightedRttScheduler::new(vec![0]))
+        .await
+        .unwrap();
+
+    const N: u32 = 32;
+    for i in 0..N {
+        sender
+            .send(Bytes::from(format!("r-{i:06}")), PacketHints::default())
+            .await
+            .unwrap();
+    }
+    for _ in 0..N {
+        timeout(Duration::from_secs(3), receiver.recv())
+            .await
+            .expect("recv timed out")
+            .expect("channel closed");
+    }
+    assert_eq!(
+        sender.stats().snapshot().packets_retransmitted,
+        0,
+        "loopback shed packets — the test cannot attribute retransmits"
+    );
+
+    let forge = |flow: u32| {
+        let mut buf = BytesMut::new();
+        CtrlPacket::Nack {
+            header: CtrlHeader::new(CtrlType::Nack, 0, flow),
+            body: NackBody { missing: (0..8).collect() },
+        }
+        .serialize(&mut buf);
+        buf
+    };
+    let spoof = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+    // Someone else's flow: every one of these must be dropped.
+    let foreign = forge(FLOW ^ 0xFFFF);
+    for _ in 0..5 {
+        spoof.send_to(&foreign, tx_a).await.unwrap();
+        sleep(Duration::from_millis(20)).await;
+    }
+    sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        sender.stats().snapshot().packets_retransmitted,
+        0,
+        "a NACK for a foreign flow_id drove retransmits on this one"
+    );
+
+    // Our flow, same seqs: served — otherwise the assertion above only
+    // proves ARQ is broken.
+    let ours = forge(FLOW);
+    spoof.send_to(&ours, tx_a).await.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut served = 0;
+    while Instant::now() < deadline {
+        served = sender.stats().snapshot().packets_retransmitted;
+        if served > 0 {
+            break;
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+    assert!(served > 0, "ARQ is dead: our own flow's NACK was ignored too");
 }
 
 /// Drops every second packet at the scheduler — emulates the capacity
