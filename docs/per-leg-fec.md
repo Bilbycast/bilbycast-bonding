@@ -140,6 +140,22 @@ The payload after the bond header is a `PerLegRepair`:
   `block_len = 2 + max(member payload length)`. This is the same XOR primitive
   the combined FEC uses (`source_block` / `xor_into` in `protocol/fec.rs`), so
   variable-length payloads recover correctly.
+- **Minimums, enforced at parse.** `PerLegRepair::parse` rejects `count < 2` or
+  `block_len < 2` outright — the datagram is dropped, never decoded.
+  `block_len < 2` is the structural floor: the block always opens with the
+  2-byte payload-length prefix. `count < 2` is the security floor: a one-member
+  repair has no other member to XOR against, so "recovering" it would hand the
+  reassembler a `(bond_seq, payload)` pair chosen entirely by whoever sent the
+  datagram — and a bond leg is an unconnected UDP socket, so that is an
+  injection primitive, not an edge case. Rejecting `block_len < 2` alone does
+  not close it. No shipped sender emits either shape: `build_per_leg_repair`
+  always covers exactly `rows` members with a `2 + max(member payload length)`
+  block, and `rows >= 2` is enforced both by `FecParams::is_valid` and by the
+  edge's own config validation, where the XOR branch requires `fec.rows` in
+  [2, 64] (the per-leg Reed-Solomon branch allows `rows = 1`, but Reed-Solomon
+  never emits a `PerLegRepair` — `PerLegFecEncoder` is only ever constructed
+  for `PerLegFecKind::Xor`). The combined `FecRepair` carries the same
+  `block_len >= 2` floor.
 
 Compared with the combined `FecRepair`, which carries
 `[base_seq][columns][rows][column][block_len][block]` and relies on the
