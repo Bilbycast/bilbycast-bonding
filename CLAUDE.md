@@ -37,7 +37,8 @@ into two crates following the same pattern:
 
 ## Wire Format
 
-Each bonded packet is a 12-byte header followed by opaque payload:
+Each bonded packet is a 12-byte (v1) or 16-byte (v2) header followed by
+opaque payload:
 
 ```text
  0                   1                   2                   3
@@ -51,6 +52,16 @@ Each bonded packet is a 12-byte header followed by opaque payload:
 +---------------------------------------------------------------+
 ```
 
+A **v2** header is the same fields plus a 32-bit trailer, used for per-leg
+latency/jitter equalization (see the equalization row below and
+[`docs/per-leg-equalization.md`](docs/per-leg-equalization.md)):
+
+```text
++---------------------------------------------------------------+
+|                         send_stamp_us                         |
++---------------------------------------------------------------+
+```
+
 - **flow_id (u32)** — identifies the bonded flow; multiple flows can share
   a set of paths.
 - **bond_seq (u32)** — monotonic across all paths. 32 bits so a
@@ -60,8 +71,18 @@ Each bonded packet is a 12-byte header followed by opaque payload:
 - **priority (u8)** — scheduler hint (Normal / High / Critical / Low).
   `Critical` causes built-in schedulers to duplicate across the two
   lowest-RTT paths.
-- **flags (4 bits)** — `RETRANSMIT`, `DUPLICATED`, `MARKER`, one reserved.
-- **version (4 bits)** — currently `1`. Parsers reject mismatched versions.
+- **flags (4 bits)** — `RETRANSMIT`, `DUPLICATED`, `MARKER`, `FEC`. No
+  spare bits remain. `FEC` re-routes the datagram: its payload is a FEC
+  repair (`FecRepair`, or `PerLegRepair` / `PerLegRsRepair` in per-leg
+  mode), so the receiver hands it to the FEC decoder and does NOT treat
+  its `bond_seq` as a media sequence number.
+- **version (4 bits)** — `1` (12-byte header) or `2` (16-byte, adds
+  `send_stamp_us`, sender monotonic microseconds, wrapping).
+  `BondHeader::parse` accepts both and returns the consumed length; any
+  other version is rejected with `UnsupportedVersion`. A sender emits v2
+  on a leg only after that leg's keepalive-ack reports
+  `recv_protocol_version >= 2`, so a v1 peer never sees a header it
+  cannot parse.
 
 ## Module Map
 
@@ -73,9 +94,18 @@ Each bonded packet is a 12-byte header followed by opaque payload:
   accounting, gap timeout).
 - `protocol/retransmit.rs` — retransmit buffer + NACK-driven resend
   bookkeeping.
-- `protocol/scheduler.rs` — `BondScheduler` trait (`schedule` /
-  `on_path_update` / `on_tick` / `on_path_{dead,alive}`),
-  `RoundRobinScheduler`, `WeightedRttScheduler`.
+- `protocol/scheduler.rs` — `BondScheduler` trait (`path_ids` / `schedule` /
+  `set_redundancy` / `on_path_update` / `on_tick` / `on_path_{dead,alive}` /
+  `charge_path` / `aggregate_capacity_bps`), `RoundRobinScheduler`,
+  `WeightedRttScheduler`. `charge_path` debits a leg for out-of-band per-leg
+  FEC parity the scheduler never routed; `aggregate_capacity_bps` is the
+  operator-facing available bonded bitrate exported via `BondConnStats`.
+- `protocol/fec.rs` — combined + per-leg XOR codec (`FecEncoder` /
+  `FecDecoder` / `PerLegFecEncoder` / `PerLegFecDecoder` and the repair
+  types).
+- `protocol/rs.rs` — hand-rolled GF(256) Cauchy Reed-Solomon (`rs_encode` /
+  `rs_reconstruct`) plus `PerLegRsEncoder` / `PerLegRsDecoder` /
+  `PerLegRsRepair`.
 - `protocol/capacity_scheduler.rs` — `CapacityAwareScheduler` +
   `CongestionConfig` + `PathPrior`: per-path congestion controller,
   token-bucket capacity-proportional split, quality deweighting.
@@ -88,9 +118,12 @@ Each bonded packet is a 12-byte header followed by opaque payload:
 
 ### bonding-transport
 - `config.rs` — `BondSocketConfig`, `PathConfig`, `PathTransport` enum
-  (`Udp` / `Rist` / `Quic` variants).
+  (`Udp` / `Attached` / `Rist` / `Quic` variants). `Attached { primary_peer }`
+  is an in-process relayed leg; its mpsc endpoints travel in the separate
+  `attachments` argument, because the enum is `Clone + Debug` and an
+  `mpsc::Receiver` is neither.
 - `path/` — uniform `BondPath` trait (`mod.rs`) plus the concrete
-  adapters: `udp.rs`, `rist.rs`, `quic.rs`.
+  adapters: `udp.rs`, `attached.rs`, `rist.rs`, `quic.rs`.
 - `sender.rs` — outbound task: consults scheduler, frames header,
   writes to selected path(s).
 - `receiver.rs` — inbound task: multiplexes N paths into a
@@ -99,9 +132,11 @@ Each bonded packet is a 12-byte header followed by opaque payload:
   to the scheduler.
 - `crypto.rs` — `BondCrypto`: optional per-datagram ChaCha20-Poly1305
   AEAD (`0xBD` envelope), applied at the UDP path.
-- `socket.rs` — public `BondSocket::sender()` / `::receiver()` API,
-  plus `send` / `recv` / `stats` / `path_stats` / `path_ids` /
-  `subscribe_events` / `close`.
+- `socket.rs` — public `BondSocket::sender_attached()` /
+  `::receiver_attached()` API (`sender()` / `receiver()` delegate to them
+  with an empty attachments map), plus `send` / `recv` / `stats` /
+  `path_stats` / `path_ids` / `subscribe_events` / `rebuild_udp_path` /
+  `close`.
 
 ## Implementation Status
 
@@ -109,7 +144,7 @@ Each bonded packet is a 12-byte header followed by opaque payload:
 |------|--------|
 | Wire header encode/parse | Done, round-trip tested |
 | Reassembly buffer (32-bit seq) | Done, gap-fill + timeout tested |
-| `BondScheduler` trait (`schedule` / `on_path_update` / `on_tick` / `on_path_{dead,alive}`) | Done |
+| `BondScheduler` trait (`path_ids` / `schedule` / `set_redundancy` / `on_path_update` / `on_tick` / `on_path_{dead,alive}` / `charge_path` / `aggregate_capacity_bps`) | Done |
 | `RoundRobinScheduler` (default for bonding-only boxes) | Done |
 | `WeightedRttScheduler` (RTT-aware, Critical-duplicates) | Done |
 | **`CapacityAwareScheduler`** (congestion-controlled, capacity-proportional split) | **Done** — `protocol/capacity_scheduler.rs`, unit + e2e tested. See "Adaptive scheduling" below. |
@@ -118,6 +153,7 @@ Each bonded packet is a 12-byte header followed by opaque payload:
 | Stats + snapshots | Done (`throughput_bps` / `jitter_us` now written from real feedback) |
 | QUIC path adapter | Done (`path/quic.rs`, `path-quic` default feature; already TLS-encrypted) |
 | Raw UDP path adapter | Done (`path/udp.rs`, `path-udp` default feature; optional `BondCrypto`) |
+| **In-process attached relay leg** (`PathTransport::Attached`) | **Done** — loopback-free bonded leg over a relay: the host (edge) owns the relay socket + tunnel framing and bridges datagrams in-process over mpsc, so there is no loopback UDP hop and no second AEAD pass. `path/attached.rs`, `BondSocket::{sender,receiver}_attached`. See [`bilbycast-edge/docs/bonded-relay-loopback-free.md`](../bilbycast-edge/docs/bonded-relay-loopback-free.md). |
 | RIST path adapter (via bilbycast-rist) | Library adapter exists (`path/rist.rs`, `path-rist` default feature) — but **NOT a real aggregation leg, and excluded from the manager UI (UDP + QUIC only).** RIST is unidirectional at the bond layer (send-only / receive-only), so a send-only leg can't carry the keepalive back-channel, the sender can't confirm it alive, and the scheduler won't aggregate over it (verified on the live cellular bond — see `manager`'s `bonding.js`). Only useful paired with a UDP/QUIC leg in the opposite direction. **The real, product-exposed aggregation legs are UDP + QUIC.** |
 | SRT leg path adapter | **Not planned (decided 2026-06-22).** The bond aggregates **UDP + QUIC** legs only — raw + optional ChaCha20 (UDP), and TLS 1.3 + congestion-control + NAT (QUIC). Both are *unreliable* carriers by design: the bond owns ALL recovery via its cross-leg NACK ARQ + optional XOR FEC (there is **no per-leg ARQ in the product** — the RIST adapter above is not an aggregation leg). SRT adds nothing the bond needs and actively fights it: its TSBPD latency-window delivery + TLPKTDROP hold and late-drop datagrams that the bond's cross-leg reassembly must reorder/recover itself; it gives **no** 3rd-party interop (the `0xBC` bond is proprietary at both ends); and it would drag the heavy libsrt/OpenSSL/CMake build chain into the deliberately-lean bonder. For SRT bonding **to a 3rd party**, use libsrt **socket-group bonding** (Broadcast/Backup groups) on the edge's SRT I/O — that already ships. If per-leg recovery is ever genuinely wanted, the path is the bond's FEC (exists) or a properly *bidirectional* reliable leg — not SRT. |
 | `BondSocket::sender` / `::receiver` (+ `send` / `recv` / `stats` / `path_stats` / `path_ids` / `subscribe_events` / `close`) | Done (`socket.rs`; `BondSocketConfig::encryption_key` threads the AEAD) |

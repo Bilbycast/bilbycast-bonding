@@ -23,7 +23,10 @@ Add `interface` to your path config:
     { "id": 1, "name": "starlink",
       "transport": { "type": "udp", "remote": "hub:7001", "interface": "wwan1" } },
     { "id": 2, "name": "fibre",
-      "transport": { "type": "udp", "remote": "hub:7002", "interface": "eth0"  } }
+      "transport": { "type": "udp", "remote": "hub:7002", "interface": "eth0"  } },
+    { "id": 3, "name": "quic-lte",
+      "transport": { "type": "quic", "addr": "hub:7100", "server_name": "hub",
+                     "tls": { "mode": "self_signed" }, "interface": "wwan2" } }
   ]
 }
 ```
@@ -214,9 +217,10 @@ interface "back up" under the same name. (A plain link flap on the
 **same** ifindex needs no intervention: keepalive liveness marks the
 path dead and revives it when packets flow again.)
 
-bilbycast-bonding recovers from churn automatically, **for UDP paths
-only** (QUIC and RIST legs manage their own connections and are not
-covered):
+bilbycast-bonding recovers from churn automatically, but the
+**watcher** covers **UDP paths only**. A QUIC or relayed leg is pinned
+at socket creation and stays pinned, but is not rebuilt when the
+ifindex moves underneath it; RIST legs are neither pinned nor watched:
 
 - **Interface watcher** — every bond polls each UDP path that has an
   `interface` pin or a specific (non-wildcard) `bind` IP on a 2 s
@@ -280,9 +284,15 @@ Behaviour notes:
   time, and the [interface watcher](#interface-churn-usb-re-plug-re-enumeration-dhcp-renumber)
   rebuilds the socket when the index changes underneath a running
   path, so `wwan0` coming back up after a re-plug works as expected.
-- **This only affects UDP paths.** QUIC, RIST, and SRT paths have
-  their own bind configurations; pinning for those transports is
-  tracked separately.
+- **`interface` pins UDP, QUIC and relayed legs.** All three go
+  through the same `SO_BINDTODEVICE` → `IP_UNICAST_IF` mechanism —
+  for QUIC it is applied to *both* endpoints (the client's dial socket
+  and the server's listen socket) before quinn takes ownership; for a
+  relayed leg the edge's tunnel bridge pins the relay socket it owns.
+  RIST legs carry no `interface` field and are not pinned, and there is
+  no SRT leg adapter at all. Only the [interface
+  watcher](#interface-churn-usb-re-plug-re-enumeration-dhcp-renumber)
+  is UDP-only.
 
 ## Troubleshooting
 

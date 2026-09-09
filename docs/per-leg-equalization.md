@@ -135,8 +135,10 @@ residual jitter, and a leg is benched only when aligning it would exceed an oper
 - **L4 Demote redesign** — `media_eligible` flips on "un-equalizable within budget OR
   rate-collapsed", coordinated receiver→sender, with a sender-local fallback.
 
-Everything defaults to **today's behaviour** (equalization OFF, no header growth emitted)
-so every existing config stays byte-valid and every v1 peer keeps working.
+An omitted `equalization` field resolves to **`auto`**, so a bond stamps + measures OWD
+and emits the 16-byte v2 header once the peer advertises v2; `off` restores the legacy
+no-stamp path. Every existing config stays byte-valid (the legacy boolean still
+deserializes) and every v1 peer keeps working through the version negotiation.
 
 ---
 
@@ -294,7 +296,10 @@ re-admit when its radio recovers.
 
 `BondedInputConfig` + `BondedOutputConfig` (edge `config/models.rs`):
 
-- `equalization: Option<bool>` — default **false** (opt-in; defaults to today's behaviour).
+- `equalization: "auto" | "off" | "on"` (`Option<BondEqualizationMode>`) — default
+  **`auto`**: measure one-way delay always, engage alignment only above the skew floor.
+  The legacy boolean still deserializes (`true` → `auto`, `false` → `off`), so configs
+  predating the tri-state load unchanged.
 - `max_bonding_latency_ms: Option<u32>` — the latency budget (default 1000; bounds the hold
   and the demote). Validated `[hold_ms, 5000]`.
 

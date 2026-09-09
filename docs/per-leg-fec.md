@@ -43,8 +43,12 @@ both ends**.
 - **Mutually exclusive** with the bond-wide combined `fec` — a bond uses one
   model or the other. Validation rejects setting both.
 
-In the manager UI the controls are **Per-leg FEC Columns / Rows** on each bond
-leg row (both the bonded input and bonded output forms).
+In the manager UI each bond leg row (bonded input and bonded output forms
+alike) carries four controls, in render order: **Per-leg FEC algorithm** (XOR /
+Reed-Solomon), **Columns**, **Rows**, and — Reed-Solomon only — **Max parity**.
+Selecting Reed-Solomon relabels Columns / Rows to **Data shards (k)** /
+**Parity shards (m)** and reveals Max parity, which arms the adaptive-parity
+envelope described below (`paths[].fec.parity_max`).
 
 ## Why not just the combined FEC?
 
@@ -118,7 +122,7 @@ receiver disambiguates by config, see *Interop* below). The header's
 `bond_seq` is informational on a FEC datagram; the receiver routes by the flag
 and reads the repair's own seq list.
 
-The payload after the bond header is a `PerLegRepair`:
+On an XOR leg the payload after the bond header is a `PerLegRepair`:
 
 ```text
  0                   1                   2                   3
@@ -140,8 +144,8 @@ The payload after the bond header is a `PerLegRepair`:
   `block_len = 2 + max(member payload length)`. This is the same XOR primitive
   the combined FEC uses (`source_block` / `xor_into` in `protocol/fec.rs`), so
   variable-length payloads recover correctly.
-- **Minimums, enforced at parse.** `PerLegRepair::parse` rejects `count < 2` or
-  `block_len < 2` outright — the datagram is dropped, never decoded.
+- **Minimums, enforced at parse (XOR).** `PerLegRepair::parse` rejects
+  `count < 2` or `block_len < 2` outright — the datagram is dropped, never decoded.
   `block_len < 2` is the structural floor: the block always opens with the
   2-byte payload-length prefix. `count < 2` is the security floor: a one-member
   repair has no other member to XOR against, so "recovering" it would hand the
@@ -162,6 +166,54 @@ Compared with the combined `FecRepair`, which carries
 receiver computing column membership from the contiguous global seq space, the
 per-leg repair is **self-describing** — it lists its members explicitly, which
 is what lets the leg carry a non-contiguous subset of the global stream.
+
+### Reed-Solomon repair (`PerLegRsRepair`)
+
+A Reed-Solomon leg emits a different payload — one parity shard per datagram,
+`m` of them per block — behind the same bond header and the same `0x08` flag:
+
+```text
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-------------------------------+-------------------------------+
+|        data_shards (k)        |       parity_shards (m)       |
++-------------------------------+-------------------------------+
+|         parity_index          |           shard_len           |   idx ∈ 0..m
++-------------------------------+-------------------------------+
+|             count             |   seq[0] (u32, big-endian)   ...   `count` = k
++-------------------------------+-------------------------------+
+...  seq[1] ... seq[count-1] ...                                |
++-------------------------------+-------------------------------+
+|  parity[0..shard_len]  ...                                     |   one shard, not a length-prefixed block
++---------------------------------------------------------------+
+```
+
+The fixed header is exactly 10 bytes (`FIXED_HDR`), then `count` × `u32`
+`bond_seq`, then `shard_len` parity bytes. A data shard is padded the same way
+an XOR source block is (`[u16 payload_len][payload][zero pad]`), so lengths
+recover exactly.
+
+- **Bounds, enforced at parse.** `PerLegRsRepair::parse` returns `None` unless
+  `data_shards != 0`, `parity_shards != 0`, `parity_index < parity_shards`,
+  `shard_len >= 2`, `count == data_shards`, and
+  `data_shards + parity_shards <= RS_MAX_BLOCK` (256, the GF(256) element
+  budget). A conforming sender cannot violate any of them:
+  `PerLegRsEncoder::new_adaptive` floors `k` and `m` at 1, `push` emits
+  `parity_index` in `0..m`, `shard_len = 2 + max(member payload length)` and
+  exactly `k` seqs, and the edge's config validation caps `data + parity` (and
+  `data + parity_max`) at 256.
+- **The same set is re-checked at `PerLegRsDecoder::push_repair`**, and that is
+  not belt-and-braces. `PerLegRsRepair`'s fields are all `pub` and
+  bilbycast-edge depends on this crate directly, so `parse`'s bounds are **not
+  a type invariant** — a hand-built value reaches the decoder without ever
+  passing `parse`, and `seqs[j]` / `shards[k + idx]` would then index on
+  caller-chosen values. `push_repair` also enforces two checks `parse` cannot
+  need (`parse` derives both from the buffer): `seqs.len() == data_shards` and
+  `parity.len() == shard_len`. It returns an empty `Vec` rather than panicking.
+  Cost is one branch per FEC datagram — this is not the media path.
+- **`rs_reconstruct` carries its own dimension guard** (`shards.len() >= k + m`
+  and every present shard exactly `shard_len` bytes) for the same reason: it is
+  public, and the Gauss-Jordan below it indexes and copies on those dimensions.
 
 ## Recovery semantics & limits
 
@@ -280,12 +332,13 @@ parity_max 6` — ≈12% overhead clean, climbing to ≈37% under heavy loss.
 | Concern | Location |
 |--------|----------|
 | Codec (`PerLegFecEncoder` / `PerLegFecDecoder` / `PerLegRepair`) | `bonding-protocol/src/protocol/fec.rs` |
+| RS codec (`PerLegRsEncoder` / `PerLegRsDecoder` / `PerLegRsRepair`, GF(256) Cauchy) | `bonding-protocol/src/protocol/rs.rs` |
 | Config field (`per_path_fec: HashMap<PathId, PerLegFecKind>`) | `bonding-transport/src/config.rs` (`BondSocketConfig`) |
 | Sender (per-leg encoders, repairs on their own leg) | `bonding-transport/src/sender.rs` |
 | Receiver (per-leg decoders, recover → reassemble, session reset) | `bonding-transport/src/receiver.rs` |
 | Edge config (`BondPathConfig.fec`) + validation (bounds + exclusivity) | `bilbycast-edge/src/config/{models,validation}.rs` |
 | Edge wiring (`BondFecConfig` → `per_path_fec`) | `bilbycast-edge/src/engine/{input_bonded,output_bonded}.rs` |
-| Manager UI (per-leg Columns/Rows on each leg) | `bilbycast-manager` `ui/static/js/config/bonding.js`, `ui/static/js/shared/bond_info.js` |
+| Manager UI (per-leg algorithm / Columns / Rows / Max parity on each leg) | `bilbycast-manager` `ui/static/js/config/bonding.js`, `ui/static/js/shared/bond_info.js` |
 
 ## Tests
 
