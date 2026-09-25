@@ -62,7 +62,26 @@ jobs:
           path: bilbycast-bonding
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        # Pinned to a commit, not `@stable`. dtolnay/rust-toolchain is
+        # versioned by branch, not tag, and `stable` is an unprotected branch
+        # its maintainer force-pushes about once a month (master plus one
+        # commit), so `@stable` ran whatever that branch held on the day, with
+        # the checked-out tree beside it. This is the commit `stable` held on
+        # 2026-09-25.
+        #
+        # Only the action's code is pinned. `toolchain: stable` still installs
+        # the current stable Rust, as before; it is spelled out because the
+        # input defaults to `stable` only on the `stable` branch, and is
+        # required on a `master` commit.
+        #
+        # To bump: `gh api repos/dtolnay/rust-toolchain/branches/stable --jq
+        # .commit.sha`, read the diff from the SHA below, and replace it.
+        # Nothing bumps this automatically (this repo has no Dependabot, and
+        # Dependabot cannot follow a branch pin anyway), and an old SHA keeps
+        # resolving, so a stale pin still builds.
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable as of 2026-09-25
+        with:
+          toolchain: stable
 
       # No apt step on purpose: this workspace is pure Rust. quinn and rustls
       # are pinned to the `ring` backend (default-features = false), not
