@@ -13,16 +13,14 @@ name: CI
 # assertion is fixed; this workflow is what stops the next one hiding as long.
 #
 # Scope is the DEFAULT feature set (path-udp + path-rist + path-quic), which is
-# what `cargo build` gives you and what bilbycast-edge compiles against.
+# what `cargo build` gives you and what bilbycast-edge compiles against. The
+# one exception is clippy, which also lints the lean UDP-only build (see the
+# step).
 #
 # Deliberately NOT run here:
 #   * `cargo fmt --check` — this tree is not rustfmt-clean, and a bare
 #     `cargo fmt` rewrites ~200 files. Adding the gate would mean either a
 #     permanently red CI or a giant unrelated reformat commit.
-#   * `cargo clippy -D warnings` — worth adding, but it should land as its own
-#     change after the existing lint debt is triaged, not bundled in here where
-#     it would make this workflow look like it introduced the failures.
-# `cargo check --all-targets` already keeps the tree warning-free today.
 
 on:
   pull_request:
@@ -92,6 +90,8 @@ jobs:
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable as of 2026-09-25
         with:
           toolchain: stable
+          # The action installs the `minimal` profile, which has no clippy.
+          components: clippy
 
       # No apt step on purpose: this workspace is pure Rust. quinn and rustls
       # are pinned to the `ring` backend (default-features = false), not
@@ -115,6 +115,23 @@ jobs:
       - name: cargo check
         working-directory: bilbycast-bonding
         run: cargo check --all-targets
+
+      # Lint gate. The tree was brought clippy-clean (clippy 1.97) in the same
+      # change that added this step. The toolchain is `stable`, not a pinned
+      # version, so a newer clippy that grows a lint can turn this red on a
+      # commit that touched nothing; fix the lint (or allow it narrowly, with
+      # a reason) rather than dropping the step.
+      #
+      # The second run lints the lean UDP-only build that bilbycast-bonder's
+      # feature pass-through exists for. Nothing else compiles it, and it is
+      # where code only the QUIC or RIST adapters call turns into dead code:
+      # `-D warnings` fails on rustc warnings as well as clippy lints.
+      - name: cargo clippy
+        working-directory: bilbycast-bonding
+        run: |
+          cargo clippy --all-targets -- -D warnings
+          cargo clippy -p bonding-transport -p bilbycast-bonder --all-targets \
+            --no-default-features --features path-udp -- -D warnings
 
       # The integration tests bind real loopback sockets (UDP + QUIC) and are
       # timing-sensitive by nature. Single-threaded so the bond's timers are not

@@ -91,7 +91,10 @@ latency/jitter equalization (see the equalization row below and
 - `control.rs` — control-channel messages (NACK / keepalive) shared by
   sender and receiver.
 - `protocol/reassembly.rs` — `ReassemblyBuffer` (32-bit seq, per-path
-  accounting, gap timeout).
+  accounting, gap timeout). Until it releases its first packet, an
+  arrival behind the anchor moves the base back rather than being
+  dropped as stale: seq 1 on a fast leg can land before seq 0 on a slow
+  one.
 - `protocol/retransmit.rs` — retransmit buffer + NACK-driven resend
   bookkeeping.
 - `protocol/scheduler.rs` — `BondScheduler` trait (`path_ids` / `schedule` /
@@ -143,7 +146,7 @@ latency/jitter equalization (see the equalization row below and
 | Area | Status |
 |------|--------|
 | Wire header encode/parse | Done, round-trip tested |
-| Reassembly buffer (32-bit seq) | Done, gap-fill + timeout tested |
+| Reassembly buffer (32-bit seq) | Done, gap-fill + timeout + cold-start reorder tested |
 | `BondScheduler` trait (`path_ids` / `schedule` / `set_redundancy` / `on_path_update` / `on_tick` / `on_path_{dead,alive}` / `charge_path` / `aggregate_capacity_bps`) | Done |
 | `RoundRobinScheduler` (default for bonding-only boxes) | Done |
 | `WeightedRttScheduler` (RTT-aware, Critical-duplicates) | Done |

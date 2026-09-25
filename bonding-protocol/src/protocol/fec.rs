@@ -4,9 +4,9 @@
 //! ARQ recovers losses but costs a NACK round-trip; on a high-RTT
 //! Starlink leg that can exceed the reassembly hold-time. FEC adds a
 //! *proactive* repair layer so sparse loss is recovered with **no**
-//! round-trip. It is **opt-in / off by default** — multi-path diversity
-//! + ARQ + IDR-duplication already cover most cases, and FEC trades
-//! bandwidth (overhead `1/rows`) for latency.
+//! round-trip. It is **opt-in / off by default** — multi-path
+//! diversity + ARQ + IDR-duplication already cover most cases, and FEC
+//! trades bandwidth (overhead `1/rows`) for latency.
 //!
 //! ## Scheme
 //!
@@ -777,7 +777,7 @@ mod tests {
         // Column 1's single loss (seq 1) recovers.
         assert_eq!(recovered.get(&1), Some(&payloads[1]));
         // Column 0's double loss does NOT.
-        assert!(recovered.get(&0).is_none() && recovered.get(&3).is_none());
+        assert!(!recovered.contains_key(&0) && !recovered.contains_key(&3));
     }
 
     /// `reset` drops in-flight block state so a stale repair from the

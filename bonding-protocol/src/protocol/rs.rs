@@ -29,8 +29,8 @@ fn gf() -> &'static Gf {
         let mut exp = [0u8; 512];
         let mut log = [0u8; 256];
         let mut x: u16 = 1;
-        for i in 0..255 {
-            exp[i] = x as u8;
+        for (i, e) in exp[..255].iter_mut().enumerate() {
+            *e = x as u8;
             log[x as usize] = i as u8;
             x <<= 1;
             if x & 0x100 != 0 {
@@ -165,12 +165,15 @@ fn gf_solve(a: &mut [Vec<u8>], rhs: &mut [Vec<u8>], r: usize, len: usize) -> boo
         a.swap(col, piv);
         rhs.swap(col, piv);
         let inv_p = inv(a[col][col]);
-        for c in col..r {
-            a[col][c] = mul(a[col][c], inv_p);
+        for v in &mut a[col][col..r] {
+            *v = mul(*v, inv_p);
         }
-        for b in 0..len {
-            rhs[col][b] = mul(rhs[col][b], inv_p);
+        for v in &mut rhs[col][..len] {
+            *v = mul(*v, inv_p);
         }
+        // Row reduction reads the pivot row while writing another row of
+        // the same matrix; indexing both is clearer than split_at_mut.
+        #[allow(clippy::needless_range_loop)]
         for row in 0..r {
             if row == col {
                 continue;
@@ -465,10 +468,10 @@ impl PerLegRsDecoder {
             return Vec::new();
         }
         if !self.blocks.contains_key(&key) {
-            if self.blocks.len() >= self.block_cap {
-                if let Some(old) = self.block_order.pop_front() {
-                    self.blocks.remove(&old);
-                }
+            if self.blocks.len() >= self.block_cap
+                && let Some(old) = self.block_order.pop_front()
+            {
+                self.blocks.remove(&old);
             }
             self.block_order.push_back(key);
             self.blocks.insert(
@@ -544,11 +547,11 @@ impl PerLegRsDecoder {
         }
         let mut out = Vec::new();
         for &j in &missing {
-            if let Some(shard) = &shards[j] {
-                if let Some(payload) = unpad_shard(shard) {
-                    self.remember(seqs[j], payload.clone());
-                    out.push((seqs[j], payload));
-                }
+            if let Some(shard) = &shards[j]
+                && let Some(payload) = unpad_shard(shard)
+            {
+                self.remember(seqs[j], payload.clone());
+                out.push((seqs[j], payload));
             }
         }
         self.blocks.get_mut(&key).unwrap().done = true;
@@ -770,8 +773,8 @@ mod tests {
                 recovered.insert(s, pl);
             }
         }
-        for i in 2..7 {
-            assert_eq!(recovered.get(&(2000 + i as u32)), Some(&pkts[i]), "seq {i} recovered");
+        for (i, p) in pkts.iter().enumerate().take(7).skip(2) {
+            assert_eq!(recovered.get(&(2000 + i as u32)), Some(p), "seq {i} recovered");
         }
     }
 

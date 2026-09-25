@@ -472,35 +472,35 @@ where
                                 PathSelection::Duplicate(v) => v.first().copied(),
                                 PathSelection::Drop => None,
                             };
-                            if let Some(pid) = pid {
-                                if let Some(pos) = path_index_by_id(pid) {
-                                    let mut header = BondHeader::new(
-                                        flow_id, rep.base_seq, pid, Priority::Normal,
-                                    );
-                                    header.set_fec();
-                                    write_packet(&header, &fec_payload, &mut fec_frame);
-                                    if let Some(path) = paths.get(pos) {
-                                        // FEC bytes are NOT counted in the
-                                        // per-path media byte counter — that
-                                        // would read as loss to the controller
-                                        // (sent > delivered) and trigger false
-                                        // backoff. The token-bucket deduction
-                                        // above already charges FEC bandwidth.
-                                        let _ = match path.primary_peer() {
-                                            Some(peer) => path.send_to(&fec_frame, peer).await,
-                                            None => path.send(&fec_frame).await,
-                                        };
-                                        // Surface the repair as redundancy
-                                        // overhead: fec_bytes_sent (separate from
-                                        // the media counter / controller) and the
-                                        // leg's true-wire total.
-                                        if let Some(ps) = path_stats.get(pos) {
-                                            let wire = (fec_frame.len()
-                                                + path.wire_overhead_per_datagram())
-                                                as u64;
-                                            ps.fec_bytes_sent.fetch_add(wire, Ordering::Relaxed);
-                                            ps.wire_bytes_sent.fetch_add(wire, Ordering::Relaxed);
-                                        }
+                            if let Some(pid) = pid
+                                && let Some(pos) = path_index_by_id(pid)
+                            {
+                                let mut header = BondHeader::new(
+                                    flow_id, rep.base_seq, pid, Priority::Normal,
+                                );
+                                header.set_fec();
+                                write_packet(&header, &fec_payload, &mut fec_frame);
+                                if let Some(path) = paths.get(pos) {
+                                    // FEC bytes are NOT counted in the
+                                    // per-path media byte counter — that
+                                    // would read as loss to the controller
+                                    // (sent > delivered) and trigger false
+                                    // backoff. The token-bucket deduction
+                                    // above already charges FEC bandwidth.
+                                    let _ = match path.primary_peer() {
+                                        Some(peer) => path.send_to(&fec_frame, peer).await,
+                                        None => path.send(&fec_frame).await,
+                                    };
+                                    // Surface the repair as redundancy
+                                    // overhead: fec_bytes_sent (separate from
+                                    // the media counter / controller) and the
+                                    // leg's true-wire total.
+                                    if let Some(ps) = path_stats.get(pos) {
+                                        let wire = (fec_frame.len()
+                                            + path.wire_overhead_per_datagram())
+                                            as u64;
+                                        ps.fec_bytes_sent.fetch_add(wire, Ordering::Relaxed);
+                                        ps.wire_bytes_sent.fetch_add(wire, Ordering::Relaxed);
                                     }
                                 }
                             }
@@ -550,112 +550,112 @@ where
                                 .iter()
                                 .position(|(s, _)| *s == body.stamp_us)
                                 .and_then(|p| pending_ka[idx].remove(p));
-                            if let Some((stamp, sent_at)) = matched {
-                                if body.stamp_us == stamp {
-                                    let now = Instant::now();
-                                    let rtt = sent_at.elapsed();
+                            if let Some((stamp, sent_at)) = matched
+                                && body.stamp_us == stamp
+                            {
+                                let now = Instant::now();
+                                let rtt = sent_at.elapsed();
 
-                                    // Windowed loss + delivered bitrate:
-                                    // diff this ack against the previous one
-                                    // for THIS path, on the probe SEND clock
-                                    // (`sent_at`, matched from `pending_ka`).
-                                    // Lifetime ratios dilute bursts and never
-                                    // drive a congestion controller usefully;
-                                    // the ack ARRIVAL clock fabricates rates
-                                    // under return-path jitter — see
-                                    // [`ack_delivery`].
-                                    let cur = AckSample {
-                                        sent: body.packets_sent_on_path,
-                                        received: body.packets_received_on_path,
-                                        bytes_received: body.bytes_received_on_path,
-                                        probe_sent_at: sent_at,
-                                    };
-                                    // `None` = an out-of-order / duplicate ack
-                                    // (still counted for RTT + liveness below,
-                                    // but its stale receiver snapshot must not
-                                    // regress the baseline or feed a bogus
-                                    // rate). First ack has no prior → 0/0.
-                                    let measurement = match &last_ack[idx] {
-                                        Some(prev) => ack_delivery(prev, &cur),
-                                        None => Some((0.0, 0)),
-                                    };
-                                    if measurement.is_some() {
-                                        last_ack[idx] = Some(cur);
-                                    }
+                                // Windowed loss + delivered bitrate:
+                                // diff this ack against the previous one
+                                // for THIS path, on the probe SEND clock
+                                // (`sent_at`, matched from `pending_ka`).
+                                // Lifetime ratios dilute bursts and never
+                                // drive a congestion controller usefully;
+                                // the ack ARRIVAL clock fabricates rates
+                                // under return-path jitter — see
+                                // [`ack_delivery`].
+                                let cur = AckSample {
+                                    sent: body.packets_sent_on_path,
+                                    received: body.packets_received_on_path,
+                                    bytes_received: body.bytes_received_on_path,
+                                    probe_sent_at: sent_at,
+                                };
+                                // `None` = an out-of-order / duplicate ack
+                                // (still counted for RTT + liveness below,
+                                // but its stale receiver snapshot must not
+                                // regress the baseline or feed a bogus
+                                // rate). First ack has no prior → 0/0.
+                                let measurement = match &last_ack[idx] {
+                                    Some(prev) => ack_delivery(prev, &cur),
+                                    None => Some((0.0, 0)),
+                                };
+                                if measurement.is_some() {
+                                    last_ack[idx] = Some(cur);
+                                }
 
-                                    // RTT, peer version + keepalive count are
-                                    // per-probe and order-independent → always
-                                    // record. Loss / throughput / jitter only
-                                    // advance on a fresh (newer) measurement.
-                                    if let Some(ps) = path_stats_for(idx) {
-                                        ps.rtt_us.store(rtt.as_micros() as u64, Ordering::Relaxed);
-                                        // v5 negotiation: record the receiver's
-                                        // advertised data-header version for this
-                                        // leg. send_on_path gates v2 (send-stamped)
-                                        // headers on this being >= v2, so we never
-                                        // brick a pre-v2 / equalization-off receiver.
-                                        ps.peer_protocol_version.store(
-                                            body.recv_protocol_version as u64,
-                                            Ordering::Relaxed,
-                                        );
-                                        ps.keepalives_received.fetch_add(1, Ordering::Relaxed);
-                                        if let Some((loss_rate, delivery_bps)) = measurement {
-                                            ps.loss_ppm.store(
-                                                (loss_rate * 1_000_000.0) as u64,
-                                                Ordering::Relaxed,
-                                            );
-                                            ps.throughput_bps
-                                                .store(delivery_bps, Ordering::Relaxed);
-                                            ps.jitter_us
-                                                .store(body.jitter_us as u64, Ordering::Relaxed);
-                                        }
-                                    }
-
-                                    // Feed the scheduler a full health snapshot
-                                    // only on a fresh measurement — an
-                                    // out-of-order ack carries a stale delivered
-                                    // rate that would disturb the windowed
-                                    // capacity control.
+                                // RTT, peer version + keepalive count are
+                                // per-probe and order-independent → always
+                                // record. Loss / throughput / jitter only
+                                // advance on a fresh (newer) measurement.
+                                if let Some(ps) = path_stats_for(idx) {
+                                    ps.rtt_us.store(rtt.as_micros() as u64, Ordering::Relaxed);
+                                    // v5 negotiation: record the receiver's
+                                    // advertised data-header version for this
+                                    // leg. send_on_path gates v2 (send-stamped)
+                                    // headers on this being >= v2, so we never
+                                    // brick a pre-v2 / equalization-off receiver.
+                                    ps.peer_protocol_version.store(
+                                        body.recv_protocol_version as u64,
+                                        Ordering::Relaxed,
+                                    );
+                                    ps.keepalives_received.fetch_add(1, Ordering::Relaxed);
                                     if let Some((loss_rate, delivery_bps)) = measurement {
-                                        let health = PathHealth {
-                                            rtt: Some(rtt),
-                                            loss_rate,
-                                            throughput_bps: delivery_bps,
-                                            jitter_us: body.jitter_us as u64,
-                                            queue_depth: 0,
-                                            // v4 keepalive-ack: this leg's
-                                            // receiver-measured relative one-way
-                                            // delay, for the equalization
-                                            // budget-demote (u32::MAX on an older
-                                            // peer → demote stays jitter-only).
-                                            relative_owd_us: body.relative_owd_us,
-                                        };
-                                        scheduler.on_path_update(path_id, &health);
-                                        // Publish the discovered aggregate capacity
-                                        // (sum of alive legs) so operators can read
-                                        // the bond's currently-usable bitrate and
-                                        // provision a fixed external encoder under it.
-                                        conn_stats.aggregate_capacity_bps.store(
-                                            scheduler.aggregate_capacity_bps(),
+                                        ps.loss_ppm.store(
+                                            (loss_rate * 1_000_000.0) as u64,
                                             Ordering::Relaxed,
                                         );
-                                        // Adaptive per-leg RS: scale this leg's
-                                        // parity with its measured loss.
-                                        if let Some(Some(LegEnc::Rs(enc))) =
-                                            per_leg_encoders.get_mut(idx)
-                                        {
-                                            enc.set_loss(loss_rate);
-                                        }
+                                        ps.throughput_bps
+                                            .store(delivery_bps, Ordering::Relaxed);
+                                        ps.jitter_us
+                                            .store(body.jitter_us as u64, Ordering::Relaxed);
                                     }
-                                    // Liveness: a fresh ack revives this
-                                    // path if it was dead. Also tell the
-                                    // scheduler so weights restore.
-                                    for ev in monitor.record_activity(path_id, now) {
-                                        if matches!(ev.kind, PathEventKind::PathAlive { .. }) {
-                                            scheduler.on_path_alive(path_id);
-                                        }
-                                        let _ = events_tx.send(ev);
+                                }
+
+                                // Feed the scheduler a full health snapshot
+                                // only on a fresh measurement — an
+                                // out-of-order ack carries a stale delivered
+                                // rate that would disturb the windowed
+                                // capacity control.
+                                if let Some((loss_rate, delivery_bps)) = measurement {
+                                    let health = PathHealth {
+                                        rtt: Some(rtt),
+                                        loss_rate,
+                                        throughput_bps: delivery_bps,
+                                        jitter_us: body.jitter_us as u64,
+                                        queue_depth: 0,
+                                        // v4 keepalive-ack: this leg's
+                                        // receiver-measured relative one-way
+                                        // delay, for the equalization
+                                        // budget-demote (u32::MAX on an older
+                                        // peer → demote stays jitter-only).
+                                        relative_owd_us: body.relative_owd_us,
+                                    };
+                                    scheduler.on_path_update(path_id, &health);
+                                    // Publish the discovered aggregate capacity
+                                    // (sum of alive legs) so operators can read
+                                    // the bond's currently-usable bitrate and
+                                    // provision a fixed external encoder under it.
+                                    conn_stats.aggregate_capacity_bps.store(
+                                        scheduler.aggregate_capacity_bps(),
+                                        Ordering::Relaxed,
+                                    );
+                                    // Adaptive per-leg RS: scale this leg's
+                                    // parity with its measured loss.
+                                    if let Some(Some(LegEnc::Rs(enc))) =
+                                        per_leg_encoders.get_mut(idx)
+                                    {
+                                        enc.set_loss(loss_rate);
                                     }
+                                }
+                                // Liveness: a fresh ack revives this
+                                // path if it was dead. Also tell the
+                                // scheduler so weights restore.
+                                for ev in monitor.record_activity(path_id, now) {
+                                    if matches!(ev.kind, PathEventKind::PathAlive { .. }) {
+                                        scheduler.on_path_alive(path_id);
+                                    }
+                                    let _ = events_tx.send(ev);
                                 }
                             }
                         }
@@ -685,46 +685,46 @@ where
                                     PathSelection::Duplicate(v) => v.first().copied(),
                                     PathSelection::Drop => None,
                                 };
-                                if let Some(pid) = pid {
-                                    if let Some(pos) = path_index_by_id(pid) {
-                                        // Flip the RETRANSMIT flag and rewrite the
-                                        // path_id byte so the receiver credits the
-                                        // retransmit to the new path.
-                                        let mut retx = BytesMut::from(&pkt[..]);
-                                        // Byte 1: ver(high4) | flags(low4).
-                                        // Set RETRANSMIT in the low nibble.
-                                        retx[1] |= bonding_protocol::packet::flags::RETRANSMIT;
-                                        // Byte 2: path_id.
-                                        retx[2] = pid;
-                                        if let Some(path) = paths.get(pos) {
-                                            let _ = path.send(&retx).await;
-                                            if let Some(ps) = path_stats_for(pos) {
-                                                ps.retransmits_sent.fetch_add(1, Ordering::Relaxed);
-                                                ps.bytes_sent
-                                                    .fetch_add(retx.len() as u64, Ordering::Relaxed);
-                                                // Retransmits ride the media counter
-                                                // (recovery, not pure overhead) but still
-                                                // add to the leg's true wire total.
-                                                ps.wire_bytes_sent.fetch_add(
-                                                    (retx.len()
-                                                        + path.wire_overhead_per_datagram())
-                                                        as u64,
-                                                    Ordering::Relaxed,
-                                                );
-                                            }
-                                            conn_stats
-                                                .packets_retransmitted
-                                                .fetch_add(1, Ordering::Relaxed);
+                                if let Some(pid) = pid
+                                    && let Some(pos) = path_index_by_id(pid)
+                                {
+                                    // Flip the RETRANSMIT flag and rewrite the
+                                    // path_id byte so the receiver credits the
+                                    // retransmit to the new path.
+                                    let mut retx = BytesMut::from(&pkt[..]);
+                                    // Byte 1: ver(high4) | flags(low4).
+                                    // Set RETRANSMIT in the low nibble.
+                                    retx[1] |= bonding_protocol::packet::flags::RETRANSMIT;
+                                    // Byte 2: path_id.
+                                    retx[2] = pid;
+                                    if let Some(path) = paths.get(pos) {
+                                        let _ = path.send(&retx).await;
+                                        if let Some(ps) = path_stats_for(pos) {
+                                            ps.retransmits_sent.fetch_add(1, Ordering::Relaxed);
+                                            ps.bytes_sent
+                                                .fetch_add(retx.len() as u64, Ordering::Relaxed);
+                                            // Retransmits ride the media counter
+                                            // (recovery, not pure overhead) but still
+                                            // add to the leg's true wire total.
+                                            ps.wire_bytes_sent.fetch_add(
+                                                (retx.len()
+                                                    + path.wire_overhead_per_datagram())
+                                                    as u64,
+                                                Ordering::Relaxed,
+                                            );
                                         }
+                                        conn_stats
+                                            .packets_retransmitted
+                                            .fetch_add(1, Ordering::Relaxed);
                                     }
                                 }
                             }
                         }
-                        if let Some(idx) = path_index_by_id(path_id) {
-                            if let Some(ps) = path_stats_for(idx) {
-                                ps.nacks_received
-                                    .fetch_add(body.missing.len() as u64, Ordering::Relaxed);
-                            }
+                        if let Some(idx) = path_index_by_id(path_id)
+                            && let Some(ps) = path_stats_for(idx)
+                        {
+                            ps.nacks_received
+                                .fetch_add(body.missing.len() as u64, Ordering::Relaxed);
                         }
                     }
                     Ok(_) | Err(_) => { /* ignore goodbye + parse errors */ }
@@ -871,7 +871,6 @@ async fn send_fec_frame(
 /// `frame_scratch` so callers that want to stash in the retransmit
 /// buffer can `.freeze()` it. Returns `true` when the send error run
 /// just triggered a socket rebuild (caller emits the event).
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 async fn send_on_path(
     flow_id: u32,

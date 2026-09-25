@@ -193,7 +193,7 @@ impl KeepaliveBody {
                 actual: buf.len(),
             });
         }
-        let mut r = &buf[..];
+        let mut r = buf;
         let stamp_us = r.get_u64();
         let packets_sent_on_path = r.get_u64();
         let highest_bond_seq_sent = r.get_u32();
@@ -295,7 +295,7 @@ impl KeepaliveAckBody {
                 actual: buf.len(),
             });
         }
-        let mut r = &buf[..];
+        let mut r = buf;
         let stamp_us = r.get_u64();
         let packets_sent_on_path = r.get_u64();
         let packets_received_on_path = r.get_u64();
@@ -363,7 +363,7 @@ impl NackBody {
                 actual: buf.len(),
             });
         }
-        let mut r = &buf[..];
+        let mut r = buf;
         let count = r.get_u16() as usize;
         let needed = count * 4;
         if r.remaining() < needed {

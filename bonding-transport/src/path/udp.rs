@@ -647,6 +647,7 @@ fn build_socket(
 /// [`build_socket`]'s pinning but returns the std socket + resolved pin
 /// mechanism rather than a tokio `UdpSocket`. The caller's transport
 /// layer (quinn) reconfigures non-blocking mode as needed.
+#[cfg(feature = "path-quic")]
 pub(crate) fn build_pinned_std_socket(
     local: SocketAddr,
     interface: Option<&str>,

@@ -138,11 +138,11 @@ async fn sender_restart_resets_session_and_resumes() {
             .await
             .unwrap();
         i += 1;
-        if let Ok(Some(b)) = timeout(Duration::from_millis(50), receiver.recv()).await {
-            if b.starts_with(b"s2-") {
-                resumed = true;
-                break;
-            }
+        if let Ok(Some(b)) = timeout(Duration::from_millis(50), receiver.recv()).await
+            && b.starts_with(b"s2-")
+        {
+            resumed = true;
+            break;
         }
     }
     assert!(resumed, "delivery did not resume within 2 s of sender restart");
@@ -584,7 +584,7 @@ impl BondScheduler for DropEveryOther {
     }
     fn schedule(&mut self, _hints: &PacketHints) -> PathSelection {
         self.ctr += 1;
-        if self.ctr % 2 == 0 {
+        if self.ctr.is_multiple_of(2) {
             PathSelection::Drop
         } else {
             PathSelection::Single(0)
@@ -715,11 +715,11 @@ async fn epochless_anchor_then_epoched_sender_resets() {
             .await
             .unwrap();
         i += 1;
-        if let Ok(Some(b)) = timeout(Duration::from_millis(50), receiver.recv()).await {
-            if b.starts_with(b"s3-") {
-                resumed = true;
-                break;
-            }
+        if let Ok(Some(b)) = timeout(Duration::from_millis(50), receiver.recv()).await
+            && b.starts_with(b"s3-")
+        {
+            resumed = true;
+            break;
         }
     }
     assert!(resumed, "delivery did not resume within 2 s of the v2->v3 sender upgrade");
@@ -784,11 +784,11 @@ async fn stale_epoch_keepalives_after_reset_are_quarantined() {
             .await
             .unwrap();
         i += 1;
-        if let Ok(Some(b)) = timeout(Duration::from_millis(50), receiver.recv()).await {
-            if b.starts_with(b"s2-") {
-                resumed = true;
-                break;
-            }
+        if let Ok(Some(b)) = timeout(Duration::from_millis(50), receiver.recv()).await
+            && b.starts_with(b"s2-")
+        {
+            resumed = true;
+            break;
         }
     }
     assert!(resumed, "delivery did not resume after restart");

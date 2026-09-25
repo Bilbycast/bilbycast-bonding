@@ -1119,14 +1119,14 @@ async fn receiver_loop(
                                 body: ack_body,
                             };
                             ack.serialize(&mut ctrl_scratch);
-                            if let Some(idx) = path_idx {
-                                if let Some(path) = paths.get(idx) {
-                                    let _ = path.send_to(&ctrl_scratch, dg.from).await;
-                                    if let Some(ps) = path_stats_for(idx) {
-                                        ps.keepalives_received
-                                            .fetch_add(1, Ordering::Relaxed);
-                                        ps.keepalives_sent.fetch_add(1, Ordering::Relaxed);
-                                    }
+                            if let Some(idx) = path_idx
+                                && let Some(path) = paths.get(idx)
+                            {
+                                let _ = path.send_to(&ctrl_scratch, dg.from).await;
+                                if let Some(ps) = path_stats_for(idx) {
+                                    ps.keepalives_received
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    ps.keepalives_sent.fetch_add(1, Ordering::Relaxed);
                                 }
                             }
                             // Tail-gap discovery — if the sender's
@@ -1189,12 +1189,11 @@ async fn receiver_loop(
                     continue;
                 }
                 // Record peer so NACKs + pongs can go back to it.
-                if let Some(idx) = path_idx {
-                    if let Some(path) = paths.get(idx) {
-                        if path.primary_peer().is_none() {
-                            path.set_primary_peer(dg.from);
-                        }
-                    }
+                if let Some(idx) = path_idx
+                    && let Some(path) = paths.get(idx)
+                    && path.primary_peer().is_none()
+                {
+                    path.set_primary_peer(dg.from);
                 }
                 let payload = dg.data.slice(consumed..);
 
@@ -1237,10 +1236,10 @@ async fn receiver_loop(
                             conn_stats.gaps_recovered.fetch_add(1, Ordering::Relaxed);
                             // Per-leg FEC recovery — credit THIS leg so the
                             // operator sees each leg's proactive recovery.
-                            if per_leg_mode {
-                                if let Some(ps) = path_idx.and_then(|i| path_stats.get(i)) {
-                                    ps.fec_recovered.fetch_add(1, Ordering::Relaxed);
-                                }
+                            if per_leg_mode
+                                && let Some(ps) = path_idx.and_then(|i| path_stats.get(i))
+                            {
+                                ps.fec_recovered.fetch_add(1, Ordering::Relaxed);
                             }
                             pending_nacks.remove(&rseq);
                             if let Some(age) = o.recovered_age {
@@ -1261,14 +1260,14 @@ async fn receiver_loop(
                 conn_stats
                     .bytes_received
                     .fetch_add(dg.data.len() as u64, Ordering::Relaxed);
-                if let Some(idx) = path_idx {
-                    if let Some(ps) = path_stats_for(idx) {
-                        ps.packets_received.fetch_add(1, Ordering::Relaxed);
-                        ps.bytes_received
-                            .fetch_add(dg.data.len() as u64, Ordering::Relaxed);
-                        if header.is_retransmit() {
-                            ps.retransmits_received.fetch_add(1, Ordering::Relaxed);
-                        }
+                if let Some(idx) = path_idx
+                    && let Some(ps) = path_stats_for(idx)
+                {
+                    ps.packets_received.fetch_add(1, Ordering::Relaxed);
+                    ps.bytes_received
+                        .fetch_add(dg.data.len() as u64, Ordering::Relaxed);
+                    if header.is_retransmit() {
+                        ps.retransmits_received.fetch_add(1, Ordering::Relaxed);
                     }
                 }
                 *path_recv_counter.entry(path_id).or_insert(0) += 1;
@@ -1297,10 +1296,10 @@ async fn receiver_loop(
                         }
                         e.2 as u64
                     };
-                    if let Some(idx) = path_idx {
-                        if let Some(ps) = path_stats_for(idx) {
-                            ps.jitter_us.store(jitter_us, Ordering::Relaxed);
-                        }
+                    if let Some(idx) = path_idx
+                        && let Some(ps) = path_stats_for(idx)
+                    {
+                        ps.jitter_us.store(jitter_us, Ordering::Relaxed);
                     }
                     jitter_us
                 };
@@ -1311,16 +1310,16 @@ async fn receiver_loop(
                 // cancels in the inter-leg difference. Only FRESH data packets
                 // (not retransmits, whose latency is the NACK loop, not the
                 // path OWD) feed the estimator.
-                if let (Some(stamp), Some(idx)) = (header.send_stamp_us, path_idx) {
-                    if !header.is_retransmit() {
-                        let arrival_us = rx_now.saturating_duration_since(rx_epoch).as_micros() as u32;
-                        let raw = arrival_us.wrapping_sub(stamp);
-                        if let Some(leg) = leg_owd.get_mut(idx) {
-                            leg.observe(raw, rx_now);
-                            eq_active = true;
-                            if eq_active_since.is_none() {
-                                eq_active_since = Some(rx_now);
-                            }
+                if let (Some(stamp), Some(idx)) = (header.send_stamp_us, path_idx)
+                    && !header.is_retransmit()
+                {
+                    let arrival_us = rx_now.saturating_duration_since(rx_epoch).as_micros() as u32;
+                    let raw = arrival_us.wrapping_sub(stamp);
+                    if let Some(leg) = leg_owd.get_mut(idx) {
+                        leg.observe(raw, rx_now);
+                        eq_active = true;
+                        if eq_active_since.is_none() {
+                            eq_active_since = Some(rx_now);
                         }
                     }
                 }
@@ -1330,14 +1329,13 @@ async fn receiver_loop(
                 // the full NACK→resend loop. EWMA'd into the retry
                 // cadence so high-RTT legs aren't re-NACKed before the
                 // first retransmit could possibly have arrived.
-                if header.is_retransmit() {
-                    if let Some(sent_at) = pending_nacks
+                if header.is_retransmit()
+                    && let Some(sent_at) = pending_nacks
                         .get(&header.bond_seq)
                         .and_then(|pn| pn.last_sent_at)
-                    {
-                        let sample = rx_now.saturating_duration_since(sent_at);
-                        retx_rtt = Some(ewma_retx_rtt(retx_rtt, sample));
-                    }
+                {
+                    let sample = rx_now.saturating_duration_since(sent_at);
+                    retx_rtt = Some(ewma_retx_rtt(retx_rtt, sample));
                 }
 
                 let outcome =
@@ -1460,10 +1458,10 @@ async fn receiver_loop(
                         let o = reassembly.insert(rseq, rpayload, path_id, fnow);
                         if o.recovered {
                             conn_stats.gaps_recovered.fetch_add(1, Ordering::Relaxed);
-                            if per_leg_mode {
-                                if let Some(ps) = path_idx.and_then(|i| path_stats.get(i)) {
-                                    ps.fec_recovered.fetch_add(1, Ordering::Relaxed);
-                                }
+                            if per_leg_mode
+                                && let Some(ps) = path_idx.and_then(|i| path_stats.get(i))
+                            {
+                                ps.fec_recovered.fetch_add(1, Ordering::Relaxed);
                             }
                             pending_nacks.remove(&rseq);
                             if let Some(age) = o.recovered_age {
@@ -1518,10 +1516,10 @@ async fn receiver_loop(
                             e.2 = 0.0;
                         }
                         e.0 = now;
-                        if let Some(idx) = path_index_by_id(*id) {
-                            if let Some(ps) = path_stats_for(idx) {
-                                ps.jitter_us.store(e.2 as u64, Ordering::Relaxed);
-                            }
+                        if let Some(idx) = path_index_by_id(*id)
+                            && let Some(ps) = path_stats_for(idx)
+                        {
+                            ps.jitter_us.store(e.2 as u64, Ordering::Relaxed);
                         }
                     }
                 }
@@ -1718,25 +1716,24 @@ async fn receiver_loop(
                 // once equalization is ENGAGED (offsets applied) — during
                 // cold-start it still runs so the global hold covers the
                 // spread until the per-leg offsets take over.
-                if !eq_engaged {
-                if let Some(hmax) = hold_autogrow {
-                    if now.saturating_duration_since(hold_last_adjust) >= Duration::from_secs(1) {
-                        let target = if hold_window_max > Duration::ZERO {
-                            hold_window_max.mul_f32(1.5).clamp(hold_floor, hmax)
-                        } else {
-                            hold_cur.mul_f32(0.9).max(hold_floor)
-                        };
-                        if target != hold_cur {
-                            hold_cur = target;
-                            reassembly.set_hold_time(hold_cur);
-                            conn_stats
-                                .current_hold_ms
-                                .store(hold_cur.as_millis() as u64, Ordering::Relaxed);
-                        }
-                        hold_window_max = Duration::ZERO;
-                        hold_last_adjust = now;
+                if !eq_engaged
+                    && let Some(hmax) = hold_autogrow
+                    && now.saturating_duration_since(hold_last_adjust) >= Duration::from_secs(1)
+                {
+                    let target = if hold_window_max > Duration::ZERO {
+                        hold_window_max.mul_f32(1.5).clamp(hold_floor, hmax)
+                    } else {
+                        hold_cur.mul_f32(0.9).max(hold_floor)
+                    };
+                    if target != hold_cur {
+                        hold_cur = target;
+                        reassembly.set_hold_time(hold_cur);
+                        conn_stats
+                            .current_hold_ms
+                            .store(hold_cur.as_millis() as u64, Ordering::Relaxed);
                     }
-                }
+                    hold_window_max = Duration::ZERO;
+                    hold_last_adjust = now;
                 }
 
                 // loss_deadline rule (single owner). Cover the equalization

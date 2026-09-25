@@ -74,10 +74,9 @@ impl RistPath {
                 remote.port()
             )));
         }
-        let mut cfg = RistSocketConfig::default();
-        cfg.local_addr = match local_bind {
-            Some(b) => b,
-            None => ephemeral_even_bind(remote),
+        let mut cfg = RistSocketConfig {
+            local_addr: local_bind.unwrap_or_else(|| ephemeral_even_bind(remote)),
+            ..Default::default()
         };
         if let Some(ms) = buffer_ms {
             cfg.buffer_size = Duration::from_millis(ms as u64);
@@ -122,8 +121,10 @@ impl RistPath {
                 local_bind.port()
             )));
         }
-        let mut cfg = RistSocketConfig::default();
-        cfg.local_addr = local_bind;
+        let mut cfg = RistSocketConfig {
+            local_addr: local_bind,
+            ..Default::default()
+        };
         if let Some(ms) = buffer_ms {
             cfg.buffer_size = Duration::from_millis(ms as u64);
         }

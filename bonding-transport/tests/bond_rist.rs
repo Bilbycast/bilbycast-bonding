@@ -259,12 +259,7 @@ async fn two_rist_paths_deliver_in_order() {
     // Drain warm-up deliveries until the stream goes quiet for longer than
     // the hold window, so no pre-roll packet (delivered or aged-out) can
     // bleed into the counted phase.
-    loop {
-        match timeout(Duration::from_millis(500), receiver.recv()).await {
-            Ok(Some(_)) => continue,
-            _ => break,
-        }
-    }
+    while let Ok(Some(_)) = timeout(Duration::from_millis(500), receiver.recv()).await {}
     // Baseline: any loss during cold-start warm-up is expected and must not
     // fail the steady-state assertion below.
     let lost_baseline = receiver.stats().snapshot().gaps_lost;

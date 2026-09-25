@@ -14,23 +14,13 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 struct Slot {
     seq: u32,
     data: Option<Bytes>,
     /// When this seq last went out as a retransmit — anchors the dedup
     /// window in [`RetransmitBuffer::get_for_retransmit`].
     last_retx: Option<Instant>,
-}
-
-impl Default for Slot {
-    fn default() -> Self {
-        Self {
-            seq: 0,
-            data: None,
-            last_retx: None,
-        }
-    }
 }
 
 /// O(1) insert / O(1) lookup retransmit buffer. Stale slot detection
@@ -104,10 +94,10 @@ impl RetransmitBuffer {
         if slot.seq != seq || slot.data.is_none() {
             return None;
         }
-        if let Some(last) = slot.last_retx {
-            if now.saturating_duration_since(last) < Self::RETRANSMIT_DEDUP {
-                return None;
-            }
+        if let Some(last) = slot.last_retx
+            && now.saturating_duration_since(last) < Self::RETRANSMIT_DEDUP
+        {
+            return None;
         }
         slot.last_retx = Some(now);
         slot.data.as_ref()

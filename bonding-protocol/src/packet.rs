@@ -79,10 +79,11 @@ pub mod flags {
 /// would promote IDR NAL units to `Critical`). The bonding library does
 /// not interpret priority beyond passing it through; schedulers MAY use
 /// it to choose duplication or path selection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Priority {
     /// Standard traffic — default.
+    #[default]
     Normal = 0,
     /// Elevated importance (e.g. PAT/PMT, P-frames).
     High = 1,
@@ -114,12 +115,6 @@ impl Priority {
             Priority::High => 2,
             Priority::Critical => 3,
         }
-    }
-}
-
-impl Default for Priority {
-    fn default() -> Self {
-        Priority::Normal
     }
 }
 

@@ -352,7 +352,7 @@ impl WeightedRttScheduler {
             .enumerate()
             .filter_map(|(i, w)| if !self.dead[i] { Some((i, *w)) } else { None })
             .collect();
-        indexed.sort_by(|a, b| b.1.cmp(&a.1));
+        indexed.sort_by_key(|&(_, w)| std::cmp::Reverse(w));
         indexed
             .into_iter()
             .take(n)

@@ -161,7 +161,7 @@ async fn spawn_fec_drop_relay(
             let is_media = len >= 2 && buf[0] == 0xBC && (buf[1] & 0x08) == 0;
             if is_media {
                 data_count += 1;
-                if data_count % drop_every == 0 {
+                if data_count.is_multiple_of(drop_every) {
                     continue; // drop this media packet — FEC must recover it
                 }
             }
@@ -480,6 +480,13 @@ async fn per_leg_rs_recovers_loss_without_arq() {
 /// Two-path encrypted bond delivers in order with the adaptive
 /// scheduler; both paths carry traffic and nothing is lost on a clean
 /// link. Proves crypto integrates with the capacity scheduler e2e.
+///
+/// Also the regression test for the cold-start anchor race. The first
+/// packet the receiver handles anchors its reassembly buffer, and each leg
+/// has its own reader task racing into the receiver's shared queue, so
+/// roughly one run in ten that first packet is seq 1 rather than seq 0.
+/// Seq 0 then used to be dropped as stale, and this test failed with 299
+/// of 300 delivered.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn encrypted_adaptive_bond_delivers_in_order() {
     let rx_a = format!("127.0.0.1:{}", free_port().await).parse().unwrap();

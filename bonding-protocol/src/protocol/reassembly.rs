@@ -21,6 +21,14 @@
 //! Bounded capacity, indexed by `bond_seq & (capacity - 1)`. Capacity
 //! defaults to 64 k slots — at 15 kpps that's ~4 seconds of headroom,
 //! enough for a multi-path RTT ceiling of a few hundred ms plus jitter.
+//!
+//! The first insert anchors the delivery base on whatever seq arrived
+//! first. On a multi-path bond that is not necessarily the lowest one in
+//! flight: seq 1 on a fast leg can land before seq 0 on a slower leg. So
+//! until the buffer has released anything, an arrival behind the base
+//! moves the base back to it (the positions in between become gaps)
+//! instead of being dropped as stale — nothing behind the base has been
+//! delivered yet, so in-order delivery is intact.
 
 use std::time::{Duration, Instant};
 
@@ -54,7 +62,9 @@ enum SlotState {
 #[derive(Debug, Clone, Default)]
 pub struct InsertOutcome {
     /// Packet's `bond_seq` is before the current delivery base (already
-    /// delivered or timed out).
+    /// delivered or timed out), or so far behind the highest seq seen that
+    /// the ring cannot hold it. A packet behind a base that has not
+    /// released anything yet is not stale — it extends the base back.
     pub stale: bool,
     /// A packet for this `bond_seq` was already buffered — dropped.
     pub duplicate: bool,
@@ -101,6 +111,7 @@ pub enum DrainItem {
 /// - `loss_deadline` gates **gap → Lost** — it must cover the slowest
 ///   eligible leg's recovery round-trip (NACK/FEC), independent of (and
 ///   `>=`) `jitter_hold`.
+///
 /// Per-leg `equalize[path_id]` is the equalization delay (max-eligible-OWD
 /// − this-leg-OWD): a Filled packet on a fast leg is additionally held by
 /// its leg's offset so all legs deliver time-aligned to the slowest. The
@@ -116,6 +127,11 @@ pub struct ReassemblyBuffer {
     equalize: Box<[Duration; 256]>,
     base_seq: Option<u32>,
     highest_seq: Option<u32>,
+    /// Whether the delivery base has moved forward since the buffer
+    /// anchored, i.e. anything was delivered or declared lost. Until it
+    /// has, an arrival behind the base extends the base back instead of
+    /// being stale (the multi-path cold start, see the module doc).
+    released: bool,
 }
 
 impl ReassemblyBuffer {
@@ -140,6 +156,7 @@ impl ReassemblyBuffer {
             equalize: Box::new([Duration::ZERO; 256]),
             base_seq: None,
             highest_seq: None,
+            released: false,
         }
     }
 
@@ -216,8 +233,9 @@ impl ReassemblyBuffer {
     /// Whether the buffer has anchored its delivery base on a seq
     /// space (i.e. at least one insert since construction / `reset`).
     /// An anchored buffer rejects everything "behind" its base as
-    /// stale, so adopting a new session epoch without a reset is only
-    /// safe while this is `false`.
+    /// stale (bar the cold-start window before its first release, and
+    /// then only within one ring span), so adopting a new session epoch
+    /// without a reset is only safe while this is `false`.
     #[inline]
     pub fn is_anchored(&self) -> bool {
         self.base_seq.is_some()
@@ -253,6 +271,7 @@ impl ReassemblyBuffer {
         }
         self.base_seq = None;
         self.highest_seq = None;
+        self.released = false;
         // Flush per-leg equalization: a restarted sender's seq space and
         // its leg delays are stale; the next session re-measures from scratch.
         self.clear_equalization();
@@ -293,14 +312,45 @@ impl ReassemblyBuffer {
 
         // Signed-wrap comparison across the 32-bit sequence space.
         let from_base = seq.wrapping_sub(base) as i32;
+        // Widest span `[base, highest]` the ring can hold without two
+        // in-flight positions sharing a slot.
+        let ahead_capacity = self.capacity as u32 - 1;
         if from_base < 0 {
-            outcome.stale = true;
+            // Behind the base. Stale once anything has been released (it
+            // was delivered or declared lost), or when `[seq, highest]`
+            // would not fit the ring.
+            if self.released || highest.wrapping_sub(seq) > ahead_capacity {
+                outcome.stale = true;
+                return outcome;
+            }
+            // Cold start: nothing has left the buffer, so this arrival is
+            // simply earlier than the packet that anchored it (seq 0 on a
+            // slow leg landing after seq 1 on a fast one). Move the base
+            // back to it. Every slot in `[seq, base)` is free: nothing
+            // behind the base was ever stored, and the span check above
+            // keeps those indices clear of `[base, highest]`.
+            self.slots[(seq as usize) & self.mask] = Slot {
+                seq,
+                state: SlotState::Filled {
+                    data,
+                    arrival: now,
+                    path_id,
+                },
+            };
+            for i in 1..base.wrapping_sub(seq) {
+                let gap_seq = seq.wrapping_add(i);
+                self.slots[(gap_seq as usize) & self.mask] = Slot {
+                    seq: gap_seq,
+                    state: SlotState::Gap { first_noticed: now },
+                };
+                outcome.new_gap_seqs.push(gap_seq);
+            }
+            self.base_seq = Some(seq);
             return outcome;
         }
 
         // Don't accept packets so far ahead that they'd overwrite an
         // in-flight entry at the same ring index.
-        let ahead_capacity = self.capacity as u32 - 1;
         if (from_base as u32) > ahead_capacity {
             outcome.stale = true;
             return outcome;
@@ -426,6 +476,7 @@ impl ReassemblyBuffer {
                 };
                 out.push(DrainItem::Lost { bond_seq: base });
                 self.base_seq = Some(base.wrapping_add(1));
+                self.released = true;
                 continue;
             }
             match &slot.state {
@@ -448,6 +499,7 @@ impl ReassemblyBuffer {
                             path_id,
                         });
                         self.base_seq = Some(base.wrapping_add(1));
+                        self.released = true;
                         continue;
                     }
                     return;
@@ -463,6 +515,7 @@ impl ReassemblyBuffer {
                         slot.state = SlotState::Empty;
                         out.push(DrainItem::Lost { bond_seq: base });
                         self.base_seq = Some(base.wrapping_add(1));
+                        self.released = true;
                         continue;
                     }
                     return;
@@ -825,6 +878,108 @@ mod tests {
 
         let late = buf.insert(1, b(1), 0, t0 + Duration::from_millis(40));
         assert!(late.stale);
+    }
+
+    #[test]
+    fn cold_start_reorder_extends_base_back() {
+        // Multi-path cold start: seq 1 lands on a fast leg before seq 0 on
+        // a slower one. Nothing has been released, so 0 is not stale — it
+        // moves the base back and both deliver in order.
+        let mut buf = ReassemblyBuffer::new(Duration::from_millis(50));
+        let t0 = Instant::now();
+        buf.insert(1, b(2), 1, t0);
+        let late = buf.insert(0, b(1), 0, t0 + Duration::from_millis(1));
+        assert!(!late.stale && !late.duplicate && !late.recovered);
+        assert!(late.new_gap_seqs.is_empty());
+        let out = drain(&mut buf, t0 + Duration::from_millis(60));
+        assert_eq!(delivered_only(&out), vec![(0, 0, 1), (1, 1, 2)]);
+    }
+
+    #[test]
+    fn cold_start_extension_exposes_the_positions_between_as_gaps() {
+        let mut buf = ReassemblyBuffer::new(Duration::from_millis(50));
+        let t0 = Instant::now();
+        buf.insert(5, b(5), 1, t0);
+        // 2 arrives behind the anchor: 3 and 4 are now known to be missing.
+        let out = buf.insert(2, b(2), 0, t0);
+        assert!(!out.stale);
+        assert_eq!(out.new_gap_seqs, vec![3, 4]);
+        // Filling them counts as a recovery, like any other gap.
+        assert!(buf.insert(4, b(4), 0, t0).recovered);
+        assert!(buf.insert(3, b(3), 0, t0).recovered);
+        let drained = drain(&mut buf, t0 + Duration::from_millis(60));
+        let vals: Vec<u8> = delivered_only(&drained).into_iter().map(|x| x.2).collect();
+        assert_eq!(vals, vec![2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn behind_the_base_is_stale_once_anything_was_released() {
+        // Delivered: the base moved past 5, so 4 can no longer be placed
+        // in order.
+        let mut buf = ReassemblyBuffer::new(Duration::from_millis(20));
+        let t0 = Instant::now();
+        buf.insert(5, b(5), 0, t0);
+        assert_eq!(drain(&mut buf, t0 + Duration::from_millis(30)).len(), 1);
+        assert!(buf.insert(4, b(4), 0, t0 + Duration::from_millis(31)).stale);
+
+        // A gap declared lost stays lost: its late arrival, and anything
+        // behind it, is stale.
+        let mut buf = ReassemblyBuffer::new(Duration::from_millis(20));
+        buf.insert(10, b(1), 0, t0);
+        buf.insert(12, b(3), 0, t0);
+        let drained = drain(&mut buf, t0 + Duration::from_millis(30));
+        assert!(matches!(
+            drained.as_slice(),
+            [
+                DrainItem::Delivered { bond_seq: 10, .. },
+                DrainItem::Lost { bond_seq: 11 },
+                DrainItem::Delivered { bond_seq: 12, .. },
+            ]
+        ));
+        assert!(buf.insert(11, b(2), 1, t0 + Duration::from_millis(31)).stale);
+        assert!(buf.insert(9, b(0), 0, t0 + Duration::from_millis(31)).stale);
+    }
+
+    #[test]
+    fn cold_start_extension_is_bounded_by_the_ring() {
+        // capacity 256: `[seq, highest]` may span at most 255 positions.
+        let mut buf = ReassemblyBuffer::with_capacity(Duration::from_millis(20), 256);
+        let t0 = Instant::now();
+        buf.insert(1_000, b(1), 0, t0);
+        buf.insert(1_010, b(2), 0, t0);
+        assert!(buf.insert(1_010 - 256, b(0), 0, t0).stale, "one past the ring");
+        assert!(buf.insert(1_000_000, b(0), 0, t0).stale, "ahead is still bounded");
+        let edge = buf.insert(1_010 - 255, b(0), 0, t0);
+        assert!(!edge.stale, "exactly one ring span still fits");
+        assert_eq!(edge.new_gap_seqs.len(), 244);
+    }
+
+    #[test]
+    fn cold_start_extension_across_the_u32_wrap() {
+        let mut buf = ReassemblyBuffer::new(Duration::from_millis(5));
+        let t0 = Instant::now();
+        buf.insert(1, b(3), 1, t0);
+        let out = buf.insert(u32::MAX, b(1), 0, t0);
+        assert!(!out.stale);
+        assert_eq!(out.new_gap_seqs, vec![0]);
+        buf.insert(0, b(2), 0, t0);
+        let drained = drain(&mut buf, t0 + Duration::from_millis(10));
+        let vals: Vec<u8> = delivered_only(&drained).into_iter().map(|x| x.2).collect();
+        assert_eq!(vals, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn reset_reopens_the_cold_start_window() {
+        let mut buf = ReassemblyBuffer::new(Duration::from_millis(20));
+        let t0 = Instant::now();
+        buf.insert(100, b(1), 0, t0);
+        let _ = drain(&mut buf, t0 + Duration::from_millis(30));
+        buf.reset();
+        let t1 = t0 + Duration::from_millis(40);
+        buf.insert(8, b(9), 1, t1);
+        assert!(!buf.insert(7, b(8), 0, t1).stale);
+        let drained = drain(&mut buf, t1 + Duration::from_millis(30));
+        assert_eq!(delivered_only(&drained), vec![(7, 0, 8), (8, 1, 9)]);
     }
 
     #[test]
