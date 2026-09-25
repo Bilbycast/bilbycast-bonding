@@ -48,18 +48,28 @@ jobs:
       # does in a local monorepo checkout.
       #
       # No token needed: Bilbycast/bilbycast-rist is public, so the default
-      # GITHUB_TOKEN can read it.
+      # GITHUB_TOKEN can read it. Deliberately unpinned: CI tests against the
+      # sibling's HEAD, as a local monorepo checkout does.
+      #
+      # Neither checkout keeps its credential (`persist-credentials: false`).
+      # Nothing in this job pushes or talks to a git remote after checkout, and
+      # without it the job's token stays in each repo's .git/config for every
+      # later step, including the build scripts and tests `cargo` runs.
+      # Submodules are still fetched: checkout authenticates them inside its
+      # own step and removes the credential when that step ends.
       - name: Checkout bilbycast-rist (path dependency)
         uses: actions/checkout@v7
         with:
           repository: Bilbycast/bilbycast-rist
           path: bilbycast-rist
           submodules: recursive
+          persist-credentials: false
 
       - name: Checkout bilbycast-bonding
         uses: actions/checkout@v7
         with:
           path: bilbycast-bonding
+          persist-credentials: false
 
       - name: Install Rust toolchain
         # Pinned to a commit, not `@stable`. dtolnay/rust-toolchain is
