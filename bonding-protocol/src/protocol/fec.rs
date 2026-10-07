@@ -164,9 +164,7 @@ impl FecEncoder {
         for c in &mut self.columns {
             c.clear();
         }
-        for e in &mut self.emitted {
-            *e = false;
-        }
+        self.emitted.fill(false);
     }
 
     /// Push one original packet; returns any repair packets that became
