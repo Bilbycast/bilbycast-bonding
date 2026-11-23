@@ -8,5 +8,4 @@ publish = false
 
 [dependencies]
 bytes = "1.11"
-log = "0.4"
 thiserror = "2.0"
